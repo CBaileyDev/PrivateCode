@@ -3,6 +3,8 @@ import Sidebar from "./components/Sidebar";
 import MessageList from "./components/MessageList";
 import InputBar from "./components/InputBar";
 import UsagePanel from "./components/UsagePanel";
+import ComparisonView from "./components/ComparisonView";
+import CheckpointTimeline from "./components/CheckpointTimeline";
 import PermissionDialog from "./components/PermissionDialog";
 import CommandPalette from "./components/CommandPalette";
 import { sessionStore, loadSessions, flushPendingModelChange } from "./stores/session";
@@ -126,6 +128,10 @@ export default function App() {
           <MessageList />
         </Show>
 
+        {/* Multi-model candidate comparison (Phase 4): only renders while a
+            fan-out / role-based turn has produced candidate panes. */}
+        <ComparisonView />
+
         {/* Input Bar */}
         <Show when={sessionStore.activeSession}>
           <InputBar />
@@ -135,6 +141,9 @@ export default function App() {
       {/* Right Panel */}
       <div class={`right-panel ${rightPanelOpen() ? "" : "collapsed"}`}>
         <UsagePanel />
+        <Show when={sessionStore.activeSession}>
+          <CheckpointTimeline />
+        </Show>
       </div>
 
       {/* Modals */}

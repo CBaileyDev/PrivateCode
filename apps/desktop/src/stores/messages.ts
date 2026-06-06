@@ -193,6 +193,28 @@ function handleProtocolEvent(event: any) {
       resetStreaming();
       break;
     }
+
+    // Multi-model fan-out / role-based candidate streams (Phase 4). Ephemeral —
+    // delegated to the comparison store; the guard above already gated the
+    // session, so only the displayed session's candidates are applied.
+    case "candidate_started":
+    case "candidate_delta":
+    case "candidate_completed": {
+      import("./candidates").then(({ handleCandidateEvent }) => {
+        handleCandidateEvent(event);
+      });
+      break;
+    }
+
+    // A new workspace snapshot was taken — keep the checkpoint timeline live.
+    case "checkpoint_created": {
+      if (event.session_id) {
+        import("./checkpoints").then(({ loadCheckpoints }) => {
+          void loadCheckpoints(event.session_id);
+        });
+      }
+      break;
+    }
   }
 }
 

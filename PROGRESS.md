@@ -42,7 +42,7 @@ Dependency order: C0 → C1 → {C2,C3,C4} → C5,C6 → {C7,C8,C9} → C10 → 
 | P4-C7 | widen code-intel to 9 languages (parallel fan-out) | ✅ done |
 | P4-C8 | multi-model orchestration: config + parallel fan-out engine | ✅ done |
 | P4-C9 | orchestration: synthesis pass + role-based routing + live turn integration | ✅ done |
-| P4-C10 | GUI: comparison/merge + checkpoint history | ⏳ headless ceiling |
+| P4-C10 | GUI: comparison/merge + checkpoint history | ✅ done (data layer tested; rendering = headless ceiling) |
 | P4-C11 | Phase-4 verification + benches + adversarial review | ⏳ pending |
 
 ### C8/C9 multi-model orchestration — honesty log
@@ -55,6 +55,14 @@ Dependency order: C0 → C1 → {C2,C3,C4} → C5,C6 → {C7,C8,C9} → C10 → 
 - **Decision — role-based final deliverable.** Sequential pipeline with EXPLICIT `role_order` (relying on `BTreeMap` key order is a documented fallback, flagged as a latent bug). Each stage sees the original prompt + prior stage outputs and streams as ephemeral `Candidate{index=stage}`. With no `synthesizer`, the FINAL stage is the durable answer (only-final-persists); with a `synthesizer`, every stage is intermediate and the synthesis produces the durable answer. Cancel mid-synthesis/final persists NOTHING (a partial synthesis is not a real answer — cleaner than the single-model path's persist-partial).
 - **Live BYOK ceiling.** Verified with `ScriptedProvider`s via `register_provider` (3 candidates + 1 synthesizer, role pipelines, all-failed → durable `Error`). Production runs only Anthropic (default) + NVIDIA (named); a true 3-distinct-vendor fan-out needs additional BYOK keys + registered providers (human/runtime config), not code.
 - **Residuals to sweep at C11 (advisor-flagged, deliberate ceilings — not oversights):** (1) mid-turn **steers are dropped** in an orchestrated turn — `promote_pending_steers` runs only in the single-model loop; queued *prompts* still run as separate activities. (2) The **synthesizer sees no conversation history** — only `user_request` + candidate texts (candidates do get full history); a follow-up-context limitation. (3) `role_order` as a strict subset of `roles` **silently drops** the unlisted roles (shortens the pipeline with no error). (4) **No live abort-during-orchestration E2E** test yet (`fan_out`/`stream_single` cancel is unit-covered; the abort_turn → orchestrated-branch → drain-settles path should get one E2E at C11, since abort is where a half-persist would hurt).
+
+### C10 GUI comparison + checkpoint history — honesty log
+
+- **Data layer tested; rendering is the headless ceiling.** Same posture as C14/C15: the verifiable parts (store logic + typecheck + build + vitest) are done; visual rendering, scroll, and keyboard interaction need a human GUI launch.
+  - **Tested (vitest, 10 new):** `candidates` store assembles per-candidate panes from `candidate_started/delta/completed`, marks errors, resets on a new fan-out (index 0), keeps panes index-ordered regardless of arrival, ignores orphan deltas, clamps ←/→ selection. `checkpoints` store filters `revert_backup`, orders newest-first, truncates the hash, loads via mockIPC, and clears to empty on IPC error.
+  - **Wiring (typecheck + build verified):** `candidate_*` events flow through the existing `messages.handleProtocolEvent` session-bleed guard → `candidates` store; `ComparisonView` renders only while panes exist; `CheckpointTimeline` reloads on session switch + `checkpoint_created`; panes/timeline cleared on session switch and delete.
+- **Ceiling — comparison "merge" is copy, not a true 3-way merge.** Plan 4.12's "select / diff / merge": `Enter`/`m` copies the selected candidate to the clipboard; there is no inter-candidate diff view and no client-side merge editor. The real merge happens server-side (the synthesis pass), so the GUI surfaces candidates for inspection rather than re-merging them. Inter-candidate diff + a merge editor are a follow-up.
+- **Ceiling — checkpoint revert is latest-only.** Plan 4.13's "one-click revert to ANY checkpoint": the backend `revert_session` restores the most-recent non-`revert_backup` checkpoint (snapshotting current state first for unrevert). The timeline's per-row Revert button is enabled ONLY on the latest row and disabled (with an explanatory tooltip) on older rows — arbitrary "restore to tree X" needs a new backend command and is deliberately not faked. No per-checkpoint diff view yet.
 
 ## Phase-1 adversarial review (done)
 Workflow `phase1-adversarial-review` (13 agents) confirmed 6 real bugs in C1–C5; all fixed:

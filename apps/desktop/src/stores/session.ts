@@ -9,6 +9,8 @@ import {
   loadMessages,
   setDisplayedSession,
 } from "./messages";
+import { clearCandidates } from "./candidates";
+import { clearCheckpoints } from "./checkpoints";
 
 // Monotonic subscription generation. Each `setActiveSession` mints a new value;
 // only the LATEST subscription's channel applies events. This subsumes the
@@ -122,8 +124,10 @@ async function setActiveSession(session: SessionInfo) {
   persistActiveSessionId(session.id);
   const mySeq = ++subscriptionSeq;
   // Clear the previous conversation immediately so the user never sees stale
-  // content during the load below.
+  // content during the load below. The candidate-comparison panes are per-turn
+  // and per-session, so drop them on a switch too.
   clearMessages();
+  clearCandidates();
 
   // Load the existing conversation from the DB (the source of truth) before we
   // start streaming live events. This is what makes switching/attaching show
@@ -192,6 +196,8 @@ async function deleteSession(sessionId: string) {
       setDisplayedSession(null);
       persistActiveSessionId(null);
       clearMessages();
+      clearCandidates();
+      clearCheckpoints();
     }
   } catch (e) {
     console.error("Failed to delete session:", e);

@@ -1468,3 +1468,110 @@ body {
 [data-tooltip]:hover::after {
   opacity: 1;
 }
+
+/* ── Multi-model comparison view (Phase 4, Step 4.12) ────────────────────── */
+.comparison-view {
+  border-top: 1px solid var(--border);
+  background: var(--bg-surface);
+  max-height: 40vh;
+  display: flex;
+  flex-direction: column;
+}
+.comparison-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--text-sm);
+}
+.comparison-title { font-weight: 600; }
+.comparison-live { color: var(--accent, #4caf50); font-weight: 600; }
+.comparison-hint { color: var(--text-muted); font-size: var(--text-xs); }
+.comparison-panes {
+  display: flex;
+  gap: var(--space-2);
+  overflow-x: auto;
+  padding: 0 var(--space-3) var(--space-3);
+}
+.comparison-pane {
+  flex: 1 0 280px;
+  min-width: 280px;
+  max-width: 480px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--bg-base);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  cursor: pointer;
+}
+.comparison-pane.selected { border-color: var(--accent, #4caf50); box-shadow: 0 0 0 1px var(--accent, #4caf50); }
+.comparison-pane.errored { opacity: 0.7; }
+.comparison-pane-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-surface);
+}
+.comparison-model {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.comparison-status { font-size: var(--text-xs); color: var(--text-muted); }
+.comparison-status.error { color: var(--danger, #e5484d); }
+.comparison-status.done { color: var(--accent, #4caf50); }
+.comparison-pane-body {
+  padding: var(--space-2);
+  overflow-y: auto;
+  font-size: var(--text-sm);
+}
+.comparison-empty { color: var(--text-muted); }
+
+/* ── Checkpoint timeline (Phase 4, Step 4.13) ───────────────────────────── */
+.checkpoint-timeline { padding: var(--space-3); border-top: 1px solid var(--border); }
+.checkpoint-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+.checkpoint-header h4 { margin: 0; font-size: var(--text-sm); }
+.checkpoint-refresh {
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: var(--text-base);
+}
+.checkpoint-empty { color: var(--text-muted); font-size: var(--text-sm); }
+.checkpoint-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--space-1); }
+.checkpoint-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+}
+.checkpoint-main { display: flex; justify-content: space-between; align-items: center; }
+.checkpoint-tool { font-weight: 600; }
+.checkpoint-hash { font-family: var(--font-mono); color: var(--text-muted); }
+.checkpoint-meta { display: flex; justify-content: space-between; align-items: center; }
+.checkpoint-time { color: var(--text-muted); }
+.checkpoint-revert {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: var(--text-xs);
+  padding: 1px 8px;
+}
+.checkpoint-revert:disabled { opacity: 0.4; cursor: not-allowed; }
