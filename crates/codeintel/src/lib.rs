@@ -1,14 +1,14 @@
 //! Code-intelligence engine (Phase 4): tree-sitter symbol extraction, FTS5 +
 //! nucleo search, incremental re-indexing, and the structural repo map.
 //!
-//! This module currently contains only the two foundation **spikes** the design
-//! review gated the rest of Phase 4 on (real `SymbolExtractor` /
-//! `LanguageRegistry` / index layers land in P4-C1+):
+//! A pure-CPU crate: it parses source, fuzzy-ranks, and formats the repo map.
+//! The DB-backed symbols index/search lives in `private-code-core` (all SQLite
+//! access is centralized there); core depends on this crate for the [`Symbol`]
+//! type and the [`SymbolExtractor`].
 //!
-//! - tree-sitter loads + parses + queries Rust AND TypeScript under one 0.26
-//!   runtime (ABI compatibility across grammar-crate versions).
-//! - FTS5 is compiled into the sqlx-bundled SQLite (`CREATE VIRTUAL TABLE …
-//!   USING fts5` applies).
+//! The `spikes` test module keeps the cross-grammar ABI regression guard (Rust
+//! 0.24 + TypeScript 0.23 under the 0.26 runtime). FTS5 availability is covered
+//! by core's `0002_symbols` migration test.
 
 mod extract;
 mod registry;
@@ -76,28 +76,5 @@ mod spikes {
             Some("foo"),
             "TypeScript 0.23 grammar must be ABI-compatible with the 0.26 runtime"
         );
-    }
-
-    /// FTS5 must be compiled into the sqlx-bundled SQLite, else `CREATE VIRTUAL
-    /// TABLE … USING fts5` fails with "no such module: fts5" at migration time.
-    #[tokio::test]
-    async fn spike_fts5_is_available_in_sqlx_sqlite() {
-        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::query("CREATE VIRTUAL TABLE t USING fts5(name, signature, filepath)")
-            .execute(&pool)
-            .await
-            .expect("FTS5 virtual table must create (FTS5 compiled into sqlx SQLite)");
-        sqlx::query(
-            "INSERT INTO t(name, signature, filepath) VALUES ('main', 'fn main()', 'src/main.rs')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        let hit: (String,) = sqlx::query_as("SELECT name FROM t WHERE t MATCH ?1")
-            .bind("main")
-            .fetch_one(&pool)
-            .await
-            .expect("FTS5 MATCH must return the inserted row");
-        assert_eq!(hit.0, "main");
     }
 }

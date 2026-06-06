@@ -8,6 +8,7 @@ publish = false
 private-code-protocol.workspace = true
 private-code-providers.workspace = true
 private-code-tools.workspace = true
+private-code-codeintel.workspace = true
 async-trait.workspace = true
 
 tokio.workspace = true
@@ -33,4 +34,9 @@ futures-util.workspace = true
 # Re-declare the providers crate with the testkit feature so core's tests can
 # use ScriptedProvider / SSE replay (off in normal lib builds).
 private-code-providers = { workspace = true, features = ["testkit"] }
+criterion.workspace = true
+
+[[bench]]
+name = "symbol_search"
+harness = false
 

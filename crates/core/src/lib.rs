@@ -5,3 +5,4 @@ pub mod coordinator;
 pub mod db;
 pub mod orchestrator;
 pub mod permissions;
+pub mod symbols;

@@ -4078,10 +4078,6 @@ name = "private-code-codeintel"
 version = "0.1.0"
 dependencies = [
  "serde",
- "serde_json",
- "sqlx",
- "thiserror 1.0.69",
- "tokio",
  "tracing",
  "tree-sitter",
  "tree-sitter-rust",
@@ -4094,11 +4090,13 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "criterion",
  "futures-util",
  "git2",
  "ignore",
  "json_comments",
  "nucleo",
+ "private-code-codeintel",
  "private-code-protocol",
  "private-code-providers",
  "private-code-tools",
