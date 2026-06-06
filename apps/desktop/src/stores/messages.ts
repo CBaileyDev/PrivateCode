@@ -208,6 +208,19 @@ function addUserMessage(text: string) {
   setMessageStore("messages", [...messageStore.messages, msg]);
 }
 
+/** Add a transient local system note (slash-command feedback). NOT persisted —
+ * the next DB reconcile (`loadMessages`) replaces it; it is a UI hint only. */
+function addSystemMessage(text: string) {
+  const msg: ParsedMessage = {
+    id: `sys-${Date.now()}`,
+    role: "system",
+    blocks: [{ type: "text", text }],
+    isStreaming: false,
+    createdAt: Date.now() / 1000,
+  };
+  setMessageStore("messages", [...messageStore.messages, msg]);
+}
+
 /** Clear all messages. */
 function clearMessages() {
   setMessageStore("messages", []);
@@ -223,6 +236,7 @@ export {
   loadMessages,
   handleProtocolEvent,
   addUserMessage,
+  addSystemMessage,
   clearMessages,
   resetStreaming,
   setDisplayedSession,

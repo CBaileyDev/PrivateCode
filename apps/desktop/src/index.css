@@ -1017,6 +1017,15 @@ body {
   overflow-y: auto;
 }
 
+.perm-feedback-input {
+  width: 100%;
+  box-sizing: border-box;
+  outline: none;
+}
+.perm-feedback-input:focus {
+  border-color: var(--accent, #6366f1);
+}
+
 .permission-dialog-footer {
   padding: var(--space-3) var(--space-5) var(--space-4);
   display: flex;

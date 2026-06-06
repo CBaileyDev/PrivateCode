@@ -215,6 +215,96 @@ async function initProject(name: string, directory: string) {
   }
 }
 
+/** Patch the locally-cached config of a session (active + list copies) so the
+ * dropdowns and panels reflect a change the backend already persisted. */
+function patchSessionConfig(id: string, patch: Partial<SessionInfo>) {
+  setSessionStore("sessions", (arr) =>
+    arr.map((s) => (s.id === id ? { ...s, ...patch } : s)),
+  );
+  setSessionStore("activeSession", (s) =>
+    s && s.id === id ? { ...s, ...patch } : s,
+  );
+}
+
+/**
+ * Switch the active session's model. `modelConfig` is a JSON string with
+ * `provider_id` + `model_id`. Returns `true` if the change is live now, `false`
+ * if a provider change was persisted but deferred (a turn is active) — the
+ * backend evicts + recreates the session on a provider change, only when idle.
+ */
+// A provider change requested mid-turn is persisted but the live session keeps
+// the old provider until it is evicted while idle. We stash the config here and
+// re-apply it on the next turn-end (see `flushPendingModelChange`) so the switch
+// doesn't silently linger until the 30-min reaper.
+let pendingModelConfig: string | null = null;
+
+async function setActiveModel(modelConfig: string): Promise<boolean> {
+  const s = sessionStore.activeSession;
+  if (!s) return true;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    const live = (await invoke("set_model", {
+      sessionId: s.id,
+      modelConfig,
+    })) as boolean;
+    patchSessionConfig(s.id, { model_config: modelConfig });
+    pendingModelConfig = live ? null : modelConfig;
+    return live;
+  } catch (e) {
+    console.error("set_model failed:", e);
+    return true;
+  }
+}
+
+/** Re-apply a deferred provider switch once the turn settles. Called by the app
+ * when streaming ends; a no-op if there is nothing pending. */
+async function flushPendingModelChange(): Promise<void> {
+  if (!pendingModelConfig) return;
+  await setActiveModel(pendingModelConfig); // now idle → evicts → live; clears on success
+}
+
+/** Switch the active session's agent (takes effect on the next turn). */
+async function setActiveAgent(agentId: string): Promise<void> {
+  const s = sessionStore.activeSession;
+  if (!s) return;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("set_agent", { sessionId: s.id, agentId });
+    patchSessionConfig(s.id, { agent_id: agentId });
+  } catch (e) {
+    console.error("set_agent failed:", e);
+  }
+}
+
+/** Revert the active session's workspace to its last checkpoint. Returns an
+ * error string on failure (e.g. nothing to revert), else null. */
+async function revertActiveSession(): Promise<string | null> {
+  const s = sessionStore.activeSession;
+  if (!s) return "No active session.";
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("revert_session", { sessionId: s.id });
+    await loadMessages(s.id); // revert appended a system message
+    return null;
+  } catch (e) {
+    return String(e);
+  }
+}
+
+/** Compact the active session's transcript. Returns an error string or null. */
+async function compactActiveSession(): Promise<string | null> {
+  const s = sessionStore.activeSession;
+  if (!s) return "No active session.";
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    await invoke("compact_session", { sessionId: s.id });
+    await loadMessages(s.id);
+    return null;
+  } catch (e) {
+    return String(e);
+  }
+}
+
 export {
   sessionStore,
   setSessionStore,
@@ -223,4 +313,9 @@ export {
   createNewSession,
   deleteSession,
   initProject,
+  setActiveModel,
+  setActiveAgent,
+  revertActiveSession,
+  compactActiveSession,
+  flushPendingModelChange,
 };

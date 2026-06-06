@@ -3,6 +3,8 @@
  * Keyboard-first navigation with arrow keys and Enter to execute.
  */
 import { createSignal, createMemo, For, onMount, onCleanup } from "solid-js";
+import { revertActiveSession, compactActiveSession } from "../stores/session";
+import { addSystemMessage, clearMessages } from "../stores/messages";
 
 interface PaletteCommand {
   id: string;
@@ -56,6 +58,9 @@ export default function CommandPalette(props: Props) {
       shortcut: "/revert",
       action: () => {
         props.onClose();
+        void revertActiveSession().then((err) => {
+          if (err) addSystemMessage(`Revert failed: ${err}`);
+        });
       },
     },
     {
@@ -65,6 +70,9 @@ export default function CommandPalette(props: Props) {
       shortcut: "/compact",
       action: () => {
         props.onClose();
+        void compactActiveSession().then((err) => {
+          addSystemMessage(err ? `Compact failed: ${err}` : "Context compacted.");
+        });
       },
     },
     {
@@ -74,6 +82,7 @@ export default function CommandPalette(props: Props) {
       shortcut: "/clear",
       action: () => {
         props.onClose();
+        clearMessages();
       },
     },
     {
@@ -114,6 +123,15 @@ export default function CommandPalette(props: Props) {
       shortcut: "/help",
       action: () => {
         props.onClose();
+        addSystemMessage(
+          "Available commands:\n" +
+            "/model <provider/name> — Switch model\n" +
+            "/agent <name> — Switch agent\n" +
+            "/revert — Revert workspace to last checkpoint\n" +
+            "/compact — Compact context\n" +
+            "/clear — Clear the local view\n" +
+            "/help — Show this help",
+        );
       },
     },
   ];

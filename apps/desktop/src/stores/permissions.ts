@@ -26,7 +26,10 @@ function addPendingPermission(perm: PendingPermission) {
   setPermissionStore("pending", perm);
 }
 
-async function replyPermission(reply: "once" | "always" | "reject") {
+async function replyPermission(
+  reply: "once" | "always" | "reject",
+  feedback?: string,
+) {
   const perm = permissionStore.pending;
   if (!perm) return;
 
@@ -36,6 +39,11 @@ async function replyPermission(reply: "once" | "always" | "reject") {
       sessionId: perm.sessionId,
       permissionId: perm.permissionId,
       reply,
+      // Feedback only travels on a denial; the model sees it in the tool_result.
+      feedback:
+        reply === "reject" && feedback && feedback.trim()
+          ? feedback.trim()
+          : null,
     });
   } catch (e) {
     console.error("Failed to reply permission:", e);

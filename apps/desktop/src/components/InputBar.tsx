@@ -2,16 +2,71 @@
  * InputBar — Rich input component with multi-line support,
  * model/agent selectors, slash commands, and file attachment.
  */
-import { createSignal, Show, onMount, onCleanup } from "solid-js";
-import { sessionStore } from "../stores/session";
-import { addUserMessage, messageStore, resetStreaming } from "../stores/messages";
+import { createSignal, For, Show } from "solid-js";
+import {
+  sessionStore,
+  setActiveModel,
+  setActiveAgent,
+  revertActiveSession,
+  compactActiveSession,
+} from "../stores/session";
+import {
+  addSystemMessage,
+  addUserMessage,
+  clearMessages,
+  messageStore,
+  resetStreaming,
+} from "../stores/messages";
+
+/** Selectable models. `value` is `provider|model_id` (model_id may itself
+ * contain `/`, e.g. NVIDIA's "meta/llama-…", so we split on the first `|`). */
+const MODEL_OPTIONS: { value: string; label: string }[] = [
+  { value: "anthropic|claude-opus-4-8", label: "Claude Opus 4.8" },
+  { value: "anthropic|claude-sonnet-4-6", label: "Claude Sonnet 4.6" },
+  { value: "anthropic|claude-haiku-4-5", label: "Claude Haiku 4.5" },
+  { value: "nvidia|meta/llama-3.3-70b-instruct", label: "Llama 3.3 70B (NVIDIA)" },
+];
+
+const AGENT_OPTIONS: { value: string; label: string }[] = [
+  { value: "build", label: "🔨 Build" },
+  { value: "plan", label: "📋 Plan" },
+  { value: "general", label: "🤖 General" },
+  { value: "explore", label: "🔍 Explore" },
+];
+
+function parseModelConfig(value: string): string {
+  const sep = value.indexOf("|");
+  const provider_id = value.slice(0, sep);
+  const model_id = value.slice(sep + 1);
+  return JSON.stringify({ provider_id, model_id });
+}
 
 export default function InputBar() {
   let textareaRef: HTMLTextAreaElement | undefined;
   const [text, setText] = createSignal("");
   const [isSending, setIsSending] = createSignal(false);
-  const [selectedModel, setSelectedModel] = createSignal("claude-opus-4-8");
-  const [selectedAgent, setSelectedAgent] = createSignal("build");
+
+  // The dropdowns reflect the ACTIVE session's persisted config (single source
+  // of truth), not a detached local signal.
+  const currentModelValue = () => {
+    try {
+      const cfg = JSON.parse(sessionStore.activeSession?.model_config ?? "{}");
+      if (cfg.provider_id && cfg.model_id) return `${cfg.provider_id}|${cfg.model_id}`;
+    } catch {
+      /* fall through */
+    }
+    return "anthropic|claude-opus-4-8";
+  };
+  const currentAgent = () => sessionStore.activeSession?.agent_id ?? "build";
+
+  const onModelChange = async (value: string) => {
+    const live = await setActiveModel(parseModelConfig(value));
+    if (!live) {
+      addSystemMessage(
+        "⏳ Model change saved — it takes effect after the current turn finishes.",
+      );
+    }
+  };
 
   const autoResize = () => {
     if (textareaRef) {
@@ -60,52 +115,63 @@ export default function InputBar() {
     switch (command) {
       case "/model": {
         if (args) {
-          setSelectedModel(args);
-          addUserMessage(`Switched model to ${args}`);
+          // Accept "provider/model" (provider ∈ {anthropic,nvidia}) or a bare
+          // model id (defaults to anthropic).
+          let provider = "anthropic";
+          let model = args;
+          if (args.startsWith("nvidia/")) {
+            provider = "nvidia";
+            model = args.slice("nvidia/".length);
+          } else if (args.startsWith("anthropic/")) {
+            model = args.slice("anthropic/".length);
+          }
+          const cfg = JSON.stringify({ provider_id: provider, model_id: model });
+          const live = await setActiveModel(cfg);
+          addSystemMessage(
+            live
+              ? `Switched model to ${provider}/${model}.`
+              : `Model change to ${provider}/${model} saved — applies after the current turn.`,
+          );
         }
         break;
       }
       case "/agent": {
         if (args) {
-          setSelectedAgent(args);
-          addUserMessage(`Switched agent to ${args}`);
+          await setActiveAgent(args);
+          addSystemMessage(`Switched agent to ${args}.`);
         }
         break;
       }
       case "/revert": {
-        try {
-          const { invoke } = await import("@tauri-apps/api/core");
-          await invoke("abort_session", {
-            sessionId: sessionStore.activeSession!.id,
-          });
-          addUserMessage("Reverted to last checkpoint.");
-        } catch (e) {
-          console.error("Revert failed:", e);
-        }
+        const err = await revertActiveSession();
+        if (err) addSystemMessage(`Revert failed: ${err}`);
         break;
       }
       case "/compact": {
-        addUserMessage("Compacting context...");
+        const err = await compactActiveSession();
+        addSystemMessage(err ? `Compact failed: ${err}` : "Context compacted.");
         break;
       }
       case "/clear": {
-        addUserMessage("Session cleared.");
+        // View-only: clears the local pane (the DB transcript is unchanged and
+        // reloads on the next reconcile/switch).
+        clearMessages();
         break;
       }
       case "/help": {
-        addUserMessage(
+        addSystemMessage(
           "Available commands:\n" +
-            "/model <name> — Switch model\n" +
+            "/model <provider/name> — Switch model\n" +
             "/agent <name> — Switch agent\n" +
-            "/revert — Revert to last checkpoint\n" +
+            "/revert — Revert workspace to last checkpoint\n" +
             "/compact — Compact context\n" +
-            "/clear — Clear session\n" +
+            "/clear — Clear the local view\n" +
             "/help — Show this help"
         );
         break;
       }
       default: {
-        addUserMessage(`Unknown command: ${command}. Type /help for available commands.`);
+        addSystemMessage(`Unknown command: ${command}. Type /help for available commands.`);
       }
     }
   };
@@ -194,25 +260,24 @@ export default function InputBar() {
         <div class="input-meta">
           <select
             class="model-selector"
-            value={selectedModel()}
-            onChange={(e) => setSelectedModel(e.currentTarget.value)}
+            value={currentModelValue()}
+            onChange={(e) => onModelChange(e.currentTarget.value)}
             id="model-selector"
           >
-            <option value="claude-opus-4-8">Claude Opus 4.8</option>
-            <option value="claude-sonnet-4-5">Claude Sonnet 4.5</option>
-            <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+            <For each={MODEL_OPTIONS}>
+              {(opt) => <option value={opt.value}>{opt.label}</option>}
+            </For>
           </select>
 
           <select
             class="agent-selector"
-            value={selectedAgent()}
-            onChange={(e) => setSelectedAgent(e.currentTarget.value)}
+            value={currentAgent()}
+            onChange={(e) => setActiveAgent(e.currentTarget.value)}
             id="agent-selector"
           >
-            <option value="build">🔨 Build</option>
-            <option value="plan">📋 Plan</option>
-            <option value="general">🤖 General</option>
-            <option value="explore">🔍 Explore</option>
+            <For each={AGENT_OPTIONS}>
+              {(opt) => <option value={opt.value}>{opt.label}</option>}
+            </For>
           </select>
 
           <span style={{ "margin-left": "auto" }}>

@@ -1,13 +1,12 @@
-import { createSignal, Show, onMount, onCleanup } from "solid-js";
+import { createSignal, createEffect, Show, onMount, onCleanup } from "solid-js";
 import Sidebar from "./components/Sidebar";
 import MessageList from "./components/MessageList";
 import InputBar from "./components/InputBar";
 import UsagePanel from "./components/UsagePanel";
 import PermissionDialog from "./components/PermissionDialog";
 import CommandPalette from "./components/CommandPalette";
-import { sessionStore, loadSessions, setActiveSession } from "./stores/session";
-import { messageStore, loadMessages } from "./stores/messages";
-import { usageStore } from "./stores/usage";
+import { sessionStore, loadSessions, flushPendingModelChange } from "./stores/session";
+import { messageStore } from "./stores/messages";
 import { permissionStore } from "./stores/permissions";
 
 export default function App() {
@@ -41,6 +40,12 @@ export default function App() {
       setPaletteOpen(false);
     }
   };
+
+  // Re-apply a model/provider change that was deferred because a turn was
+  // active, as soon as streaming ends (else it lingers until the idle reaper).
+  createEffect(() => {
+    if (!messageStore.isStreaming) void flushPendingModelChange();
+  });
 
   onMount(() => {
     document.addEventListener("keydown", handleKeyDown);

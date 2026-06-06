@@ -3,11 +3,23 @@
  * Shows tool name, action, resources, and preview of what will happen.
  * Keyboard shortcuts: y = once, a = always, n = reject.
  */
-import { onMount, onCleanup } from "solid-js";
+import { createSignal, onMount, onCleanup } from "solid-js";
 import { permissionStore, replyPermission } from "../stores/permissions";
 
 export default function PermissionDialog() {
+  const [feedback, setFeedback] = createSignal("");
+
   const handleKeyDown = (e: KeyboardEvent) => {
+    // Don't let the single-key shortcuts fire while the user is typing a denial
+    // reason (otherwise the letters "n"/"y"/"a" would trigger a decision).
+    const tag = (e.target as HTMLElement | null)?.tagName;
+    if (tag === "INPUT" || tag === "TEXTAREA") {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        replyPermission("reject", feedback());
+      }
+      return;
+    }
     if (e.key === "y") {
       e.preventDefault();
       replyPermission("once");
@@ -16,7 +28,7 @@ export default function PermissionDialog() {
       replyPermission("always");
     } else if (e.key === "n" || e.key === "Escape") {
       e.preventDefault();
-      replyPermission("reject");
+      replyPermission("reject", feedback());
     }
   };
 
@@ -60,12 +72,24 @@ export default function PermissionDialog() {
             <div class="detail-label">Preview</div>
             <div class="detail-value">{perm()?.preview}</div>
           </div>
+
+          <div class="permission-detail">
+            <div class="detail-label">Reason (optional)</div>
+            <input
+              class="detail-value perm-feedback-input"
+              type="text"
+              placeholder="Sent to the model when you reject…"
+              value={feedback()}
+              onInput={(e) => setFeedback(e.currentTarget.value)}
+              id="perm-feedback-input"
+            />
+          </div>
         </div>
 
         <div class="permission-dialog-footer">
           <button
             class="perm-btn reject"
-            onClick={() => replyPermission("reject")}
+            onClick={() => replyPermission("reject", feedback())}
             id="perm-reject-btn"
           >
             Reject <span class="kbd">n</span>
