@@ -33,6 +33,10 @@ describe("safeUrl", () => {
     expect(safeUrl("data:text/html,<script>1</script>")).toBe("#");
     expect(safeUrl("vbscript:msgbox(1)")).toBe("#");
   });
+
+  it("rejects protocol-relative //host", () => {
+    expect(safeUrl("//evil.com")).toBe("#");
+  });
 });
 
 describe("renderInline (XSS)", () => {

@@ -28,6 +28,9 @@ export function escapeHtml(s: string): string {
  */
 export function safeUrl(url: string): string {
   const trimmed = url.trim();
+  // Reject protocol-relative `//host` (it inherits the page scheme and points
+  // off-origin) before the relative-reference allowance below.
+  if (trimmed.startsWith("//")) return "#";
   if (/^(https?:|mailto:)/i.test(trimmed) || /^[/.#?]/.test(trimmed)) {
     return trimmed;
   }
