@@ -15,7 +15,7 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | C4 | Git-backed E2E turn + reconcile-arms + compaction impl | ✅ done |
 | C5 | Permission-park + tool.run cancellability (CRITICAL prereq) | ✅ done |
 | C6 | Daemon serve refactor (build_router/serve_daemon/DI) | ✅ done |
-| C7 | Daemon graceful shutdown + WS round-trip test | ⬜ pending |
+| C7 | Daemon graceful shutdown + WS round-trip test | ✅ done |
 | C8 | Daemon eviction reaper + steer/queue + ToolRequested | ⬜ pending |
 | C9 | Daemon lock-across-await + durable replay | ⬜ pending |
 | C10 | Desktop command→EngineState seam + set_model/agent/revert/compact + eviction | ⬜ pending |
