@@ -172,6 +172,64 @@ impl Orchestrator {
         Ok(input_id)
     }
 
+    /// At a safe provider-turn boundary, coalesce every pending `delivery="steer"`
+    /// input into the visible history as a chronological user message, in durable
+    /// admission order (session.md L153: steers "promote at the next safe
+    /// provider-turn boundary, including continuation inside the current drain";
+    /// L165: "coalesces pending steers in durable admission order"). Returns the
+    /// number promoted so the caller knows whether to refetch messages.
+    ///
+    /// This is the ONLY place steers fold into a running activity. It is idempotent
+    /// against the coordinator's queue: the coordinator also enqueues every input
+    /// id, but a steer promoted here is no longer pending, so when its queued copy
+    /// is later popped `run_session_turn` finds nothing to promote and no-ops. A
+    /// steer that arrives after this turn's last boundary stays pending and simply
+    /// opens the next activity when the queue drains it — never lost, never double-run.
+    ///
+    /// `chain_watermark` is the opening input's `admitted_seq`: only steers admitted
+    /// strictly after it fold in. That is the ownership-chain boundary (session.md
+    /// L163) — a steer abandoned by an abort keeps a seq below any later fresh
+    /// prompt, so a subsequent unrelated activity never resurrects it. Those orphan
+    /// rows are preserved-but-skipped by design (recovery is deferred future work,
+    /// not a leak).
+    async fn promote_pending_steers(
+        &self,
+        session_id: &str,
+        chain_watermark: i64,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let pending = db::get_pending_inputs(&self.pool, session_id).await?;
+        // `get_pending_inputs` is already ordered by `admitted_seq` (durable
+        // admission order); keep only steers admitted within this chain. Queued
+        // inputs open their own activities and must NOT be folded in here.
+        let steers: Vec<_> = pending
+            .into_iter()
+            .filter(|i| i.delivery == "steer" && i.admitted_seq > chain_watermark)
+            .collect();
+        if steers.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = self.pool.begin().await?;
+        for input in &steers {
+            let seq = db::next_sequence(&mut tx, session_id).await?;
+            db::promote_session_input(&mut tx, &input.id, seq).await?;
+
+            let msg_id = Uuid::new_v4().to_string();
+            let msg = ChatMessage {
+                id: msg_id.clone(),
+                role: Role::User,
+                content: vec![ContentBlock::Text {
+                    text: input.prompt.clone(),
+                }],
+                created_at: chrono::Utc::now().timestamp(),
+            };
+            let msg_json = serde_json::to_string(&msg)?;
+            db::append_message(&mut tx, &msg_id, session_id, seq, "user", &msg_json).await?;
+        }
+        tx.commit().await?;
+        Ok(steers.len())
+    }
+
     /// Ephemeral deltas: drop on a full channel rather than block the turn
     /// (the durable `message.completed` carries the final text either way).
     /// Durable events are sent with `.send().await` directly so they're never lost.
@@ -207,6 +265,9 @@ impl Orchestrator {
                 return Ok(()); // Already processed
             }
         };
+        // This chain's ownership boundary: only steers admitted strictly after the
+        // opening input fold into it (see `promote_pending_steers`).
+        let chain_watermark = input_row.admitted_seq;
 
         let user_msg_seq = db::next_sequence(&mut tx, session_id).await?;
         db::promote_session_input(&mut tx, &input_row.id, user_msg_seq).await?;
@@ -381,6 +442,13 @@ impl Orchestrator {
                 break;
             }
             turn_count += 1;
+
+            // Safe provider-turn boundary: fold any pending steer inputs into the
+            // visible history (in durable admission order) BEFORE assembling this
+            // turn's request, so a steer that arrived mid-drain is seen on the next
+            // provider turn rather than waiting for a fresh activity (session.md L153).
+            self.promote_pending_steers(session_id, chain_watermark)
+                .await?;
 
             // Fetch current messages, applying any compaction boundary.
             let db_msgs = db::get_messages(&self.pool, session_id).await?;
@@ -1844,6 +1912,239 @@ mod tests {
             msgs.iter()
                 .any(|m| m.type_ == "system" && m.data.contains("v2 different")),
             "an Updated turn must append a system delta message carrying the new instructions"
+        );
+    }
+
+    /// Turn 1 signals it was reached, then blocks until released, then emits a
+    /// `mock` tool_use (forcing a turn 2); every later turn emits a terminal text.
+    /// This opens a deterministic window AFTER turn 1's boundary scan but BEFORE
+    /// turn 2's, so a steer admitted in it must fold into the SAME activity.
+    struct GatedToolProvider {
+        reached: StdMutex<Option<oneshot::Sender<()>>>,
+        release: StdMutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for GatedToolProvider {
+        async fn stream_chat(
+            &self,
+            _model_id: &str,
+            _system_prompt: Option<&str>,
+            _max_tokens: u32,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError>
+        {
+            // Only the first call holds the reached-signal and the release-gate.
+            if let Some(tx) = self.reached.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let release = self.release.lock().unwrap().take();
+            if let Some(rx) = release {
+                let _ = rx.await;
+                // Turn 1: a tool call so the loop continues to a turn 2 boundary.
+                let evs = vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "tu1".into(),
+                        name: "mock".into(),
+                    },
+                    ProviderEvent::ToolUseComplete {
+                        id: "tu1".into(),
+                        name: "mock".into(),
+                        input: serde_json::json!({}),
+                    },
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("tool_use".into()),
+                    },
+                ];
+                return Ok(futures_util::stream::iter(evs.into_iter().map(Ok)).boxed());
+            }
+            // Turn 2+: terminate.
+            let evs = vec![
+                ProviderEvent::TextDelta("done".into()),
+                ProviderEvent::MessageStop {
+                    usage: UsageStats::default(),
+                    finish_reason: Some("end_turn".into()),
+                },
+            ];
+            Ok(futures_util::stream::iter(evs.into_iter().map(Ok)).boxed())
+        }
+        fn count_tokens(&self, _m: &str, t: &str) -> usize {
+            t.len() / 4
+        }
+    }
+
+    /// A `delivery="steer"` input admitted while a turn is in flight is folded into
+    /// the SAME activity at the next safe provider-turn boundary (session.md L153) —
+    /// it appears as a visible user message after the opening prompt and the tool
+    /// round-trip. And once coalesced, re-running it (as the coordinator's queued
+    /// copy eventually would) is a clean no-op — the property that lets the
+    /// coordinator enqueue every input without double-running steers.
+    #[tokio::test]
+    async fn steer_coalesces_into_the_running_activity() {
+        let ws = TempDir::new().unwrap();
+        let (reached_tx, reached_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let provider = Arc::new(GatedToolProvider {
+            reached: StdMutex::new(Some(reached_tx)),
+            release: StdMutex::new(Some(release_rx)),
+        });
+        let (orch, sid, pool) = make_orch(provider, ws.path()).await;
+
+        // Open the activity (promoted by run_session_turn step 3).
+        let a = orch.admit_input(&sid, "open", "queue").await.unwrap();
+        let orch_run = orch.clone();
+        let sid_run = sid.clone();
+        // Discard the (non-Send) Box<dyn Error> inside the task so the JoinHandle
+        // output stays Send; the DB assertions below verify the turn succeeded.
+        let run = tokio::spawn(async move {
+            let _ = orch_run
+                .run_session_turn(&sid_run, &a, CancellationToken::new())
+                .await;
+        });
+
+        // Turn 1 is now in flight: its boundary scan has already run and saw no
+        // steer. Admit one NOW so it can only be coalesced at turn 2's boundary.
+        reached_rx.await.unwrap();
+        let s = orch.admit_input(&sid, "steer me", "steer").await.unwrap();
+        release_tx.send(()).unwrap();
+
+        run.await.unwrap();
+
+        // The steer became a visible user message, after the opening prompt.
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        let parsed: Vec<(i64, ChatMessage)> = msgs
+            .iter()
+            .filter_map(|m| {
+                serde_json::from_str::<ChatMessage>(&m.data)
+                    .ok()
+                    .map(|c| (m.seq, c))
+            })
+            .collect();
+        let user_texts: Vec<String> = parsed
+            .iter()
+            .filter(|(_, m)| m.role == Role::User)
+            .filter_map(|(_, m)| {
+                m.content.iter().find_map(|c| match c {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert_eq!(
+            user_texts,
+            vec!["open".to_string(), "steer me".to_string()],
+            "the steer folded in as a user message after the opening prompt"
+        );
+
+        // It was coalesced AT the turn-2 boundary (after turn 1's assistant
+        // tool_use), proving mid-drain injection rather than a pre-turn-1 promotion.
+        let steer_seq = parsed
+            .iter()
+            .find(|(_, m)| {
+                m.role == Role::User
+                    && m.content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlock::Text { text } if text == "steer me"))
+            })
+            .map(|(seq, _)| *seq)
+            .unwrap();
+        let tool_use_seq = parsed
+            .iter()
+            .find(|(_, m)| {
+                m.role == Role::Assistant
+                    && m.content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlock::ToolUse { .. }))
+            })
+            .map(|(seq, _)| *seq)
+            .unwrap();
+        assert!(
+            steer_seq > tool_use_seq,
+            "the steer was coalesced at the turn-2 boundary, after turn 1's tool_use"
+        );
+
+        // The inbox fully drained — the coalesced steer is not left pending.
+        assert!(
+            db::get_pending_inputs(&pool, &sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the coalesced steer is promoted, not left pending"
+        );
+
+        // The coordinator also enqueues every input id; when it later pops this
+        // steer's queued copy, run_session_turn must find nothing to promote and
+        // add no messages (idempotent — no double-run).
+        let before = get_messages(&pool, &sid).await.unwrap().len();
+        orch.run_session_turn(&sid, &s, CancellationToken::new())
+            .await
+            .unwrap();
+        let after = get_messages(&pool, &sid).await.unwrap().len();
+        assert_eq!(
+            before, after,
+            "re-running an already-coalesced steer is a no-op (no double-run)"
+        );
+    }
+
+    /// The ownership-chain boundary: a steer left pending by an abort (lower seq)
+    /// must NOT be resurrected into a LATER unrelated activity (session.md L163).
+    /// This fails without the `admitted_seq > chain_watermark` filter (the scan
+    /// would coalesce the orphan steer into the fresh turn) and passes with it.
+    #[tokio::test]
+    async fn abandoned_steer_is_not_resurrected_into_a_later_activity() {
+        let ws = TempDir::new().unwrap();
+        // One terminal text turn — the fresh activity does no tool work.
+        let provider = Arc::new(ScriptedProvider {
+            turns: StdMutex::new(VecDeque::from(vec![vec![
+                ProviderEvent::TextDelta("fresh reply".into()),
+                ProviderEvent::MessageStop {
+                    usage: UsageStats::default(),
+                    finish_reason: Some("end_turn".into()),
+                },
+            ]])),
+        });
+        let (orch, sid, pool) = make_orch(provider, ws.path()).await;
+
+        // An orphan steer: admitted (lower seq) but never run — the residue an
+        // abort leaves behind after clearing the in-memory queue.
+        orch.admit_input(&sid, "stale steer", "steer")
+            .await
+            .unwrap();
+        // A later, unrelated fresh prompt opens a new activity (higher seq).
+        let b = orch.admit_input(&sid, "fresh", "queue").await.unwrap();
+        orch.run_session_turn(&sid, &b, CancellationToken::new())
+            .await
+            .unwrap();
+
+        // The fresh activity must contain "fresh" but NOT the orphan steer.
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        let user_texts: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .filter(|m| m.role == Role::User)
+            .filter_map(|m| {
+                m.content.iter().find_map(|c| match c {
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+            })
+            .collect();
+        assert!(
+            user_texts.contains(&"fresh".to_string()),
+            "the fresh prompt was promoted"
+        );
+        assert!(
+            !user_texts.contains(&"stale steer".to_string()),
+            "the abandoned steer must NOT be resurrected into a later activity"
+        );
+
+        // It is preserved-but-skipped: still a pending inbox row (recovery deferred).
+        let pending = db::get_pending_inputs(&pool, &sid).await.unwrap();
+        assert!(
+            pending.iter().any(|i| i.prompt == "stale steer"),
+            "the abandoned steer is preserved as a pending row, not lost"
         );
     }
 
