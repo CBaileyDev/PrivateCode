@@ -1161,6 +1161,89 @@ mod tests {
         coord.shutdown(Duration::from_secs(5)).await;
     }
 
+    /// Cold reconnect after eviction: once a turn has settled and the reaper has
+    /// evicted the session, a reconnecting client gets an EMPTY in-memory replay
+    /// (no stale/duplicate events, no panic) and reconstructs the conversation +
+    /// usage purely from the DB. This is the evidence that "durable replay from
+    /// DB" needs no event-log table — every durable event has a REST content home
+    /// (messages → session_message, usage → session row), and the only transient
+    /// events (permission prompt, error) can't be pending post-settlement.
+    #[tokio::test]
+    async fn cold_reconnect_after_eviction_reconstructs_from_db() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(&pool, &sid, &project_id, ws_str, ws_str, "t", "build", &cfg)
+            .await
+            .unwrap();
+
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+
+        // Run a turn to completion (wait for the durable MessageCompleted).
+        let mut rx = coord.get_or_create_session(&sid).await.unwrap();
+        coord.run_turn(&sid, "hi there", "queue").await.unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(ProtocolEvent::MessageCompleted { .. })) => break,
+                Ok(Ok(_)) => continue,
+                _ => continue,
+            }
+        }
+
+        // Evict the live session (what the reaper does post-settlement).
+        {
+            let mut map = coord.sessions.lock().await;
+            if let Some(sess) = map.remove(&sid) {
+                sess.session_cancel.cancel();
+            }
+            assert!(!map.contains_key(&sid), "session evicted");
+        }
+
+        // Cold reconnect: history rebuilds empty (no stale/duplicate replay).
+        let replay = coord.get_history(&sid, 0).await.unwrap();
+        assert!(
+            replay.is_empty(),
+            "post-eviction in-memory replay is empty, not stale; got {} events",
+            replay.len()
+        );
+
+        // The conversation is fully reconstructable from the DB.
+        let msgs = db::get_messages(&pool, &sid).await.unwrap();
+        let texts: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .flat_map(|cm| cm.content)
+            .filter_map(|b| match b {
+                ContentBlock::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.contains("hi there")),
+            "the user prompt survives in the DB"
+        );
+        assert!(
+            texts.iter().any(|t| t.contains("hello")),
+            "the assistant reply survives in the DB"
+        );
+
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
+
     /// A provider whose `count_tokens` returns a fixed sentinel, so a test can
     /// tell which provider `select_provider` returned.
     struct SentinelProvider(usize);
