@@ -264,6 +264,11 @@ export default function InputBar() {
             onChange={(e) => onModelChange(e.currentTarget.value)}
             id="model-selector"
           >
+            {/* Show a session's model even if it isn't a built-in option (e.g.
+                set via a slash command) so the select never renders blank. */}
+            <Show when={!MODEL_OPTIONS.some((o) => o.value === currentModelValue())}>
+              <option value={currentModelValue()}>{currentModelValue()}</option>
+            </Show>
             <For each={MODEL_OPTIONS}>
               {(opt) => <option value={opt.value}>{opt.label}</option>}
             </For>

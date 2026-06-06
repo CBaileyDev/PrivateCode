@@ -233,10 +233,13 @@ function patchSessionConfig(id: string, patch: Partial<SessionInfo>) {
  * backend evicts + recreates the session on a provider change, only when idle.
  */
 // A provider change requested mid-turn is persisted but the live session keeps
-// the old provider until it is evicted while idle. We stash the config here and
-// re-apply it on the next turn-end (see `flushPendingModelChange`) so the switch
-// doesn't silently linger until the 30-min reaper.
-let pendingModelConfig: string | null = null;
+// the old provider until it is evicted while idle. We stash it — KEYED BY
+// SESSION — and re-apply on the next turn-end (see `flushPendingModelChange`) so
+// the switch doesn't silently linger until the 30-min reaper. Keying by session
+// is load-bearing: switching sessions flips `isStreaming` (via clearMessages),
+// which fires the flush; without the key it would write the stashed config onto
+// the WRONG session's row.
+let pendingModelChange: { sessionId: string; config: string } | null = null;
 
 async function setActiveModel(modelConfig: string): Promise<boolean> {
   const s = sessionStore.activeSession;
@@ -248,7 +251,7 @@ async function setActiveModel(modelConfig: string): Promise<boolean> {
       modelConfig,
     })) as boolean;
     patchSessionConfig(s.id, { model_config: modelConfig });
-    pendingModelConfig = live ? null : modelConfig;
+    pendingModelChange = live ? null : { sessionId: s.id, config: modelConfig };
     return live;
   } catch (e) {
     console.error("set_model failed:", e);
@@ -257,10 +260,14 @@ async function setActiveModel(modelConfig: string): Promise<boolean> {
 }
 
 /** Re-apply a deferred provider switch once the turn settles. Called by the app
- * when streaming ends; a no-op if there is nothing pending. */
+ * when streaming ends; a no-op if nothing is pending or the pending change
+ * belongs to a session that is no longer active (its DB row already has the new
+ * config — it applies when that session is revisited and goes idle, or via the
+ * reaper). */
 async function flushPendingModelChange(): Promise<void> {
-  if (!pendingModelConfig) return;
-  await setActiveModel(pendingModelConfig); // now idle → evicts → live; clears on success
+  if (!pendingModelChange) return;
+  if (sessionStore.activeSession?.id !== pendingModelChange.sessionId) return;
+  await setActiveModel(pendingModelChange.config); // now idle → evicts → live; clears on success
 }
 
 /** Switch the active session's agent (takes effect on the next turn). */
