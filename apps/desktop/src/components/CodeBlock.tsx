@@ -1,9 +1,12 @@
 /**
- * CodeBlock — Syntax-highlighted code block with language label,
- * line numbers, and copy button. Highlights via a simple CSS-based
- * approach; the Shiki web worker is available for richer highlighting.
+ * CodeBlock — Syntax-highlighted code block with a language label and copy
+ * button. Highlighting runs in the Shiki worker (off the main thread); until it
+ * resolves — and if it ever fails — we render escaped plain text, so the block
+ * always degrades gracefully. Shiki output escapes the code content, so the
+ * `innerHTML` here is safe (do NOT route it through the markdown sanitizer).
  */
-import { createSignal, createMemo, Show } from "solid-js";
+import { createSignal, onCleanup, Show } from "solid-js";
+import { highlightInWorker } from "../lib/shiki-client";
 
 interface Props {
   code: string;
@@ -12,6 +15,22 @@ interface Props {
 
 export default function CodeBlock(props: Props) {
   const [copied, setCopied] = createSignal(false);
+  const [html, setHtml] = createSignal<string | null>(null);
+
+  // Highlight once on mount. A virtua unmount mid-flight is handled by the
+  // `cancelled` flag (a late resolve is dropped); the worker client owns the
+  // pending-map cleanup, so there is no per-component listener leak.
+  let cancelled = false;
+  onCleanup(() => {
+    cancelled = true;
+  });
+  highlightInWorker(props.code, props.language)
+    .then((h) => {
+      if (!cancelled) setHtml(h);
+    })
+    .catch(() => {
+      /* keep the plain-text fallback */
+    });
 
   const handleCopy = async () => {
     try {
@@ -22,8 +41,6 @@ export default function CodeBlock(props: Props) {
       console.error("Copy failed:", e);
     }
   };
-
-  const lines = createMemo(() => props.code.split("\n"));
 
   return (
     <div class="code-block" id={`code-block-${props.language}`}>
@@ -36,34 +53,17 @@ export default function CodeBlock(props: Props) {
           {copied() ? "✓ Copied" : "Copy"}
         </button>
       </div>
-      <pre>
-        <code>
-          {lines().map((line, i) => (
-            <div
-              style={{
-                display: "flex",
-                "min-height": "20px",
-              }}
-            >
-              <span
-                style={{
-                  width: "40px",
-                  "text-align": "right",
-                  "padding-right": "12px",
-                  color: "var(--text-muted)",
-                  "user-select": "none",
-                  "flex-shrink": "0",
-                  "font-size": "var(--text-xs)",
-                  opacity: "0.5",
-                }}
-              >
-                {i + 1}
-              </span>
-              <span style={{ flex: "1" }}>{line || " "}</span>
-            </div>
-          ))}
-        </code>
-      </pre>
+      <Show
+        when={html()}
+        fallback={
+          <pre class="code-fallback">
+            <code>{props.code}</code>
+          </pre>
+        }
+      >
+        {/* Shiki output is trusted, escaped HTML. */}
+        <div class="shiki-host" innerHTML={html()!} />
+      </Show>
     </div>
   );
 }

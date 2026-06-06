@@ -588,6 +588,41 @@ body {
   color: var(--accent);
 }
 
+/* Shiki-highlighted output (and the plain-text fallback before it resolves). */
+.shiki-host .shiki,
+.code-fallback {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  overflow-x: auto;
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  tab-size: 4;
+}
+.code-fallback {
+  background: var(--bg-primary);
+}
+.shiki-host .shiki code {
+  /* Line numbers via a CSS counter on Shiki's per-line spans. */
+  counter-reset: shiki-line;
+  display: block;
+}
+.shiki-host .shiki .line {
+  display: inline-block;
+  width: 100%;
+}
+.shiki-host .shiki .line::before {
+  counter-increment: shiki-line;
+  content: counter(shiki-line);
+  display: inline-block;
+  width: 2.5em;
+  margin-right: var(--space-3);
+  text-align: right;
+  color: var(--text-muted);
+  opacity: 0.5;
+  user-select: none;
+}
+
 /* ─── Diff Viewer ───────────────────────────────────────────────────────── */
 .diff-viewer {
   margin: var(--space-3) 0;
