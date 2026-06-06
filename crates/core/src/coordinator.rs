@@ -89,6 +89,25 @@ pub fn should_forward(event: &ProtocolEvent, watermark: i64) -> bool {
     seq == 0 || seq > watermark
 }
 
+/// The durable events in `history` strictly newer than `after_seq`, in order.
+/// This is the recovery primitive both event forwarders (daemon WS + desktop
+/// subscribe) use after a broadcast `Lagged`: a burst of ephemeral deltas can
+/// overflow a slow-but-connected subscriber's 16384 ring view and evict
+/// interleaved durable events (`Error`, `ToolPermissionRequired`) from THAT
+/// receiver — but never from `sess.history`, which the event router populates
+/// with durable events ONLY (deltas are excluded by `is_durable_event`) under
+/// the same lock before broadcasting. So replaying `durable_after(history,
+/// last_forwarded_seq)` on a `Lagged` recovers exactly the durable events the
+/// subscriber missed, without resurrecting an evicted session (a `Lagged`
+/// implies the session is still live; eviction drops the sender → `Closed`).
+pub fn durable_after(history: &[ProtocolEvent], after_seq: i64) -> Vec<ProtocolEvent> {
+    history
+        .iter()
+        .filter(|e| event_seq(e) > after_seq)
+        .cloned()
+        .collect()
+}
+
 impl SessionCoordinator {
     pub fn new(
         pool: sqlx::SqlitePool,
@@ -542,12 +561,21 @@ impl SessionCoordinator {
         Ok(())
     }
 
-    /// Replay durable events emitted since `after_seq` for a reconnecting client.
+    /// Replay durable events emitted since `after_seq` for a (re)connecting client.
     /// This carries live state (completed messages, tool outputs, checkpoints,
-    /// usage, errors) — NOT message *content*, which the client reconciles from
-    /// the shared SQLite DB. Returning only the in-memory durable log keeps replay
-    /// simple and correct; the previous DB "reconstruction" emitted content-less
-    /// events and double-counted, which broke attach.
+    /// usage, errors, permission prompts) — NOT message *content*, which the
+    /// client reconciles from the shared SQLite DB. Returning only the in-memory
+    /// durable log keeps replay simple and correct; the previous DB
+    /// "reconstruction" emitted content-less events and double-counted, which
+    /// broke attach.
+    ///
+    /// NOTE: this rebuilds the session if it isn't live (the initial subscribe
+    /// path wants that). For *connected* lag recovery the forwarders instead read
+    /// the live history directly via [`durable_after`] — they must NOT resurrect
+    /// an evicted session. The replay is bounded: `Error` and
+    /// `ToolPermissionRequired` have no DB content home, so once a session is
+    /// idle-evicted they are gone — a cold reconnect after eviction cannot recover
+    /// them (the deferred durable-event-log would close that residual gap).
     pub async fn get_history(
         &self,
         session_id: &str,
@@ -2160,5 +2188,208 @@ mod tests {
 
         // The parked oneshot received the grant.
         assert_eq!(_rx.await.unwrap(), PermissionReply::Allow);
+    }
+
+    /// The recovery primitive both event forwarders depend on after a broadcast
+    /// `Lagged`: `durable_after` returns the durable events strictly newer than the
+    /// watermark and NEVER an ephemeral delta (which has no recovery need).
+    #[test]
+    fn durable_after_filters_by_seq_and_skips_ephemeral() {
+        use private_code_protocol::event::DeltaPayload;
+        let history = vec![
+            ProtocolEvent::MessageDelta {
+                session_id: "s".into(),
+                delta: DeltaPayload::Text { text: "tok".into() },
+            },
+            ProtocolEvent::ToolPermissionRequired {
+                session_id: "s".into(),
+                seq: 3,
+                permission_id: "p".into(),
+                tool_name: "write_file".into(),
+                action: "write".into(),
+                resources: vec!["/f".into()],
+                preview: String::new(),
+            },
+            ProtocolEvent::Error {
+                session_id: "s".into(),
+                seq: 5,
+                code: "provider_error".into(),
+                message: "boom".into(),
+                retryable: true,
+            },
+            ProtocolEvent::MessageCompleted {
+                session_id: "s".into(),
+                seq: 7,
+                message_id: "m".into(),
+                usage: UsageStats::default(),
+            },
+        ];
+
+        // From watermark 4: recover seq 5 and 7; the already-seen seq-3 permission
+        // and the ephemeral delta (seq 0) are excluded.
+        let recovered = durable_after(&history, 4);
+        assert_eq!(recovered.len(), 2);
+        assert!(matches!(recovered[0], ProtocolEvent::Error { seq: 5, .. }));
+        assert!(matches!(
+            recovered[1],
+            ProtocolEvent::MessageCompleted { seq: 7, .. }
+        ));
+
+        // From watermark 0: all three durables recover; the delta is still skipped.
+        let from_zero = durable_after(&history, 0);
+        assert_eq!(from_zero.len(), 3);
+        assert!(
+            !from_zero
+                .iter()
+                .any(|e| matches!(e, ProtocolEvent::MessageDelta { .. })),
+            "ephemeral deltas are never recovered"
+        );
+    }
+
+    /// A provider whose `stream_chat` fails immediately — drives the orchestrator's
+    /// `provider_error` path so a durable `Error` lands in `sess.history`.
+    struct ErroringProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ErroringProvider {
+        async fn stream_chat(
+            &self,
+            _model_id: &str,
+            _system_prompt: Option<&str>,
+            _max_tokens: u32,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError>
+        {
+            Err(ProviderError::Other("simulated provider failure".into()))
+        }
+        fn count_tokens(&self, _m: &str, t: &str) -> usize {
+            t.len() / 4
+        }
+    }
+
+    /// The two in-memory-only durable events a connected-client lag could drop —
+    /// `ToolPermissionRequired` and `Error` — DO land in `sess.history` with a real
+    /// seq, so `durable_after(history, last_forwarded_seq)` recovers them. This is
+    /// the foundation of the forwarders' lag-recovery: without it a lagged client
+    /// would silently lose a permission prompt (turn hangs) or an error (spinner
+    /// wedged), since neither event has a DB content home to reconcile from.
+    #[tokio::test]
+    async fn lagged_recovery_history_carries_permission_and_error() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+
+        // ── Session A: a write_file tool call parks on ToolPermissionRequired ──
+        let perm_sid = uuid::Uuid::new_v4().to_string();
+        create_session(
+            &pool,
+            &perm_sid,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+        let provider = Arc::new(private_code_providers::testkit::ScriptedProvider::new(
+            vec![vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                },
+                ProviderEvent::ToolUseComplete {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({}),
+                },
+                ProviderEvent::MessageStop {
+                    usage: UsageStats::default(),
+                    finish_reason: Some("tool_use".into()),
+                },
+            ]],
+        ));
+        let mut reg = private_code_tools::ToolRegistry::new();
+        reg.register(Box::new(AskTool));
+        let coord =
+            SessionCoordinator::new(pool.clone(), std::env::temp_dir(), provider, Arc::new(reg));
+        coord.run_turn(&perm_sid, "hi", "steer").await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let map = coord.sessions.lock().await;
+                if let Some(sess) = map.get(&perm_sid) {
+                    let recoverable = durable_after(&sess.history, 0);
+                    if let Some(ProtocolEvent::ToolPermissionRequired { seq, .. }) = recoverable
+                        .iter()
+                        .find(|e| matches!(e, ProtocolEvent::ToolPermissionRequired { .. }))
+                    {
+                        assert!(*seq > 0, "ToolPermissionRequired must carry a durable seq");
+                        break;
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "permission prompt never reached the in-memory history"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        coord.shutdown(Duration::from_secs(5)).await;
+
+        // ── Session B: the turn errors before any output ──
+        let err_sid = uuid::Uuid::new_v4().to_string();
+        create_session(
+            &pool,
+            &err_sid,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+        let coord2 = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(ErroringProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        coord2.run_turn(&err_sid, "hi", "steer").await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let map = coord2.sessions.lock().await;
+                if let Some(sess) = map.get(&err_sid) {
+                    let recoverable = durable_after(&sess.history, 0);
+                    if let Some(ProtocolEvent::Error { seq, .. }) = recoverable
+                        .iter()
+                        .find(|e| matches!(e, ProtocolEvent::Error { .. }))
+                    {
+                        assert!(*seq > 0, "Error must carry a durable seq");
+                        break;
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "error never reached the in-memory history"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        coord2.shutdown(Duration::from_secs(5)).await;
     }
 }

@@ -6,7 +6,6 @@ use axum::{
     response::IntoResponse,
 };
 use private_code_core::coordinator::SessionCoordinator;
-use private_code_core::db;
 use private_code_protocol::event::ProtocolEvent;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -131,25 +130,53 @@ async fn handle_socket(socket: WebSocket, query: WsQuery, coord: Arc<SessionCoor
     });
 
     let command_tx_clone = command_tx.clone();
+    let coord_fwd = coord.clone();
+    let sid_fwd = query.session_id.clone();
+    // Monotonic high-water of durable seqs forwarded so far (seeded from the
+    // replay). Advancing it on every forwarded durable event makes the live arm
+    // and the lag-recovery arm below dedup against each other.
+    let mut watermark = replay_watermark;
     tokio::spawn(async move {
+        use private_code_core::coordinator::{durable_after, event_seq, should_forward};
         use tokio::sync::broadcast::error::RecvError;
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
-                    // Dedup: skip any durable event already delivered via replay.
-                    if !private_code_core::coordinator::should_forward(&event, replay_watermark) {
+                    // Dedup: skip any durable event already delivered (via replay or
+                    // a prior lag-recovery).
+                    if !should_forward(&event, watermark) {
                         continue;
                     }
+                    watermark = watermark.max(event_seq(&event));
                     if let Ok(msg_str) = serde_json::to_string(&event) {
                         if command_tx_clone.send(Message::Text(msg_str)).await.is_err() {
                             break;
                         }
                     }
                 }
-                // The client fell behind a burst of ephemeral deltas. Skip the gap
-                // and KEEP streaming rather than silently dropping the connection;
-                // durable state is reconciled by the client from the shared DB.
-                Err(RecvError::Lagged(_)) => continue,
+                // A burst of ephemeral deltas overflowed this connected client's
+                // 16384 ring view, evicting interleaved durable events (Error,
+                // ToolPermissionRequired) it still needs — and those two have NO DB
+                // content home, so DB reconciliation cannot recover them. Replay the
+                // durable events the client missed from the live in-memory history,
+                // then KEEP streaming. The session is necessarily still live here (an
+                // idle-eviction drops the sender, yielding Closed rather than Lagged).
+                Err(RecvError::Lagged(_)) => {
+                    let missed = {
+                        let map = coord_fwd.sessions.lock().await;
+                        map.get(&sid_fwd)
+                            .map(|s| durable_after(&s.history, watermark))
+                            .unwrap_or_default()
+                    };
+                    for event in missed {
+                        watermark = watermark.max(event_seq(&event));
+                        if let Ok(msg_str) = serde_json::to_string(&event) {
+                            if command_tx_clone.send(Message::Text(msg_str)).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
                 Err(RecvError::Closed) => break,
             }
         }
@@ -240,32 +267,13 @@ async fn process_rpc(
             // Optional free-text feedback the model sees when a request is denied.
             let feedback = params["feedback"].as_str();
 
-            // If reply is "always", save to permissions_saved
-            if reply == "always" {
-                if let Ok(Some(sess)) = db::get_session(&coord.pool, session_id).await {
-                    let sessions = coord.sessions.lock().await;
-                    if let Some(active) = sessions.get(session_id) {
-                        if let Some((prompt, _)) = &active.pending_permission {
-                            if prompt.permission_id == perm_id {
-                                let action = prompt.action.clone();
-                                let resource = prompt
-                                    .resources
-                                    .first()
-                                    .cloned()
-                                    .unwrap_or_else(|| "*".to_string());
-                                let _ = db::save_permission(
-                                    &coord.pool,
-                                    &sess.project_id,
-                                    &action,
-                                    &resource,
-                                )
-                                .await;
-                            }
-                        }
-                    }
-                }
-            }
-
+            // The "always" rule is persisted by `reply_permission` itself — it
+            // captures the action/resource under the sessions lock and writes the
+            // rule AFTER releasing it (coordinator.rs). A duplicate save here once
+            // existed and was actively harmful: it held `coord.sessions.lock()`
+            // ACROSS a `db::save_permission().await` (the lock-across-await pattern
+            // C9 eliminated everywhere else, blocking event routing and every other
+            // session for the duration of the write), on top of being redundant.
             coord
                 .reply_permission(session_id, perm_id, reply, feedback)
                 .await

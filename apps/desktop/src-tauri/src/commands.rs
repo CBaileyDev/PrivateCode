@@ -5,7 +5,9 @@
 //! Every command is a thin wrapper over the shared [`SessionCoordinator`]; the
 //! desktop owns no bespoke session state machine (see `state.rs`).
 
-use private_code_core::coordinator::{event_seq, should_forward, SessionCoordinator};
+use private_code_core::coordinator::{
+    durable_after, event_seq, should_forward, SessionCoordinator,
+};
 use private_code_core::db::{self, SessionRow};
 use private_code_protocol::event::ProtocolEvent;
 use serde::{Deserialize, Serialize};
@@ -371,20 +373,44 @@ pub async fn subscribe_session(
         }
     }
 
+    // For lag recovery the task reads the live in-memory history directly (the
+    // `sessions` map is a shared Arc) — it must NOT call `get_history`, which
+    // would rebuild an evicted session; a `Lagged` implies the session is live.
+    let sessions = coord.sessions.clone();
+    let sid = session_id.clone();
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
         loop {
             match rx.recv().await {
                 Ok(event) => {
-                    // Skip any durable event already delivered via replay.
+                    // Skip any durable event already delivered (replay or a prior
+                    // lag-recovery); advance the watermark so the two paths dedup.
                     if !should_forward(&event, watermark) {
                         continue;
                     }
+                    watermark = watermark.max(event_seq(&event));
                     if channel.send(event).is_err() {
                         break; // frontend disconnected
                     }
                 }
-                Err(RecvError::Lagged(_)) => continue,
+                // A delta burst overflowed this connected webview's 16384 ring view,
+                // evicting interleaved durable events (Error, ToolPermissionRequired
+                // — which have no DB content home) it still needs. Replay the missed
+                // durable events from the live in-memory history, then keep streaming.
+                Err(RecvError::Lagged(_)) => {
+                    let missed = {
+                        let map = sessions.lock().await;
+                        map.get(&sid)
+                            .map(|s| durable_after(&s.history, watermark))
+                            .unwrap_or_default()
+                    };
+                    for event in missed {
+                        watermark = watermark.max(event_seq(&event));
+                        if channel.send(event).is_err() {
+                            return;
+                        }
+                    }
+                }
                 Err(RecvError::Closed) => break,
             }
         }

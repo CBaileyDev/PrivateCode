@@ -70,9 +70,16 @@ pub trait ModelProvider: Send + Sync {
 
 /// Resolve a provider API key: OS keyring first, then an environment-variable
 /// fallback. The key is NOT removed from the environment — `remove_var` is
-/// thread-unsafe in a multi-threaded runtime and breaks re-resolution; child
-/// processes are protected by env-scrubbing at spawn time (see security.md T2),
-/// which is the correct mitigation.
+/// thread-unsafe in a multi-threaded runtime and breaks re-resolution.
+///
+/// Mitigation for the env-fallback tier (security.md T2): the only
+/// model-controllable child process is the bash tool, which scrubs its child
+/// environment to a fixed allowlist (`env_clear()` + allowlist in
+/// `tools::system_tools`), so a model-issued `env` cannot read the key.
+/// Env-scrubbing is per-spawn, NOT an ambient property — any NEW child-process
+/// spawn (e.g. an MCP stdio transport) MUST apply the same scrub. (The local
+/// `git gc` in `core::checkpoint` inherits the env but is not model-controllable
+/// and does not exfiltrate; it is the one current un-scrubbed spawn.)
 pub fn resolve_api_key(provider_name: &str) -> Result<String, ProviderError> {
     if let Ok(entry) = keyring::Entry::new("private-code", provider_name)
         && let Ok(key) = entry.get_password()

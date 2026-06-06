@@ -13,8 +13,13 @@ pub const DEFAULT_MODEL_ID: &str = "claude-opus-4-8";
 pub struct ModelConfig {
     pub provider_id: String,
     pub model_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub api_key: Option<String>,
+    // NOTE: there is deliberately no `api_key` field. Provider keys are resolved
+    // ONLY via the OS keyring then a `{PROVIDER}_API_KEY` env fallback
+    // (providers::resolve_api_key); per the threat model (security.md T4) a key
+    // must never be persisted to a config file. A previous unused `api_key:
+    // Option<String>` here was dead surface that — via the published JsonSchema —
+    // invited users to write a plaintext key into config.json, the one storage
+    // location the threat model forbids. Removed.
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -56,7 +61,6 @@ impl Default for AppConfig {
             default_provider: ModelConfig {
                 provider_id: "anthropic".to_string(),
                 model_id: DEFAULT_MODEL_ID.to_string(),
-                api_key: None,
             },
             compaction: CompactionConfig::default(),
         }
