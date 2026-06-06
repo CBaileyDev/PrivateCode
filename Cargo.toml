@@ -15,12 +15,11 @@ private-code-tui = { path = "crates/tui" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 reqwest = { version = "0.12", features = ["json", "stream"] }
-git2 = "0.19"
-gix = "0.66"
+git2 = "0.20"
 ratatui = "0.26"
 crossterm = "0.28"
 keyring = "2"

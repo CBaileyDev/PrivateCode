@@ -3,6 +3,7 @@ name = "private-code-core"
 version = "0.1.0"
 edition = "2024"
 
+publish = false
 [dependencies]
 private-code-protocol.workspace = true
 private-code-providers.workspace = true
@@ -15,7 +16,6 @@ sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 git2.workspace = true
-gix.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -3,6 +3,7 @@ name = "private-code-cli"
 version = "0.1.0"
 edition = "2024"
 
+publish = false
 [dependencies]
 private-code-core.workspace = true
 private-code-protocol.workspace = true

@@ -1,0 +1,121 @@
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+# Cancel superseded runs on the same ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # ---- Cross-platform build + lint + test ----
+  quality:
+    name: quality (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
+
+      # apps/desktop/src-tauri is a workspace member, so `--workspace` compiles
+      # the Tauri crate on every OS; on Linux it links webkit2gtk.
+      - name: Install Linux Tauri system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      # tauri.conf.json sets frontendDist=../dist and generate_context! embeds it
+      # at compile time, so dist/ must exist before any cargo step builds the crate.
+      - name: Build frontend (produces apps/desktop/dist)
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run build
+
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy -D warnings
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+      - name: cargo nextest run
+        run: cargo nextest run --workspace --locked
+
+  # ---- Supply chain: lock freshness, advisories, license/source policy ----
+  supply-chain:
+    name: supply-chain
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      # Correct lock-freshness gate: fails if Cargo.lock is stale.
+      - name: Verify Cargo.lock is up to date
+        run: cargo update --locked --workspace
+
+      # cargo-deny is the single supply-chain gate: it checks the same RustSec
+      # advisory DB as cargo-audit but is feature-aware (won't flag the never-
+      # compiled rsa behind the disabled sqlx mysql driver) and config-driven
+      # via deny.toml (advisories + licenses + bans + sources).
+      - name: cargo deny check
+        run: cargo deny check
+
+  # ---- Frontend type-check + build (no cargo, no webkit) ----
+  frontend:
+    name: frontend
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Install + type-check + build
+        working-directory: apps/desktop
+        run: |
+          npm ci
+          npm run typecheck
+          npm run build
+          # `npm run test` (vitest) is added here once the store test suite lands (cluster C15).

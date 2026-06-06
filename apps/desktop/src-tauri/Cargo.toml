@@ -3,6 +3,7 @@ name = "private-code-desktop"
 version = "0.1.0"
 edition = "2021"
 
+publish = false
 [dependencies]
 private-code-core = { path = "../../../crates/core" }
 private-code-protocol = { path = "../../../crates/protocol" }
@@ -18,7 +19,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }

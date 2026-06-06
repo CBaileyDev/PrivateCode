@@ -1,0 +1,6 @@
+# Pin the toolchain for reproducible builds.
+# Six crates are edition 2024, which requires Rust >= 1.85; `stable` on CI
+# runners satisfies this. rustfmt + clippy are needed by the CI quality job.
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
