@@ -4102,6 +4102,7 @@ dependencies = [
  "private-code-protocol",
  "private-code-providers",
  "private-code-tools",
+ "rayon",
  "schemars 0.8.22",
  "serde",
  "serde_json",

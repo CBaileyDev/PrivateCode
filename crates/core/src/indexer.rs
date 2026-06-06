@@ -8,7 +8,8 @@
 //! unit it builds on.
 
 use crate::symbols;
-use private_code_codeintel::{EntryType, SymbolExtractor, WalkOptions, walk};
+use private_code_codeintel::{EntryType, Symbol, SymbolExtractor, WalkOptions, walk};
+use rayon::prelude::*;
 use sqlx::SqlitePool;
 use std::path::Path;
 
@@ -35,6 +36,51 @@ pub async fn index_workspace(pool: &SqlitePool, root: &Path) -> Result<usize, sq
         symbols::index_file(pool, &rel_str, &syms).await?;
         indexed += 1;
     }
+    Ok(indexed)
+}
+
+/// Background variant of [`index_workspace`] for the cold-start path: parse files
+/// in parallel on the rayon pool and stream per-file symbol batches over a
+/// bounded channel to the (serialized) SQLite writer. The CPU-bound walk+parse
+/// runs off the async runtime (`spawn_blocking` + rayon); the bounded channel
+/// applies backpressure so a fast parser can't outrun the DB writer. One shared
+/// `SymbolExtractor` compiles each grammar's query once (its registry is
+/// Mutex-guarded, hence `Sync`).
+pub async fn index_workspace_background(
+    pool: &SqlitePool,
+    root: &Path,
+) -> Result<usize, sqlx::Error> {
+    let root = root.to_path_buf();
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<(String, Vec<Symbol>)>(64);
+
+    let producer = tokio::task::spawn_blocking(move || {
+        let extractor = SymbolExtractor::new();
+        let files: Vec<_> = walk(&root, &WalkOptions::default())
+            .into_iter()
+            .filter(|e| e.file_type == EntryType::File)
+            .collect();
+        files.par_iter().for_each(|entry| {
+            let rel = entry.path.strip_prefix(&root).unwrap_or(&entry.path);
+            let rel_str = rel.to_string_lossy().replace('\\', "/");
+            let Ok(source) = std::fs::read_to_string(&entry.path) else {
+                return;
+            };
+            let syms = extractor.extract(&rel_str, &source);
+            if !syms.is_empty() {
+                // blocking_send is correct here: rayon workers are not tokio
+                // runtime threads. Full channel == backpressure, not deadlock.
+                let _ = tx.blocking_send((rel_str, syms));
+            }
+        });
+        // `tx` drops here, closing the channel so the consumer loop ends.
+    });
+
+    let mut indexed = 0usize;
+    while let Some((rel, syms)) = rx.recv().await {
+        symbols::index_file(pool, &rel, &syms).await?;
+        indexed += 1;
+    }
+    let _ = producer.await;
     Ok(indexed)
 }
 
@@ -65,6 +111,28 @@ mod tests {
         assert_eq!(
             hit.filepath, "src/config.rs",
             "filepaths are stored relative to root with forward slashes"
+        );
+    }
+
+    #[tokio::test]
+    async fn background_indexing_produces_the_same_index() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("src")).unwrap();
+        fs::write(root.join("src/config.rs"), "pub struct AppConfig {}").unwrap();
+        fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
+        fs::write(root.join("notes.txt"), "not code").unwrap();
+
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let n = index_workspace_background(&pool, root).await.unwrap();
+        assert_eq!(n, 2, "the rayon+mpsc pipeline indexes the same two files");
+
+        let hits = search_symbols(&pool, "AppConfig", 10).await.unwrap();
+        assert!(
+            hits.iter()
+                .any(|h| h.name == "AppConfig" && h.filepath == "src/config.rs"),
+            "background-indexed symbols are searchable, got {hits:?}"
         );
     }
 }

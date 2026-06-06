@@ -4,6 +4,7 @@ pub mod config;
 pub mod context;
 pub mod coordinator;
 pub mod db;
+pub mod fuzzy;
 pub mod indexer;
 pub mod orchestrator;
 pub mod permissions;
