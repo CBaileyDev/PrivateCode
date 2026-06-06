@@ -10,6 +10,14 @@
 //! - FTS5 is compiled into the sqlx-bundled SQLite (`CREATE VIRTUAL TABLE …
 //!   USING fts5` applies).
 
+mod extract;
+mod registry;
+mod symbol;
+
+pub use extract::SymbolExtractor;
+pub use registry::{LangDef, LanguageRegistry};
+pub use symbol::Symbol;
+
 #[cfg(test)]
 mod spikes {
     use tree_sitter::{Parser, Query, QueryCursor, StreamingIterator};
