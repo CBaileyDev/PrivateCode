@@ -12,6 +12,7 @@ private-code-protocol = { path = "crates/protocol" }
 private-code-providers = { path = "crates/providers" }
 private-code-tools = { path = "crates/tools" }
 private-code-tui = { path = "crates/tui" }
+private-code-codeintel = { path = "crates/codeintel" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }
