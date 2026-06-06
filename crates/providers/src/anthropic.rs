@@ -180,6 +180,12 @@ pub fn parse_anthropic_event(
                     .unwrap_or_default()
                     .to_string();
                 Ok(Some(ProviderEvent::ReasoningDelta(thinking)))
+            } else if delta_type == "signature_delta" {
+                let signature = val["delta"]["signature"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(Some(ProviderEvent::ReasoningSignatureDelta(signature)))
             } else if delta_type == "input_json_delta" {
                 let partial = val["delta"]["partial_json"].as_str().unwrap_or_default();
                 if let Some((id, _, acc)) = state.active_tool_uses.get_mut(&index) {
@@ -306,11 +312,23 @@ impl ModelProvider for AnthropicProvider {
                             "text": text,
                         }));
                     }
-                    ContentBlock::Reasoning { reasoning } => {
-                        content.push(serde_json::json!({
-                            "type": "text",
-                            "text": reasoning,
-                        }));
+                    ContentBlock::Reasoning {
+                        reasoning,
+                        signature,
+                    } => {
+                        // Only replay an extended-thinking block that carries its
+                        // signature, as a proper {type:"thinking"} block. Reasoning
+                        // without a signature cannot be validly replayed (Anthropic
+                        // requires the signature) and must NOT be sent as plain text
+                        // — that loses the cryptographic proof and pollutes context —
+                        // so it is dropped from the replayed messages here.
+                        if let Some(sig) = signature {
+                            content.push(serde_json::json!({
+                                "type": "thinking",
+                                "thinking": reasoning,
+                                "signature": sig,
+                            }));
+                        }
                     }
                     ContentBlock::ToolUse { id, name, input } => {
                         content.push(serde_json::json!({

@@ -657,7 +657,7 @@ fn draw_ui(f: &mut ratatui::Frame, state: &AppState) {
                     chat_lines.extend(render_markdown(text));
                     chat_lines.push(Line::from(""));
                 }
-                ContentBlock::Reasoning { reasoning } => {
+                ContentBlock::Reasoning { reasoning, .. } => {
                     chat_lines.push(Line::from(vec![Span::styled(
                         "Thought:",
                         Style::default()

@@ -3,6 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use tracing::{info, warn};
 
+/// The single default model id. Used by both `AppConfig::default` and the
+/// orchestrator's per-turn fallback so they can never diverge. Phase-1 stopgap
+/// until the model catalog (Phase 5) is the source of truth; never hardcode a
+/// model id elsewhere — resolve from here or the session's `model_config`.
+pub const DEFAULT_MODEL_ID: &str = "claude-opus-4-8";
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ModelConfig {
     pub provider_id: String,
@@ -25,7 +31,7 @@ impl Default for AppConfig {
             max_turns: 25,
             default_provider: ModelConfig {
                 provider_id: "anthropic".to_string(),
-                model_id: "claude-3-5-sonnet-latest".to_string(),
+                model_id: DEFAULT_MODEL_ID.to_string(),
                 api_key: None,
             },
         }

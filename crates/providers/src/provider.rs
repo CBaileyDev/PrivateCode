@@ -6,6 +6,10 @@ use private_code_protocol::message::ChatMessage;
 pub enum ProviderEvent {
     TextDelta(String),
     ReasoningDelta(String),
+    /// The signature for the current extended-thinking block (Anthropic
+    /// `signature_delta`). Emitted near the end of a thinking block; callers
+    /// attach it to the in-progress reasoning block for valid replay.
+    ReasoningSignatureDelta(String),
     ToolUseStart {
         id: String,
         name: String,

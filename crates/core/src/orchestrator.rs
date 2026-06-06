@@ -1,4 +1,5 @@
 use crate::checkpoint::{GitSnapshotEngine, Snapshot};
+use crate::config::{AppConfig, DEFAULT_MODEL_ID};
 use crate::context::{Reconcile, SystemContextRegistry};
 use crate::db::{self};
 use crate::permissions::{self, PermissionDecision, PermissionPrompt, PermissionRule};
@@ -12,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 pub struct Orchestrator {
@@ -23,6 +24,23 @@ pub struct Orchestrator {
     pub tool_registry: Arc<ToolRegistry>,
     pub permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>,
     pub event_tx: mpsc::Sender<ProtocolEvent>,
+}
+
+/// A content block assembled from the provider stream, preserving arrival
+/// order so the persisted assistant message reflects the real interleaving of
+/// text / thinking / tool-use blocks (instead of a nondeterministic
+/// HashMap-sourced reordering).
+enum PartialBlock {
+    Text(String),
+    Reasoning {
+        text: String,
+        signature: Option<String>,
+    },
+    Tool {
+        id: String,
+        name: String,
+        input: String,
+    },
 }
 
 impl Orchestrator {
@@ -139,7 +157,7 @@ impl Orchestrator {
                 let mut tx = self.pool.begin().await?;
                 let snap_json = serde_json::to_string(&snapshot)?;
                 let bseq = db::next_sequence(&mut tx, session_id).await?;
-                if had_epoch {
+                let cas_ok = if had_epoch {
                     db::replace_context_epoch(
                         &mut tx,
                         session_id,
@@ -149,7 +167,7 @@ impl Orchestrator {
                         bseq,
                         revision,
                     )
-                    .await?;
+                    .await?
                 } else {
                     db::insert_context_epoch(
                         &mut tx,
@@ -159,9 +177,21 @@ impl Orchestrator {
                         &snap_json,
                         bseq,
                     )
-                    .await?;
+                    .await?
+                };
+                if cas_ok {
+                    tx.commit().await?;
+                } else {
+                    // RevisionMismatch: another writer advanced/replaced the epoch
+                    // concurrently. Roll back rather than proceed as if it stuck;
+                    // the current baseline is reloaded below and the reconcile
+                    // retries at the next turn boundary.
+                    tx.rollback().await?;
+                    warn!(
+                        "context epoch CAS revision mismatch on replacement (session {}); keeping existing baseline",
+                        session_id
+                    );
                 }
-                tx.commit().await?;
             }
             Reconcile::Updated { text, snapshot } => {
                 // Mid-conversation delta: a durable {role:"system"} message in history
@@ -180,8 +210,20 @@ impl Orchestrator {
                     .await?;
 
                 let snap_json = serde_json::to_string(&snapshot)?;
-                db::advance_context_epoch(&mut tx, session_id, &snap_json, revision).await?;
-                tx.commit().await?;
+                let cas_ok =
+                    db::advance_context_epoch(&mut tx, session_id, &snap_json, revision).await?;
+                if cas_ok {
+                    tx.commit().await?;
+                } else {
+                    // RevisionMismatch: drop this update (incl. the system message)
+                    // rather than commit a half-applied delta; the reconcile retries
+                    // next turn against the reloaded epoch.
+                    tx.rollback().await?;
+                    warn!(
+                        "context epoch CAS revision mismatch on update (session {}); skipping this delta",
+                        session_id
+                    );
+                }
             }
             _ => {}
         }
@@ -223,13 +265,18 @@ impl Orchestrator {
                 .ok();
         }
 
+        // Load app config (per-turn so a changed config takes effect promptly).
+        let app_config = AppConfig::load(&self.global_data_dir, workspace_path);
+
         // Parse model config. The provider resolves its own API key internally.
+        // The default model id is the single shared const (also AppConfig's default),
+        // so config and orchestrator can never disagree.
         let model_val: serde_json::Value = serde_json::from_str(&session.model_config)?;
-        let model_id = model_val["model_id"].as_str().unwrap_or("claude-opus-4-8");
+        let model_id = model_val["model_id"].as_str().unwrap_or(DEFAULT_MODEL_ID);
         let max_tokens = model_val["max_tokens"].as_u64().unwrap_or(8192) as u32;
 
         let mut turn_count = 0;
-        let max_turns = 25;
+        let max_turns = app_config.max_turns;
 
         // Initialize file read cache
         let mut file_read_cache = HashMap::new();
@@ -284,12 +331,13 @@ impl Orchestrator {
             };
 
             let assistant_msg_id = Uuid::new_v4().to_string();
-            let mut accumulated_text = String::new();
-            let mut accumulated_reasoning = String::new();
 
-            // Map tool_use_id to (tool_name, accumulated_input)
-            let mut accumulated_tool_uses: HashMap<String, (String, String)> = HashMap::new();
+            // Content blocks in stream-arrival order (deterministic, faithful to
+            // the real text / thinking / tool interleaving).
+            let mut blocks: Vec<PartialBlock> = Vec::new();
             let mut final_usage = UsageStats::default();
+            // Set if the stream errors mid-flight: the turn did NOT complete cleanly.
+            let mut stream_error: Option<String> = None;
 
             use futures_util::StreamExt;
             let mut cancelled = false;
@@ -304,29 +352,63 @@ impl Orchestrator {
                 let event = match event_opt {
                     Some(Ok(ev)) => ev,
                     Some(Err(e)) => {
+                        // Do NOT swallow-and-continue: a transport/parse error mid
+                        // stream means the rest of this message is lost. Record it
+                        // and stop so the turn is reported as errored, not as a
+                        // clean completion with truncated content.
                         error!("Stream delta error: {}", e);
-                        continue;
+                        stream_error = Some(e.to_string());
+                        break;
                     }
                     None => break,
                 };
 
                 match event {
                     ProviderEvent::TextDelta(text) => {
-                        accumulated_text.push_str(&text);
+                        if let Some(PartialBlock::Text(s)) = blocks.last_mut() {
+                            s.push_str(&text);
+                        } else {
+                            blocks.push(PartialBlock::Text(text.clone()));
+                        }
                         self.emit_delta(ProtocolEvent::MessageDelta {
                             session_id: session_id.to_string(),
                             delta: DeltaPayload::Text { text },
                         });
                     }
                     ProviderEvent::ReasoningDelta(reasoning) => {
-                        accumulated_reasoning.push_str(&reasoning);
+                        if let Some(PartialBlock::Reasoning { text, .. }) = blocks.last_mut() {
+                            text.push_str(&reasoning);
+                        } else {
+                            blocks.push(PartialBlock::Reasoning {
+                                text: reasoning.clone(),
+                                signature: None,
+                            });
+                        }
                         self.emit_delta(ProtocolEvent::MessageDelta {
                             session_id: session_id.to_string(),
                             delta: DeltaPayload::Reasoning { reasoning },
                         });
                     }
+                    ProviderEvent::ReasoningSignatureDelta(sig) => {
+                        // Attach to the most recent reasoning block (signature_delta
+                        // arrives at the end of a thinking block). Not surfaced as a
+                        // UI delta — it is metadata for valid multi-turn replay.
+                        for b in blocks.iter_mut().rev() {
+                            if let PartialBlock::Reasoning { signature, .. } = b {
+                                match signature {
+                                    Some(existing) => existing.push_str(&sig),
+                                    None => *signature = Some(sig),
+                                }
+                                break;
+                            }
+                        }
+                    }
                     ProviderEvent::ToolUseStart { id, name } => {
-                        accumulated_tool_uses.insert(id.clone(), (name.clone(), String::new()));
+                        blocks.push(PartialBlock::Tool {
+                            id: id.clone(),
+                            name: name.clone(),
+                            input: String::new(),
+                        });
                         self.emit_delta(ProtocolEvent::MessageDelta {
                             session_id: session_id.to_string(),
                             delta: DeltaPayload::ToolUse {
@@ -337,8 +419,13 @@ impl Orchestrator {
                         });
                     }
                     ProviderEvent::ToolUseDelta { id, input_delta } => {
-                        if let Some((_, input)) = accumulated_tool_uses.get_mut(&id) {
-                            input.push_str(&input_delta);
+                        for b in blocks.iter_mut().rev() {
+                            if let PartialBlock::Tool { id: tid, input, .. } = b
+                                && *tid == id
+                            {
+                                input.push_str(&input_delta);
+                                break;
+                            }
                         }
                         self.emit_delta(ProtocolEvent::MessageDelta {
                             session_id: session_id.to_string(),
@@ -350,7 +437,28 @@ impl Orchestrator {
                         });
                     }
                     ProviderEvent::ToolUseComplete { id, name, input } => {
-                        accumulated_tool_uses.insert(id, (name, input.to_string()));
+                        let mut found = false;
+                        for b in blocks.iter_mut().rev() {
+                            if let PartialBlock::Tool {
+                                id: tid,
+                                name: n,
+                                input: inp,
+                            } = b
+                                && *tid == id
+                            {
+                                *n = name.clone();
+                                *inp = input.to_string();
+                                found = true;
+                                break;
+                            }
+                        }
+                        if !found {
+                            blocks.push(PartialBlock::Tool {
+                                id,
+                                name,
+                                input: input.to_string(),
+                            });
+                        }
                     }
                     ProviderEvent::MessageStop {
                         usage,
@@ -363,25 +471,48 @@ impl Orchestrator {
             // Abort the stream's HTTP connection promptly on cancel.
             drop(stream);
 
-            // Construct content blocks
+            // Construct content blocks in arrival order. Tool calls whose
+            // accumulated input is not valid JSON (e.g. a stream truncated
+            // mid-tool) are recorded with an empty-object input (so the persisted
+            // tool_use stays replay-valid) and their ids tracked so we return an
+            // error tool_result instead of executing them with bogus input.
             let mut content_blocks = Vec::new();
-            if !accumulated_text.is_empty() {
-                content_blocks.push(ContentBlock::Text {
-                    text: accumulated_text,
-                });
-            }
-            if !accumulated_reasoning.is_empty() {
-                content_blocks.push(ContentBlock::Reasoning {
-                    reasoning: accumulated_reasoning,
-                });
-            }
-            for (id, (name, input_str)) in &accumulated_tool_uses {
-                let input_val = serde_json::from_str(input_str).unwrap_or(serde_json::Value::Null);
-                content_blocks.push(ContentBlock::ToolUse {
-                    id: id.clone(),
-                    name: name.clone(),
-                    input: input_val,
-                });
+            let mut malformed_tool_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+            for b in blocks {
+                match b {
+                    PartialBlock::Text(text) => {
+                        if !text.is_empty() {
+                            content_blocks.push(ContentBlock::Text { text });
+                        }
+                    }
+                    PartialBlock::Reasoning { text, signature } => {
+                        if !text.is_empty() {
+                            content_blocks.push(ContentBlock::Reasoning {
+                                reasoning: text,
+                                signature,
+                            });
+                        }
+                    }
+                    PartialBlock::Tool { id, name, input } => {
+                        let input_val = if input.trim().is_empty() {
+                            serde_json::json!({})
+                        } else {
+                            match serde_json::from_str::<serde_json::Value>(&input) {
+                                Ok(v) => v,
+                                Err(_) => {
+                                    malformed_tool_ids.insert(id.clone());
+                                    serde_json::json!({})
+                                }
+                            }
+                        };
+                        content_blocks.push(ContentBlock::ToolUse {
+                            id,
+                            name,
+                            input: input_val,
+                        });
+                    }
+                }
             }
 
             let assistant_msg = ChatMessage {
@@ -419,6 +550,25 @@ impl Orchestrator {
             .await?;
             tx.commit().await?;
 
+            // A mid-stream transport/parse error means the turn did not complete
+            // cleanly. The partial assistant message is persisted above, but we
+            // surface a retryable error and stop here — we do NOT present truncated
+            // output as a clean completion, and do NOT execute any half-parsed tool
+            // calls that accumulated before the break.
+            if let Some(err_msg) = stream_error {
+                self.event_tx
+                    .send(ProtocolEvent::Error {
+                        session_id: session_id.to_string(),
+                        seq: asst_seq,
+                        code: "stream_error".to_string(),
+                        message: err_msg.clone(),
+                        retryable: true,
+                    })
+                    .await
+                    .ok();
+                return Err(format!("provider stream error: {err_msg}").into());
+            }
+
             self.event_tx
                 .send(ProtocolEvent::MessageCompleted {
                     session_id: session_id.to_string(),
@@ -455,6 +605,22 @@ impl Orchestrator {
             let mut tool_results = Vec::new();
 
             for (call_id, tool_name, arguments) in tool_calls {
+                // A tool call whose arguments failed to parse as JSON is never
+                // executed — return an error tool_result so the model can retry
+                // with valid arguments (the tool_use/tool_result pair is kept).
+                if malformed_tool_ids.contains(call_id) {
+                    tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id: call_id.clone(),
+                        content: ToolResultContent::Text(
+                            "Invalid tool call: the arguments were not valid JSON (the tool-call \
+                             stream may have been truncated). Retry with complete, valid JSON arguments."
+                                .to_string(),
+                        ),
+                        is_error: true,
+                    });
+                    continue;
+                }
+
                 let tool_opt = self.tool_registry.get(tool_name);
                 let tool = match tool_opt {
                     Some(t) => t,
@@ -1014,6 +1180,243 @@ mod tests {
         assert!(
             res.is_ok(),
             "run_session_turn must terminate after cancel (no hang)"
+        );
+    }
+
+    /// A provider that errors mid-stream after one text delta.
+    struct ErrorMidStreamProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ErrorMidStreamProvider {
+        async fn stream_chat(
+            &self,
+            _model_id: &str,
+            _system_prompt: Option<&str>,
+            _max_tokens: u32,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError>
+        {
+            let s = futures_util::stream::iter(vec![
+                Ok(ProviderEvent::TextDelta("partial".into())),
+                Err(ProviderError::Other("boom".into())),
+            ]);
+            Ok(s.boxed())
+        }
+        fn count_tokens(&self, _m: &str, t: &str) -> usize {
+            t.len() / 4
+        }
+    }
+
+    /// A provider that returns the same (auto-allowed) tool call on every turn,
+    /// so the loop only ends when it hits max_turns.
+    struct AlwaysToolProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for AlwaysToolProvider {
+        async fn stream_chat(
+            &self,
+            _model_id: &str,
+            _system_prompt: Option<&str>,
+            _max_tokens: u32,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError>
+        {
+            let evs = vec![
+                ProviderEvent::ToolUseStart {
+                    id: "loop".into(),
+                    name: "mock".into(),
+                },
+                ProviderEvent::ToolUseComplete {
+                    id: "loop".into(),
+                    name: "mock".into(),
+                    input: serde_json::json!({}),
+                },
+                ProviderEvent::MessageStop {
+                    usage: UsageStats::default(),
+                    finish_reason: Some("tool_use".into()),
+                },
+            ];
+            Ok(futures_util::stream::iter(evs.into_iter().map(Ok)).boxed())
+        }
+        fn count_tokens(&self, _m: &str, t: &str) -> usize {
+            t.len() / 4
+        }
+    }
+
+    fn assistant_tool_messages(msgs: &[crate::db::MessageRow]) -> Vec<ChatMessage> {
+        msgs.iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .filter(|cm| {
+                cm.role == Role::Assistant
+                    && cm
+                        .content
+                        .iter()
+                        .any(|c| matches!(c, ContentBlock::ToolUse { .. }))
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn test_parallel_tool_calls_preserve_stream_order() {
+        let ws = TempDir::new().unwrap();
+        let provider = Arc::new(ScriptedProvider {
+            turns: StdMutex::new(VecDeque::from(vec![
+                vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "z".into(),
+                        name: "mock".into(),
+                    },
+                    ProviderEvent::ToolUseComplete {
+                        id: "z".into(),
+                        name: "mock".into(),
+                        input: serde_json::json!({"k":1}),
+                    },
+                    ProviderEvent::ToolUseStart {
+                        id: "a".into(),
+                        name: "mock".into(),
+                    },
+                    ProviderEvent::ToolUseComplete {
+                        id: "a".into(),
+                        name: "mock".into(),
+                        input: serde_json::json!({"k":2}),
+                    },
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("tool_use".into()),
+                    },
+                ],
+                vec![
+                    ProviderEvent::TextDelta("done".into()),
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("end_turn".into()),
+                    },
+                ],
+            ])),
+        });
+
+        let (orch, sid, pool) = make_orch(provider, ws.path()).await;
+        let input_id = orch.admit_input(&sid, "hi", "steer").await.unwrap();
+        orch.run_session_turn(&sid, &input_id, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        let asst = assistant_tool_messages(&msgs)
+            .into_iter()
+            .next()
+            .expect("assistant tool_use message");
+        let ids: Vec<String> = asst
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                ContentBlock::ToolUse { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ids,
+            vec!["z".to_string(), "a".to_string()],
+            "tool_use blocks must persist in stream-arrival order (not HashMap order)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_malformed_tool_input_is_rejected_not_executed() {
+        let ws = TempDir::new().unwrap();
+        // Tool stream is truncated mid-input (no ToolUseComplete), so the
+        // accumulated input "{\"oops\":" never parses.
+        let provider = Arc::new(ScriptedProvider {
+            turns: StdMutex::new(VecDeque::from(vec![
+                vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "t1".into(),
+                        name: "mock".into(),
+                    },
+                    ProviderEvent::ToolUseDelta {
+                        id: "t1".into(),
+                        input_delta: "{\"oops\":".into(),
+                    },
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("tool_use".into()),
+                    },
+                ],
+                vec![
+                    ProviderEvent::TextDelta("done".into()),
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("end_turn".into()),
+                    },
+                ],
+            ])),
+        });
+
+        let (orch, sid, pool) = make_orch(provider, ws.path()).await;
+        let input_id = orch.admit_input(&sid, "hi", "steer").await.unwrap();
+        orch.run_session_turn(&sid, &input_id, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let all: String = get_messages(&pool, &sid)
+            .await
+            .unwrap()
+            .iter()
+            .map(|m| m.data.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all.contains("Invalid tool call"),
+            "a malformed tool call must produce an error tool_result"
+        );
+        assert!(
+            !all.contains("\"echo\""),
+            "the tool must NOT have been executed with bogus input"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mid_stream_error_fails_the_turn() {
+        let ws = TempDir::new().unwrap();
+        let (orch, sid, pool) = make_orch(Arc::new(ErrorMidStreamProvider), ws.path()).await;
+        let input_id = orch.admit_input(&sid, "hi", "steer").await.unwrap();
+
+        let res = orch
+            .run_session_turn(&sid, &input_id, CancellationToken::new())
+            .await;
+        assert!(
+            res.is_err(),
+            "a mid-stream provider error must fail the turn, not report success"
+        );
+        // The partial assistant text is still durably persisted.
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        assert!(
+            msgs.iter().any(|m| m.data.contains("partial")),
+            "the partial assistant text should be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_max_turns_config_caps_the_loop() {
+        let ws = TempDir::new().unwrap();
+        // Project config caps the loop at 2 turns.
+        let cfg_dir = ws.path().join(".private-code");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        std::fs::write(cfg_dir.join("config.json"), r#"{"max_turns": 2}"#).unwrap();
+
+        let (orch, sid, pool) = make_orch(Arc::new(AlwaysToolProvider), ws.path()).await;
+        let input_id = orch.admit_input(&sid, "hi", "steer").await.unwrap();
+        orch.run_session_turn(&sid, &input_id, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        assert_eq!(
+            assistant_tool_messages(&msgs).len(),
+            2,
+            "the loop must stop at max_turns=2 from config"
         );
     }
 }

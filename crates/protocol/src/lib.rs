@@ -20,6 +20,7 @@ mod tests {
                 },
                 ContentBlock::Reasoning {
                     reasoning: "Thinking about greeting...".to_string(),
+                    signature: None,
                 },
                 ContentBlock::ToolUse {
                     id: "call-1".to_string(),
