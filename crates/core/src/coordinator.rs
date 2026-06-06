@@ -718,6 +718,89 @@ impl SessionCoordinator {
 
         Ok(db::get_session(&self.pool, session_id).await?)
     }
+
+    /// Evict a session's live state IFF it is idle — mirroring the reaper's guard
+    /// (no active turn, no pending permission, empty queue). Evicting a session
+    /// with a running drain would be a correctness bug: a fresh access could
+    /// rebuild the session and spawn a NEW drain while the old drain is still
+    /// mid-turn; when the old drain reaches its settlement hand-off it re-looks
+    /// up the session by id (it cannot tell "its" session from the recreate) and
+    /// would either steal the new drain's queued input or clear the new drain's
+    /// `active_turn_cancel`, letting a third drain spawn in parallel — the exact
+    /// double-drain the single-token invariant exists to prevent. The check and
+    /// the removal therefore happen under ONE lock acquisition with no await
+    /// between them.
+    ///
+    /// Returns `true` when no stale live state remains afterward (evicted, or the
+    /// session was never live), `false` when a busy session blocked eviction.
+    pub async fn evict_session(&self, session_id: &str) -> bool {
+        let mut sessions = self.sessions.lock().await;
+        let idle = match sessions.get(session_id) {
+            None => return true, // nothing cached → next access rebuilds fresh
+            Some(sess) => {
+                sess.active_turn_cancel.is_none()
+                    && sess.pending_permission.is_none()
+                    && sess.queued.is_empty()
+            }
+        };
+        if idle {
+            if let Some(sess) = sessions.remove(session_id) {
+                sess.session_cancel.cancel(); // tear down its router tasks
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Switch a session's model. The new `model_config` is ALWAYS persisted. The
+    /// orchestrator re-reads `model_id` per turn, so a model change within the
+    /// same provider takes effect on the next turn with no eviction. A
+    /// `provider_id` change, however, only takes effect once the live session is
+    /// rebuilt (the provider is pinned at session build) — so we evict, but only
+    /// when idle.
+    ///
+    /// Returns `Ok(true)` when the change is fully live, `Ok(false)` when a
+    /// provider switch was persisted but a busy session deferred it (the caller
+    /// should surface "applies after the current turn" and retry the eviction
+    /// once the turn settles — e.g. on the turn-ended event).
+    pub async fn set_model(
+        &self,
+        session_id: &str,
+        model_config: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let provider_of = |cfg: &str| -> Option<String> {
+            serde_json::from_str::<serde_json::Value>(cfg)
+                .ok()
+                .and_then(|v| v["provider_id"].as_str().map(str::to_string))
+        };
+        let old_provider = db::get_session(&self.pool, session_id)
+            .await?
+            .map(|r| provider_of(&r.model_config))
+            .ok_or("Session not found")?;
+        let new_provider = provider_of(model_config);
+
+        db::update_session_model(&self.pool, session_id, model_config).await?;
+
+        // Same provider → no live state to refresh (model_id is per-turn).
+        if new_provider == old_provider {
+            return Ok(true);
+        }
+        // Provider changed → must rebuild; only possible when idle.
+        Ok(self.evict_session(session_id).await)
+    }
+
+    /// Switch a session's agent. The orchestrator re-reads `agent_id` from the DB
+    /// at the start of each turn, so this is a pure DB write — it takes effect on
+    /// the next turn with no eviction (a turn already mid-flight keeps its agent).
+    pub async fn set_agent(
+        &self,
+        session_id: &str,
+        agent_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        db::update_session_agent(&self.pool, session_id, agent_id).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -1672,5 +1755,231 @@ mod tests {
 
         // ── nothing left to unrevert → Ok(None) ──
         assert!(coord.unrevert_session(&session_id).await.unwrap().is_none());
+    }
+
+    /// `evict_session` must mirror the reaper's idle guard: a session with an
+    /// active turn, a parked permission, OR a queued input must NOT be evicted —
+    /// evicting a live-drain session would let a recreate race the old drain's
+    /// settlement and spawn a parallel drain. A non-live session counts as
+    /// already-evicted.
+    #[tokio::test]
+    async fn evict_session_is_guarded_by_idleness() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        let coord = SessionCoordinator::new(
+            pool,
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+
+        // A non-live session counts as evicted (next access rebuilds fresh).
+        assert!(
+            coord.evict_session(&session_id).await,
+            "non-live session counts as evicted"
+        );
+
+        // Make it live, then evict while idle.
+        coord.get_or_create_session(&session_id).await.unwrap();
+        assert!(coord.sessions.lock().await.contains_key(&session_id));
+        assert!(
+            coord.evict_session(&session_id).await,
+            "idle live session evicts"
+        );
+        assert!(
+            !coord.sessions.lock().await.contains_key(&session_id),
+            "evicted session is gone"
+        );
+
+        // An ACTIVE TURN blocks eviction (the load-bearing case).
+        coord.get_or_create_session(&session_id).await.unwrap();
+        {
+            let mut s = coord.sessions.lock().await;
+            s.get_mut(&session_id).unwrap().active_turn_cancel = Some(CancellationToken::new());
+        }
+        assert!(
+            !coord.evict_session(&session_id).await,
+            "an active turn blocks eviction"
+        );
+        assert!(
+            coord.sessions.lock().await.contains_key(&session_id),
+            "busy session survives the evict attempt"
+        );
+
+        // A PARKED PERMISSION blocks eviction.
+        {
+            let mut s = coord.sessions.lock().await;
+            let sess = s.get_mut(&session_id).unwrap();
+            sess.active_turn_cancel = None;
+            let (tx, _rx) = oneshot::channel::<PermissionReply>();
+            sess.pending_permission = Some((
+                PermissionPrompt {
+                    permission_id: "p1".into(),
+                    tool_name: "write_file".into(),
+                    action: "write".into(),
+                    resources: vec!["*".into()],
+                    preview: String::new(),
+                },
+                tx,
+            ));
+        }
+        assert!(
+            !coord.evict_session(&session_id).await,
+            "a parked permission blocks eviction"
+        );
+
+        // A QUEUED input blocks eviction.
+        {
+            let mut s = coord.sessions.lock().await;
+            let sess = s.get_mut(&session_id).unwrap();
+            sess.pending_permission = None;
+            sess.queued.push_back("queued-input".into());
+        }
+        assert!(
+            !coord.evict_session(&session_id).await,
+            "a queued input blocks eviction"
+        );
+
+        // Fully idle again → evicts.
+        {
+            let mut s = coord.sessions.lock().await;
+            s.get_mut(&session_id).unwrap().queued.clear();
+        }
+        assert!(
+            coord.evict_session(&session_id).await,
+            "idle again → evicts"
+        );
+        assert!(!coord.sessions.lock().await.contains_key(&session_id));
+    }
+
+    /// `set_model` always persists the new config, but only evicts the live
+    /// session when the PROVIDER changes (the provider is pinned at session
+    /// build; `model_id` is re-read per turn). A provider change against a busy
+    /// session persists the config but defers the eviction → `Ok(false)`.
+    #[tokio::test]
+    async fn set_model_persists_always_and_evicts_only_on_provider_change() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        let mut coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(SentinelProvider(1)),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        coord.register_provider("nvidia", Arc::new(SentinelProvider(2)));
+
+        coord.get_or_create_session(&session_id).await.unwrap();
+
+        // Same provider, new model_id → stays live (model_id is per-turn); DB updated.
+        let same_provider =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-haiku-4-5"})
+                .to_string();
+        assert!(
+            coord.set_model(&session_id, &same_provider).await.unwrap(),
+            "same-provider change is immediately live"
+        );
+        assert!(
+            coord.sessions.lock().await.contains_key(&session_id),
+            "same-provider change must NOT evict"
+        );
+        assert_eq!(
+            db::get_session(&pool, &session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .model_config,
+            same_provider
+        );
+
+        // Provider change while idle → evicts; next access rebuilds with nvidia.
+        let new_provider =
+            serde_json::json!({"provider_id":"nvidia","model_id":"meta/llama-3.3-70b-instruct"})
+                .to_string();
+        assert!(
+            coord.set_model(&session_id, &new_provider).await.unwrap(),
+            "idle provider change is live"
+        );
+        assert!(
+            !coord.sessions.lock().await.contains_key(&session_id),
+            "provider change evicts the live session"
+        );
+        assert_eq!(
+            db::get_session(&pool, &session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .model_config,
+            new_provider
+        );
+
+        // Provider change while BUSY → persisted but eviction deferred (Ok(false)).
+        coord.get_or_create_session(&session_id).await.unwrap();
+        {
+            let mut s = coord.sessions.lock().await;
+            s.get_mut(&session_id).unwrap().active_turn_cancel = Some(CancellationToken::new());
+        }
+        let back =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        assert!(
+            !coord.set_model(&session_id, &back).await.unwrap(),
+            "busy provider change defers eviction"
+        );
+        assert!(
+            coord.sessions.lock().await.contains_key(&session_id),
+            "busy session is not evicted"
+        );
+        assert_eq!(
+            db::get_session(&pool, &session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .model_config,
+            back,
+            "model_config is persisted even when the eviction is deferred"
+        );
     }
 }

@@ -256,6 +256,43 @@ pub async fn update_usage(
     Ok(())
 }
 
+/// Persist a session's model selection (`model_config` JSON: `provider_id` +
+/// `model_id`). The orchestrator re-reads `model_id` per turn, but the provider
+/// is pinned at session build — so a `provider_id` change requires evicting the
+/// live session (see `SessionCoordinator::set_model`).
+pub async fn update_session_model(
+    pool: &SqlitePool,
+    session_id: &str,
+    model_config: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE session SET model_config = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
+    )
+    .bind(model_config)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Persist a session's agent selection. The orchestrator re-reads `agent_id`
+/// from the DB at the start of each turn, so this takes effect on the next turn
+/// without evicting the live session.
+pub async fn update_session_agent(
+    pool: &SqlitePool,
+    session_id: &str,
+    agent_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE session SET agent_id = ?1, updated_at = strftime('%s','now') WHERE id = ?2",
+    )
+    .bind(agent_id)
+    .bind(session_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 pub async fn append_message(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     id: &str,
