@@ -622,6 +622,16 @@ impl Tool for PatchTool {
                 } => {
                     let canonical = validate_path(context.workspace_path, &path)?;
                     let original_text = fs::read_to_string(&canonical)?;
+
+                    // Staleness guard: mirror EditTool/WriteFileTool so a patch
+                    // cannot silently clobber a file that changed out-of-band
+                    // since it was read this turn.
+                    if let Some(cached) = context.file_read_cache.get(&canonical)
+                        && original_text != *cached
+                    {
+                        return Err(ToolError::StaleFile);
+                    }
+
                     let SplitBom {
                         text: original_body,
                         bom,

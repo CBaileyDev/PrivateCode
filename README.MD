@@ -6,6 +6,16 @@ Private Code (formerly codenamed *Forge*) is designed to be a developer's ultima
 
 ---
 
+## 🖼️ UI Preview
+
+> **Desktop GUI** (Tauri 2 + Solid.js) — frontend preview. The shell below is captured running standalone, so the connection indicator reads *Offline*; live session/backend wiring is in active development.
+
+| Welcome screen (dark) | Command palette (⌘K) |
+|:---:|:---:|
+| ![Private Code desktop GUI — dark welcome screen](docs/images/desktop-welcome-dark.png) | ![Private Code desktop GUI — command palette](docs/images/desktop-command-palette.png) |
+
+---
+
 ## ⚡ Key Pillars & Project Angle
 
 ### 1. Performance as Correctness
