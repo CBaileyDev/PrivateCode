@@ -24,7 +24,7 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | C12 | Desktop frontend bugs (XSS, session bleed, locks, panics) | ✅ done |
 | C13 | Wire model/agent dropdowns + slash commands | ✅ done |
 | C14 | MessageList virtualization (virtua) + real Shiki-in-worker | ✅ done |
-| C15 | Frontend store test suite (vitest + mockIPC) | ⬜ pending |
+| C15 | Frontend store test suite (vitest + mockIPC) | ✅ done |
 | C16 | Perf instrumentation (--selftest + criterion + perf.yml) | ⬜ pending |
 
 Dependency order: C0 → C1 → {C2,C3,C4} → C5,C6 → {C7,C8,C9} → C10 → {C11,C12,C13} → {C14,C15} → C16
@@ -83,6 +83,16 @@ Six scope items; five fixed, one (plugins) consciously scoped out:
 - **virtua:** `MessageList` now renders a `<VList>` (`virtua/solid`) over a single `data` array of `{kind:'msg'} | {kind:'streaming'}` rows — virtua measures dynamic heights including the streaming bubble growing token-by-token. Auto-scroll is intentionally dumb: a `createEffect` on row-count + streaming buffers calls `handle.scrollToIndex(last, {align:'end'})` only while pinned to bottom; `onScroll` recomputes `atBottom` from `scrollSize/scrollOffset/viewportSize` and toggles the FAB. The VList owns the scroll (`.message-container` is now `min-height:0; overflow:hidden`); rows are re-centered to the 860px column via `.message-row`.
 - **Honesty ceiling (advisor):** C14 is the LEAST verifiable cluster — typecheck + build + the pure-Shiki vitest prove "compiles, bundles, doesn't throw on import, highlight logic correct, degrades gracefully," but they do NOT prove virtualization scrolls, auto-scroll-on-stream works, height measurement settles, or that highlighting/line-numbers render. Those need a human GUI launch and are on the C15/human list. virtua is **not** headless-unit-testable (jsdom has no layout). Recorded as "implemented per library docs + pure logic tested + degrades gracefully," not "verified" — same honesty log as the `block_on` shutdown.
 - Bundle: Shiki sits in its own ~677KB async worker chunk (loaded on first highlight); virtua adds ~20KB to the main bundle (52→72KB). CSP `cdn.jsdelivr.net` removed (bundled).
+
+## C15 done (frontend store suite — vitest + jsdom + mockIPC)
+Closes the C12/C13/C14 deferred-test checklists. Pure-logic tests stay node-env; store tests opt into jsdom via a `// @vitest-environment jsdom` docblock and drive the real store code through `@tauri-apps/api/mocks` `mockIPC` (the stores' `await import("@tauri-apps/api/core")` invoke routes to the mock). **28 vitest tests across 5 files**, all green:
+- `sanitize.test.ts` (9, node) — XSS escape/allowlist (C12).
+- `highlight.test.ts` (4, node) — Shiki known-lang/alias/unknown-fallback/escaping (C14).
+- `messages.test.ts` (7, jsdom) — bleed guard (both directions), error→lock-reset, and `loadMessages`: normal rows, compaction→divider (not raw JSON), malformed→text-block (no throw), late-load for a non-displayed session dropped.
+- `session.test.ts` (5, jsdom) — `setActiveModel`/`setActiveAgent` invoke + store patch, `revertActiveSession`→revert_session+reload, **deferred provider switch is NOT applied to a different session** (the C13 session-keying regression — discriminating), reload-restore re-attaches the persisted active session.
+- `permissions.test.ts` (3, jsdom) — deny-feedback forwarded on reject, null on allow, whitespace-only ignored.
+- Infra: `jsdom` dev-dep; an in-memory `localStorage` polyfill in `session.test.ts` (this vitest/jsdom build doesn't expose a functional one). A benign node-25 `--localstorage-file` warning is emitted by jsdom; ignorable.
+- **Still GUI-only (not unit-testable headless):** virtua scroll/measurement + Shiki/line-number RENDERING + the `block_on` shutdown hook. These remain on the human-launch list.
 
 ## Carry-forward notes
 - **Deferred (Lagged-while-connected recovery):** the WS forward loop `continue`s on `broadcast::RecvError::Lagged`, relying on the client reconciling durable state from the DB. That holds for messages/checkpoints/usage but not for `Error` (in-memory only) — a client that lags past the 16384 buffer mid-turn could miss an error with no reconnect. Real but low-probability and a riskier hot-path change; the right fix is the forward loop re-syncing in-memory durable history on Lagged (track last-forwarded seq, replay history beyond it). Not bundled with the Error-seq fix.
