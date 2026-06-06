@@ -59,8 +59,21 @@ pub struct SessionCoordinator {
     pub shutdown_token: CancellationToken,
 }
 
+/// Whether an event enters `sess.history` (the 1000-cap durable replay buffer).
+/// CRITICAL: every EPHEMERAL event variant must be excluded here, NOT just
+/// filtered by `event_seq`. A multi-model turn emits ~N×hundreds of
+/// `CandidateDelta`s; if they entered `sess.history` they would evict the real
+/// durable events (`MessageCompleted`, `Error`, `ToolPermissionRequired`) within
+/// a single fan-out, re-breaking lag recovery / cold reconnect. Candidate events
+/// are pure UI streaming — only the synthesized `MessageCompleted` is durable.
 fn is_durable_event(event: &ProtocolEvent) -> bool {
-    !matches!(event, ProtocolEvent::MessageDelta { .. })
+    !matches!(
+        event,
+        ProtocolEvent::MessageDelta { .. }
+            | ProtocolEvent::CandidateStarted { .. }
+            | ProtocolEvent::CandidateDelta { .. }
+            | ProtocolEvent::CandidateCompleted { .. }
+    )
 }
 
 /// The durable replay-cursor sequence for an event (0 for ephemeral/uncounted events).
@@ -2201,6 +2214,15 @@ mod tests {
                 session_id: "s".into(),
                 delta: DeltaPayload::Text { text: "tok".into() },
             },
+            // A fan-out candidate delta is ephemeral too — it must never be
+            // recovered (event_seq == 0), exactly like a MessageDelta.
+            ProtocolEvent::CandidateDelta {
+                session_id: "s".into(),
+                candidate_index: 0,
+                delta: DeltaPayload::Text {
+                    text: "cand".into(),
+                },
+            },
             ProtocolEvent::ToolPermissionRequired {
                 session_id: "s".into(),
                 seq: 3,
@@ -2235,14 +2257,69 @@ mod tests {
             ProtocolEvent::MessageCompleted { seq: 7, .. }
         ));
 
-        // From watermark 0: all three durables recover; the delta is still skipped.
+        // From watermark 0: all three durables recover; the deltas are still skipped.
         let from_zero = durable_after(&history, 0);
         assert_eq!(from_zero.len(), 3);
         assert!(
-            !from_zero
-                .iter()
-                .any(|e| matches!(e, ProtocolEvent::MessageDelta { .. })),
-            "ephemeral deltas are never recovered"
+            !from_zero.iter().any(|e| matches!(
+                e,
+                ProtocolEvent::MessageDelta { .. } | ProtocolEvent::CandidateDelta { .. }
+            )),
+            "ephemeral deltas (message and candidate) are never recovered"
+        );
+    }
+
+    /// The load-bearing invariant for multi-model orchestration: ALL three
+    /// candidate event variants are EPHEMERAL — excluded from `sess.history` by
+    /// `is_durable_event`, exactly like `MessageDelta`. If any one of them were
+    /// durable, a single fan-out turn's hundreds of candidate deltas would evict
+    /// the real durable events (`MessageCompleted`, `Error`,
+    /// `ToolPermissionRequired`) from the 1000-cap buffer, silently regressing
+    /// lag recovery and cold reconnect. This test fails closed the moment a new
+    /// candidate variant is added without excluding it.
+    #[test]
+    fn candidate_events_are_ephemeral_only_synthesis_persists() {
+        use private_code_protocol::event::DeltaPayload;
+        let started = ProtocolEvent::CandidateStarted {
+            session_id: "s".into(),
+            candidate_index: 0,
+            model_id: "anthropic/claude-opus-4-8".into(),
+        };
+        let delta = ProtocolEvent::CandidateDelta {
+            session_id: "s".into(),
+            candidate_index: 0,
+            delta: DeltaPayload::Text { text: "x".into() },
+        };
+        let completed = ProtocolEvent::CandidateCompleted {
+            session_id: "s".into(),
+            candidate_index: 0,
+            usage: UsageStats::default(),
+            finish_reason: Some("end_turn".into()),
+            error: None,
+        };
+        for ev in [&started, &delta, &completed] {
+            assert!(
+                !is_durable_event(ev),
+                "candidate events must be ephemeral (excluded from sess.history)"
+            );
+            // Ephemeral ⇒ no replay cursor ⇒ always-forward, never recovered.
+            assert_eq!(event_seq(ev), 0, "candidate events carry no durable seq");
+            assert!(
+                should_forward(ev, 9999),
+                "ephemeral candidate events always forward to live subscribers"
+            );
+        }
+
+        // The synthesized answer, by contrast, IS durable and replayable.
+        let synth = ProtocolEvent::MessageCompleted {
+            session_id: "s".into(),
+            seq: 1,
+            message_id: "m".into(),
+            usage: UsageStats::default(),
+        };
+        assert!(
+            is_durable_event(&synth),
+            "the synthesized MessageCompleted is the one durable record of the turn"
         );
     }
 

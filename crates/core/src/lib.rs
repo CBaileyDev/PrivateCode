@@ -6,6 +6,7 @@ pub mod coordinator;
 pub mod db;
 pub mod fuzzy;
 pub mod indexer;
+pub mod orchestration;
 pub mod orchestrator;
 pub mod permissions;
 pub mod repomap;

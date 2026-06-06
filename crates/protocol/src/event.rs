@@ -85,4 +85,33 @@ pub enum ProtocolEvent {
         message: String,
         retryable: bool,
     },
+    /// A fan-out candidate (one parallel model in a multi-model turn) started
+    /// streaming. EPHEMERAL: this and the two variants below carry no replay
+    /// cursor (no `seq`) and MUST be excluded from `is_durable_event` — only the
+    /// synthesized final answer persists as a durable `MessageCompleted`. Replays
+    /// of a multi-model turn show one answer, not N candidate transcripts.
+    CandidateStarted {
+        session_id: String,
+        candidate_index: u32,
+        model_id: String,
+    },
+    /// A token delta from candidate `candidate_index`. EPHEMERAL (see
+    /// [`CandidateStarted`]). Reuses [`DeltaPayload`] so a comparison UI can render
+    /// each candidate's stream exactly like the primary one.
+    CandidateDelta {
+        session_id: String,
+        candidate_index: u32,
+        delta: DeltaPayload,
+    },
+    /// Candidate `candidate_index` finished (or failed). EPHEMERAL (see
+    /// [`CandidateStarted`]). `usage` is that candidate's own spend (summed into
+    /// the turn total alongside the synthesizer); `error` is `Some` when the
+    /// candidate failed and the turn proceeded with the survivors.
+    CandidateCompleted {
+        session_id: String,
+        candidate_index: u32,
+        usage: UsageStats,
+        finish_reason: Option<String>,
+        error: Option<String>,
+    },
 }
