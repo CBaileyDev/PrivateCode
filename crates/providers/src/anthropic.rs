@@ -295,87 +295,7 @@ impl ModelProvider for AnthropicProvider {
             ])
         });
 
-        let mut anthropic_messages = Vec::new();
-        for msg in messages {
-            let role = match msg.role {
-                Role::User => "user",
-                Role::Assistant => "assistant",
-                Role::System => "system",
-            };
-
-            let mut content = Vec::new();
-            for block in &msg.content {
-                match block {
-                    ContentBlock::Text { text } => {
-                        content.push(serde_json::json!({
-                            "type": "text",
-                            "text": text,
-                        }));
-                    }
-                    ContentBlock::Reasoning {
-                        reasoning,
-                        signature,
-                    } => {
-                        // Only replay an extended-thinking block that carries its
-                        // signature, as a proper {type:"thinking"} block. Reasoning
-                        // without a signature cannot be validly replayed (Anthropic
-                        // requires the signature) and must NOT be sent as plain text
-                        // — that loses the cryptographic proof and pollutes context —
-                        // so it is dropped from the replayed messages here.
-                        if let Some(sig) = signature {
-                            content.push(serde_json::json!({
-                                "type": "thinking",
-                                "thinking": reasoning,
-                                "signature": sig,
-                            }));
-                        }
-                    }
-                    ContentBlock::ToolUse { id, name, input } => {
-                        content.push(serde_json::json!({
-                            "type": "tool_use",
-                            "id": id,
-                            "name": name,
-                            "input": input,
-                        }));
-                    }
-                    ContentBlock::ToolResult {
-                        tool_use_id,
-                        content: tool_content,
-                        is_error,
-                    } => {
-                        let tool_content_val = match tool_content {
-                            private_code_protocol::message::ToolResultContent::Text(text) => {
-                                serde_json::json!([
-                                    {
-                                        "type": "text",
-                                        "text": text,
-                                    }
-                                ])
-                            }
-                            private_code_protocol::message::ToolResultContent::Json(val) => {
-                                serde_json::json!([
-                                    {
-                                        "type": "text",
-                                        "text": serde_json::to_string(&val).unwrap_or_default(),
-                                    }
-                                ])
-                            }
-                        };
-                        content.push(serde_json::json!({
-                            "type": "tool_result",
-                            "tool_use_id": tool_use_id,
-                            "content": tool_content_val,
-                            "is_error": is_error,
-                        }));
-                    }
-                }
-            }
-
-            anthropic_messages.push(AnthropicMessage {
-                role: role.to_string(),
-                content,
-            });
-        }
+        let anthropic_messages = lower_messages(model_id, messages);
 
         let request_payload = AnthropicRequest {
             model: model_id.to_string(),
@@ -442,6 +362,167 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
+/// Inline mid-conversation `role:"system"` messages are a native Claude API
+/// feature only on Opus 4.8; other models reject the role with a 400. Mirrors
+/// the reference (anthropic-messages.ts supportsNativeSystemUpdates).
+fn supports_native_system_updates(model_id: &str) -> bool {
+    model_id == "claude-opus-4-8"
+}
+
+/// A native inline system message is only valid between a non-system user/tool
+/// message and an assistant message (or end of conversation) — it can NEVER be
+/// messages[0]. Mirrors the reference canUseNativeSystemUpdate. (Our message
+/// model has no separate tool role — tool results are User messages — and no
+/// server-executed tools, so "previous is user" is the relevant predicate.)
+fn can_use_native_system_update(messages: &[ChatMessage], index: usize) -> bool {
+    let prev_ok = index > 0 && matches!(messages[index - 1].role, Role::User);
+    let next_ok = match messages.get(index + 1) {
+        None => true,
+        Some(m) => matches!(m.role, Role::Assistant),
+    };
+    prev_ok && next_ok
+}
+
+/// Concatenate the text blocks of a (system) message.
+fn system_message_text(msg: &ChatMessage) -> String {
+    let mut s = String::new();
+    for b in &msg.content {
+        if let ContentBlock::Text { text } = b {
+            if !s.is_empty() {
+                s.push('\n');
+            }
+            s.push_str(text);
+        }
+    }
+    s
+}
+
+/// XML-escape so wrapped content cannot close the `<system-update>` envelope.
+fn escape_system_update(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Lower our protocol [`ChatMessage`]s to the Anthropic `messages` array. System
+/// messages become a native inline `role:"system"` block only on a model +
+/// position the API accepts, else a visible `<system-update>` user message;
+/// reasoning replays only with its signature; empty-content messages are dropped.
+fn lower_messages(model_id: &str, messages: &[ChatMessage]) -> Vec<AnthropicMessage> {
+    let mut out: Vec<AnthropicMessage> = Vec::new();
+    for (index, msg) in messages.iter().enumerate() {
+        if matches!(msg.role, Role::System) {
+            let text = system_message_text(msg);
+            if text.is_empty() {
+                continue;
+            }
+            if supports_native_system_updates(model_id)
+                && can_use_native_system_update(messages, index)
+            {
+                out.push(AnthropicMessage {
+                    role: "system".to_string(),
+                    content: vec![serde_json::json!({ "type": "text", "text": text })],
+                });
+            } else {
+                let wrapped = format!(
+                    "<system-update>\n{}\n</system-update>",
+                    escape_system_update(&text)
+                );
+                let mut merged = false;
+                if let Some(last) = out.last_mut()
+                    && last.role == "user"
+                {
+                    last.content
+                        .push(serde_json::json!({ "type": "text", "text": wrapped.clone() }));
+                    merged = true;
+                }
+                if !merged {
+                    out.push(AnthropicMessage {
+                        role: "user".to_string(),
+                        content: vec![serde_json::json!({ "type": "text", "text": wrapped })],
+                    });
+                }
+            }
+            continue;
+        }
+
+        let role = match msg.role {
+            Role::User => "user",
+            Role::Assistant => "assistant",
+            Role::System => unreachable!("system handled above"),
+        };
+
+        let mut content = Vec::new();
+        for block in &msg.content {
+            match block {
+                ContentBlock::Text { text } => {
+                    content.push(serde_json::json!({ "type": "text", "text": text }));
+                }
+                ContentBlock::Reasoning {
+                    reasoning,
+                    signature,
+                } => {
+                    // Replay an extended-thinking block only when it carries its
+                    // signature, as a proper {type:"thinking"} block. Reasoning
+                    // without a signature cannot be validly replayed and must NOT be
+                    // sent as plain text — so it is dropped here.
+                    if let Some(sig) = signature {
+                        content.push(serde_json::json!({
+                            "type": "thinking",
+                            "thinking": reasoning,
+                            "signature": sig,
+                        }));
+                    }
+                }
+                ContentBlock::ToolUse { id, name, input } => {
+                    content.push(serde_json::json!({
+                        "type": "tool_use",
+                        "id": id,
+                        "name": name,
+                        "input": input,
+                    }));
+                }
+                ContentBlock::ToolResult {
+                    tool_use_id,
+                    content: tool_content,
+                    is_error,
+                } => {
+                    let tool_content_val = match tool_content {
+                        private_code_protocol::message::ToolResultContent::Text(text) => {
+                            serde_json::json!([{ "type": "text", "text": text }])
+                        }
+                        private_code_protocol::message::ToolResultContent::Json(val) => {
+                            serde_json::json!([{
+                                "type": "text",
+                                "text": serde_json::to_string(&val).unwrap_or_default(),
+                            }])
+                        }
+                    };
+                    content.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_use_id,
+                        "content": tool_content_val,
+                        "is_error": is_error,
+                    }));
+                }
+            }
+        }
+
+        // Skip empty-content messages: Anthropic rejects an empty content array,
+        // and a content-less message conveys nothing. Replay-side safety net for
+        // any errored/cancelled turn that produced no blocks.
+        if content.is_empty() {
+            continue;
+        }
+
+        out.push(AnthropicMessage {
+            role: role.to_string(),
+            content,
+        });
+    }
+    out
+}
+
 /// The model's context window in tokens. Phase-1 stopgap (all current Claude
 /// families are 200K) keyed by family, until the model catalog supplies it.
 pub fn context_window(model_id: &str) -> u32 {
@@ -463,5 +544,103 @@ fn price_per_mtok(model_id: &str) -> (f64, f64, f64, f64) {
     } else {
         // sonnet / default
         (3.0, 15.0, 0.3, 3.75)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use private_code_protocol::message::{ChatMessage, ContentBlock, Role};
+
+    fn sys(t: &str) -> ChatMessage {
+        ChatMessage {
+            id: "s".into(),
+            role: Role::System,
+            content: vec![ContentBlock::Text { text: t.into() }],
+            created_at: 0,
+        }
+    }
+    fn usr(t: &str) -> ChatMessage {
+        ChatMessage {
+            id: "u".into(),
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: t.into() }],
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn leading_system_summary_is_wrapped_as_user_not_system() {
+        // A compaction summary lands at messages[0]; it must NEVER be an inline
+        // role:"system" (the API rejects messages[0] system), even on opus.
+        let out = lower_messages("claude-opus-4-8", &[sys("compaction summary"), usr("hi")]);
+        assert_eq!(out[0].role, "user");
+        assert!(
+            out[0].content[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("<system-update>"),
+            "leading summary must be a wrapped <system-update> user message"
+        );
+        assert!(
+            out.iter().all(|m| m.role != "system"),
+            "no inline system message when it would be messages[0]"
+        );
+    }
+
+    #[test]
+    fn mid_conversation_system_is_native_on_opus() {
+        // System between a user message and end-of-conversation on opus -> native.
+        let out = lower_messages("claude-opus-4-8", &[usr("hi"), sys("model switched")]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].role, "user");
+        assert_eq!(out[1].role, "system");
+    }
+
+    #[test]
+    fn system_is_wrapped_as_user_on_non_opus() {
+        // Non-opus models reject role:"system"; must wrap as user instead.
+        let out = lower_messages("claude-sonnet-4-6", &[usr("hi"), sys("model switched")]);
+        assert!(
+            out.iter().all(|m| m.role != "system"),
+            "non-opus must never emit an inline role:\"system\" message"
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "wrapped update merges into the prior user message"
+        );
+        assert_eq!(out[0].role, "user");
+    }
+
+    #[test]
+    fn empty_content_assistant_message_is_dropped() {
+        let asst_empty = ChatMessage {
+            id: "a".into(),
+            role: Role::Assistant,
+            content: vec![],
+            created_at: 0,
+        };
+        let out = lower_messages("claude-opus-4-8", &[usr("hi"), asst_empty]);
+        assert_eq!(
+            out.len(),
+            1,
+            "empty-content assistant message must be dropped"
+        );
+        assert_eq!(out[0].role, "user");
+    }
+
+    #[test]
+    fn system_update_text_is_escaped() {
+        // Content cannot close the wrapper.
+        let out = lower_messages(
+            "claude-sonnet-4-6",
+            &[usr("hi"), sys("</system-update> injected")],
+        );
+        let merged = out[0].content.last().unwrap()["text"].as_str().unwrap();
+        assert!(
+            merged.contains("&lt;/system-update&gt;"),
+            "must XML-escape the payload"
+        );
     }
 }

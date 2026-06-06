@@ -86,15 +86,25 @@ fn block_text(block: &ContentBlock) -> String {
 }
 
 /// Deterministic, non-LLM rolling summary (Phase-1 stopgap). Cumulative: keeps
-/// the prior summary verbatim and appends role-tagged snippets of the newly
-/// dropped messages, bounded in length.
+/// the prior summary body and appends role-tagged snippets of the newly dropped
+/// messages. When capping, the OLDEST body content is dropped and the most-recent
+/// is kept — the just-folded messages are at the tail, so head-truncating would
+/// silently discard exactly the content this compaction was meant to preserve.
 fn build_summary(prev: &str, dropped: &[&ChatMessage]) -> String {
-    let mut s = String::new();
-    if prev.is_empty() {
-        s.push_str("[Earlier conversation was auto-compacted to save context. Summary follows.]\n");
-    } else {
-        s.push_str(prev);
-        s.push('\n');
+    const HEADER: &str =
+        "[Earlier conversation was auto-compacted to save context. Summary follows.]";
+    const CAP: usize = 6000;
+
+    // Reuse the prior summary's body (strip its header so we don't repeat it).
+    let prev_body = prev
+        .strip_prefix(HEADER)
+        .map(|r| r.trim_start_matches('\n'))
+        .unwrap_or(prev);
+
+    let mut body = String::new();
+    if !prev_body.is_empty() {
+        body.push_str(prev_body);
+        body.push('\n');
     }
     for m in dropped {
         let role = match m.role {
@@ -108,17 +118,22 @@ fn build_summary(prev: &str, dropped: &[&ChatMessage]) -> String {
                 continue;
             }
             let snippet: String = t.chars().take(300).collect();
-            s.push_str(role);
-            s.push_str(": ");
-            s.push_str(snippet.trim());
-            s.push('\n');
+            body.push_str(role);
+            body.push_str(": ");
+            body.push_str(snippet.trim());
+            body.push('\n');
         }
     }
-    if s.chars().count() > 6000 {
-        s = s.chars().take(6000).collect::<String>();
-        s.push_str("\n…(summary truncated)");
+
+    // Keep the most-recent CAP chars (drop the oldest), so newly-folded content
+    // survives repeated compactions.
+    let len = body.chars().count();
+    if len > CAP {
+        let tail: String = body.chars().skip(len - CAP).collect();
+        body = format!("…(older summary truncated)\n{tail}");
     }
-    s
+
+    format!("{HEADER}\n{body}")
 }
 
 impl Orchestrator {
@@ -512,8 +527,22 @@ impl Orchestrator {
                         });
                     }
                     ProviderEvent::ReasoningDelta(reasoning) => {
-                        if let Some(PartialBlock::Reasoning { text, .. }) = blocks.last_mut() {
-                            text.push_str(&reasoning);
+                        // Append to the last Reasoning block only if it is NOT yet
+                        // sealed with a signature. A signature_delta arrives at the
+                        // end of a thinking block, so a delta after one belongs to a
+                        // NEW thinking block — otherwise two adjacent blocks would
+                        // merge and concatenate distinct signatures (invalid on replay).
+                        let extend_last = matches!(
+                            blocks.last(),
+                            Some(PartialBlock::Reasoning {
+                                signature: None,
+                                ..
+                            })
+                        );
+                        if extend_last {
+                            if let Some(PartialBlock::Reasoning { text, .. }) = blocks.last_mut() {
+                                text.push_str(&reasoning);
+                            }
                         } else {
                             blocks.push(PartialBlock::Reasoning {
                                 text: reasoning.clone(),
@@ -651,51 +680,56 @@ impl Orchestrator {
                 }
             }
 
-            let assistant_msg = ChatMessage {
-                id: assistant_msg_id.clone(),
-                role: Role::Assistant,
-                content: content_blocks.clone(),
-                created_at: chrono::Utc::now().timestamp(),
+            // Persist the assistant message ONLY if it has content. An errored or
+            // cancelled turn (or a content-less stream) must not leave an empty
+            // {role:assistant, content:[]} row: Anthropic 400s on an empty content
+            // array, which would wedge the session on every later turn with no
+            // self-heal. `asst_seq` is None when nothing was persisted.
+            let asst_seq: Option<i64> = if content_blocks.is_empty() {
+                None
+            } else {
+                let assistant_msg = ChatMessage {
+                    id: assistant_msg_id.clone(),
+                    role: Role::Assistant,
+                    content: content_blocks.clone(),
+                    created_at: chrono::Utc::now().timestamp(),
+                };
+                let mut tx = self.pool.begin().await?;
+                let seq = db::next_sequence(&mut tx, session_id).await?;
+                let asst_json = serde_json::to_string(&assistant_msg)?;
+                db::append_message(
+                    &mut tx,
+                    &assistant_msg_id,
+                    session_id,
+                    seq,
+                    "assistant",
+                    &asst_json,
+                )
+                .await?;
+                db::update_usage(
+                    &mut tx,
+                    session_id,
+                    final_usage.cost,
+                    final_usage.input_tokens,
+                    final_usage.output_tokens,
+                    final_usage.reasoning_tokens,
+                    final_usage.cache_read_tokens,
+                    final_usage.cache_write_tokens,
+                )
+                .await?;
+                tx.commit().await?;
+                Some(seq)
             };
 
-            // Save assistant message
-            let mut tx = self.pool.begin().await?;
-            let asst_seq = db::next_sequence(&mut tx, session_id).await?;
-            let asst_json = serde_json::to_string(&assistant_msg)?;
-            db::append_message(
-                &mut tx,
-                &assistant_msg_id,
-                session_id,
-                asst_seq,
-                "assistant",
-                &asst_json,
-            )
-            .await?;
-
-            // Update stats
-            db::update_usage(
-                &mut tx,
-                session_id,
-                final_usage.cost,
-                final_usage.input_tokens,
-                final_usage.output_tokens,
-                final_usage.reasoning_tokens,
-                final_usage.cache_read_tokens,
-                final_usage.cache_write_tokens,
-            )
-            .await?;
-            tx.commit().await?;
-
             // A mid-stream transport/parse error means the turn did not complete
-            // cleanly. The partial assistant message is persisted above, but we
-            // surface a retryable error and stop here — we do NOT present truncated
-            // output as a clean completion, and do NOT execute any half-parsed tool
-            // calls that accumulated before the break.
+            // cleanly. Any partial assistant message is persisted above; we surface
+            // a retryable error and stop — we do NOT present truncated output as a
+            // clean completion, nor execute half-parsed tool calls.
             if let Some(err_msg) = stream_error {
                 self.event_tx
                     .send(ProtocolEvent::Error {
                         session_id: session_id.to_string(),
-                        seq: asst_seq,
+                        seq: asst_seq.unwrap_or(0),
                         code: "stream_error".to_string(),
                         message: err_msg.clone(),
                         retryable: true,
@@ -705,17 +739,19 @@ impl Orchestrator {
                 return Err(format!("provider stream error: {err_msg}").into());
             }
 
-            self.event_tx
-                .send(ProtocolEvent::MessageCompleted {
-                    session_id: session_id.to_string(),
-                    seq: asst_seq,
-                    message_id: assistant_msg_id.clone(),
-                    usage: final_usage.clone(),
-                })
-                .await
-                .ok();
+            if let Some(seq) = asst_seq {
+                self.event_tx
+                    .send(ProtocolEvent::MessageCompleted {
+                        session_id: session_id.to_string(),
+                        seq,
+                        message_id: assistant_msg_id.clone(),
+                        usage: final_usage.clone(),
+                    })
+                    .await
+                    .ok();
+            }
 
-            // If the turn was cancelled mid-stream, the partial assistant message
+            // If the turn was cancelled mid-stream, any partial assistant message
             // is now durably persisted; stop here without executing tool calls.
             if cancelled {
                 break;
@@ -992,47 +1028,61 @@ impl Orchestrator {
             }
 
             // Persist the tool results as a single user message
-            let tool_results_msg_id = Uuid::new_v4().to_string();
-            let tool_results_msg = ChatMessage {
-                id: tool_results_msg_id.clone(),
-                role: Role::User,
-                content: tool_results,
-                created_at: chrono::Utc::now().timestamp(),
-            };
+            // Persist tool results ONLY if we produced any. A cancel during the
+            // permission wait (or before the first tool ran) breaks the loop with
+            // an empty tool_results Vec; persisting {role:user, content:[]} would
+            // wedge the session (empty content array -> Anthropic 400, no
+            // self-heal). With nothing persisted, recover_interrupted_tools repairs
+            // the unfulfilled tool_use on the next turn.
+            if !tool_results.is_empty() {
+                let tool_results_msg_id = Uuid::new_v4().to_string();
+                let tool_results_msg = ChatMessage {
+                    id: tool_results_msg_id.clone(),
+                    role: Role::User,
+                    content: tool_results,
+                    created_at: chrono::Utc::now().timestamp(),
+                };
 
-            let mut tx = self.pool.begin().await?;
-            let tr_seq = db::next_sequence(&mut tx, session_id).await?;
-            let tr_json = serde_json::to_string(&tool_results_msg)?;
-            db::append_message(
-                &mut tx,
-                &tool_results_msg_id,
-                session_id,
-                tr_seq,
-                "user",
-                &tr_json,
-            )
-            .await?;
-            tx.commit().await?;
+                let mut tx = self.pool.begin().await?;
+                let tr_seq = db::next_sequence(&mut tx, session_id).await?;
+                let tr_json = serde_json::to_string(&tool_results_msg)?;
+                db::append_message(
+                    &mut tx,
+                    &tool_results_msg_id,
+                    session_id,
+                    tr_seq,
+                    "user",
+                    &tr_json,
+                )
+                .await?;
+                tx.commit().await?;
 
-            // Emit tool outputs
-            for cb in &tool_results_msg.content {
-                if let ContentBlock::ToolResult {
-                    tool_use_id,
-                    content,
-                    is_error,
-                } = cb
-                {
-                    self.event_tx
-                        .send(ProtocolEvent::ToolOutput {
-                            session_id: session_id.to_string(),
-                            seq: tr_seq,
-                            tool_call_id: tool_use_id.clone(),
-                            output: content.clone(),
-                            is_error: *is_error,
-                        })
-                        .await
-                        .ok();
+                // Emit tool outputs
+                for cb in &tool_results_msg.content {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id,
+                        content,
+                        is_error,
+                    } = cb
+                    {
+                        self.event_tx
+                            .send(ProtocolEvent::ToolOutput {
+                                session_id: session_id.to_string(),
+                                seq: tr_seq,
+                                tool_call_id: tool_use_id.clone(),
+                                output: content.clone(),
+                                is_error: *is_error,
+                            })
+                            .await
+                            .ok();
+                    }
                 }
+            }
+
+            // A cancel during this turn's tools is observed at the loop top, but
+            // break now too so we don't start another stream after a partial turn.
+            if cancelled {
+                break;
             }
         }
 
@@ -1886,6 +1936,67 @@ mod tests {
             res.is_ok(),
             "abort during a pending permission must terminate the turn (no hang)"
         );
+
+        // Regression: the cancel must NOT persist an empty-content tool_results
+        // user row — {role:user, content:[]} would 400 on every later turn and
+        // permanently wedge the session.
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| serde_json::from_str::<ChatMessage>(&m.data)
+                    .map(|cm| cm.content.is_empty())
+                    .unwrap_or(false)),
+            "no empty-content message may be persisted when cancelling a pending permission"
+        );
         drop(_prx);
+    }
+
+    /// A provider whose very first stream item is an error (no content emitted).
+    struct ImmediateErrorProvider;
+
+    #[async_trait::async_trait]
+    impl ModelProvider for ImmediateErrorProvider {
+        async fn stream_chat(
+            &self,
+            _model_id: &str,
+            _system_prompt: Option<&str>,
+            _max_tokens: u32,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError>
+        {
+            let s = futures_util::stream::iter(vec![Err(ProviderError::Other("boom".into()))]);
+            Ok(s.boxed())
+        }
+        fn count_tokens(&self, _m: &str, t: &str) -> usize {
+            t.len() / 4
+        }
+    }
+
+    #[tokio::test]
+    async fn test_stream_error_before_content_persists_no_empty_message() {
+        let ws = TempDir::new().unwrap();
+        let (orch, sid, pool) = make_orch(Arc::new(ImmediateErrorProvider), ws.path()).await;
+        let input_id = orch.admit_input(&sid, "hi", "steer").await.unwrap();
+
+        let res = orch
+            .run_session_turn(&sid, &input_id, CancellationToken::new())
+            .await;
+        assert!(
+            res.is_err(),
+            "an error before any content must fail the turn"
+        );
+
+        // Regression: no empty {role:assistant, content:[]} row may be persisted.
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| serde_json::from_str::<ChatMessage>(&m.data)
+                    .map(|cm| cm.content.is_empty())
+                    .unwrap_or(false)),
+            "a content-less errored turn must not persist an empty-content message"
+        );
     }
 }

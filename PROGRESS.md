@@ -28,6 +28,13 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 
 Dependency order: C0 → C1 → {C2,C3,C4} → C5,C6 → {C7,C8,C9} → C10 → {C11,C12,C13} → {C14,C15} → C16
 
+## Phase-1 adversarial review (done)
+Workflow `phase1-adversarial-review` (13 agents) confirmed 6 real bugs in C1–C5; all fixed:
+1. **(critical)** compaction summary prepended as a leading inline `role:"system"` → Anthropic 400 (can't be messages[0]; rejected on non-opus). Fixed: anthropic.rs now gates inline system on opus+valid-position and otherwise wraps as a `<system-update>` user message (reference-grounded `lower_messages`).
+2–4. **(high ×3)** empty-content messages (`content:[]`) persisted on stream-error / permission-cancel / stream-cancel → wedge the session (400, no self-heal). Fixed: orchestrator never persists empty assistant/tool_result rows; anthropic.rs drops empty-content messages on replay.
+5. **(medium)** `build_summary` head-truncated (dropped newly-folded content on repeated compactions). Fixed: keep the most-recent content.
+6. **(low)** adjacent thinking blocks merged + concatenated signatures. Fixed: a signature seals a reasoning block; the next delta starts a new one.
+
 ## Carry-forward notes
 - **C12/C15 (frontend):** the new `compaction` message `type` needs render handling — the message store's `JSON.parse` fallback will otherwise show the raw `{compacted_through_seq,summary}` JSON. Render it as a "history compacted" divider (or hide it; the summary already reaches the model via the system prefix).
 - Compaction summary is a deterministic non-LLM stub (Phase 1); `auto=true` by default but only fires near the 200K window.
