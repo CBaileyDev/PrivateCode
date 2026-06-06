@@ -16,7 +16,7 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | C5 | Permission-park + tool.run cancellability (CRITICAL prereq) | ✅ done |
 | C6 | Daemon serve refactor (build_router/serve_daemon/DI) | ✅ done |
 | C7 | Daemon graceful shutdown + WS round-trip test | ✅ done |
-| C8 | Daemon eviction reaper + steer/queue + ToolRequested | ⬜ pending |
+| C8 | Daemon eviction reaper + steer/queue + ToolRequested | 🔶 in progress (C8a reaper ✅, C8b ToolRequested ✅, C8c-1 queue/drain ✅, C8c-2 steer ⬜) |
 | C9 | Daemon lock-across-await + durable replay | ⬜ pending |
 | C10 | Desktop command→EngineState seam + set_model/agent/revert/compact + eviction | ⬜ pending |
 | C11 | Desktop command-layer test harness | ⬜ pending |
@@ -36,6 +36,7 @@ Workflow `phase1-adversarial-review` (13 agents) confirmed 6 real bugs in C1–C
 6. **(low)** adjacent thinking blocks merged + concatenated signatures. Fixed: a signature seals a reasoning block; the next delta starts a new one.
 
 ## Carry-forward notes
+- **C8c-2 (steer) — abort/steer boundary (advisor-flagged):** `abort_turn` now clears the in-memory queue and cancels the active turn but leaves the abandoned inputs as **unpromoted `session_input` rows** (session.md L163: "stops the current chain while preserving pending/unpromoted durable inbox rows for a later fresh wake"). When C8c-2 adds orchestrator-side steer promotion (mid-turn scan of pending `delivery="steer"` rows at the safe provider-turn boundary), it MUST establish the L163 "ownership-chain boundary" so an aborted steer is not silently resurrected on the next turn. Concretely: abort needs to fence the rows it abandons (e.g. an abort/run-generation marker or tombstone the pending rows) and the steer scan must skip fenced rows. Queue-path drain (C8c-1) is unaffected — it pops in-memory ids the abort already cleared.
 - **C12/C15 (frontend):** the new `compaction` message `type` needs render handling — the message store's `JSON.parse` fallback will otherwise show the raw `{compacted_through_seq,summary}` JSON. Render it as a "history compacted" divider (or hide it; the summary already reaches the model via the system prefix).
 - Compaction summary is a deterministic non-LLM stub (Phase 1); `auto=true` by default but only fires near the 200K window.
 

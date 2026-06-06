@@ -2,10 +2,14 @@ use private_code_core::db;
 use private_code_core::orchestrator::Orchestrator;
 use private_code_core::permissions::{PermissionDecision, PermissionPrompt};
 use private_code_protocol::event::{ProtocolEvent, UsageStats};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
+
+/// Max number of inputs that may be queued behind an active turn before
+/// `run_turn` rejects further admissions (session.md inbox backlog limit).
+const MAX_BACKLOG: usize = 32;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -17,7 +21,16 @@ pub struct ActiveSession {
     pub history: Vec<ProtocolEvent>, // last 1000 durable events
     pub pending_permission: Option<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>,
     pub current_usage: UsageStats,
+    /// `Some` iff a drain chain is running for this session. This is the single
+    /// concurrency invariant: it is set ONLY by `run_turn` (atomically with the
+    /// spawn decision) and cleared ONLY by the drain loop (atomically with
+    /// `queued.pop_front()` returning `None`). `abort_turn` never touches it.
+    /// That makes parallel drains and stranded queue items impossible.
     pub active_turn_cancel: Option<CancellationToken>,
+    /// FIFO of admitted-but-not-yet-run input ids (`session_input.id`) waiting
+    /// behind the active turn (session.md: "queue inputs form a FIFO of future
+    /// activities ... promotes exactly one queued input ... at a time").
+    pub queued: VecDeque<String>,
     /// Cancels this session's router tasks so eviction tears them down
     /// deterministically (rather than relying on sender-drop alone).
     pub session_cancel: CancellationToken,
@@ -96,6 +109,7 @@ impl SessionCoordinator {
                     .filter(|(_, s)| {
                         s.active_turn_cancel.is_none()
                             && s.pending_permission.is_none()
+                            && s.queued.is_empty()
                             && s.last_activity.elapsed() > idle_ttl
                     })
                     .map(|(id, _)| id.clone())
@@ -187,6 +201,7 @@ impl SessionCoordinator {
                 cost: session_row.cost,
             },
             active_turn_cancel: None,
+            queued: VecDeque::new(),
             session_cancel: session_cancel.clone(),
             last_activity: std::time::Instant::now(),
         };
@@ -257,6 +272,11 @@ impl SessionCoordinator {
         Ok(b_rx)
     }
 
+    /// Admit a prompt and either start a drain chain for it or queue it behind
+    /// the active turn. A second prompt arriving mid-turn is NOT rejected — it is
+    /// admitted to the durable inbox and run FIFO when the current turn settles
+    /// (session.md: "queue inputs form a FIFO ... promotes exactly one queued
+    /// input ... at a time"). The backlog cap is the only rejection path.
     pub async fn run_turn(
         &self,
         session_id: &str,
@@ -265,62 +285,121 @@ impl SessionCoordinator {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.get_or_create_session(session_id).await?;
 
-        // Reserve the turn slot and grab the orchestrator handle, then DROP the
-        // sessions lock before any await — never hold the Mutex across a DB write
-        // (it would block event routing and every other session's operations).
-        let (orchestrator, cancel_token) = {
+        // Phase 1: enforce the backlog cap and grab the orchestrator handle.
+        // Reject ONLY when a drain is active AND the queue is already full — we
+        // check before admitting so a rejected prompt never orphans a DB row.
+        // (The Mutex is dropped before the DB write below: never hold it across
+        // an await — that would block event routing and every other session.)
+        let orchestrator = {
             let mut sessions = self.sessions.lock().await;
             let sess = sessions
                 .get_mut(session_id)
                 .ok_or("session not found in coordinator")?;
-            if sess.active_turn_cancel.is_some() {
-                return Err("A turn is already running for this session".into());
-            }
             sess.last_activity = std::time::Instant::now();
-            let cancel_token = CancellationToken::new();
-            sess.active_turn_cancel = Some(cancel_token.clone());
-            (sess.orchestrator.clone(), cancel_token)
+            if sess.active_turn_cancel.is_some() && sess.queued.len() >= MAX_BACKLOG {
+                return Err(format!(
+                    "input backlog full ({} queued); retry once the session drains",
+                    MAX_BACKLOG
+                )
+                .into());
+            }
+            sess.orchestrator.clone()
         };
 
         let s_id = session_id.to_string();
         let sessions_clone = self.sessions.clone();
 
-        // Admit the input (a DB write) with the lock released.
-        let input_id = match orchestrator.admit_input(&s_id, prompt, delivery).await {
-            Ok(id) => id,
-            Err(e) => {
-                // Release the reserved slot if admission failed.
-                let mut s = sessions_clone.lock().await;
-                if let Some(sess) = s.get_mut(&s_id) {
-                    sess.active_turn_cancel = None;
-                }
-                return Err(e.into());
+        // Phase 2: admit the input (a DB write) with the lock released. No slot is
+        // reserved yet, so a failed admission has nothing to roll back.
+        let input_id = orchestrator.admit_input(&s_id, prompt, delivery).await?;
+
+        // Phase 3: enqueue the input, then start a drain chain IFF none is running.
+        // Setting `active_turn_cancel` here (under the lock, atomically with the
+        // spawn decision) is the only place it is ever set — that, plus the drain
+        // loop being the only place it is cleared, is what serializes the chain.
+        // NOTE (accepted limitation, session.md L165 defers multi-caller admit):
+        // two concurrent same-session `run_turn`s can push in an order that differs
+        // from their `admitted_seq`. Single-client prompts serialize, both items
+        // still run with no loss, so we accept this rather than re-query the DB at
+        // settlement (which would reintroduce the lost-wakeup race).
+        let drain = {
+            let mut sessions = self.sessions.lock().await;
+            let sess = sessions
+                .get_mut(session_id)
+                .ok_or("session not found in coordinator")?;
+            sess.queued.push_back(input_id);
+            if sess.active_turn_cancel.is_some() {
+                None
+            } else {
+                let cancel_token = CancellationToken::new();
+                sess.active_turn_cancel = Some(cancel_token.clone());
+                // The queue was empty before our push (active_turn_cancel.is_none()
+                // implies no drain, which implies an empty queue), so this pops the
+                // very input we just admitted.
+                let first = sess.queued.pop_front().expect("just pushed an input");
+                Some((sess.orchestrator.clone(), cancel_token, first))
             }
         };
 
+        let Some((orchestrator, first_cancel, first_input_id)) = drain else {
+            return Ok(()); // Queued behind the running drain; it will be picked up.
+        };
+
         self.tracker.spawn(async move {
-            if let Err(e) = orchestrator
-                .run_session_turn(&s_id, &input_id, cancel_token)
-                .await
-            {
-                tracing::error!("Error executing turn for session {}: {}", s_id, e);
-            }
-            let mut s_map = sessions_clone.lock().await;
-            if let Some(sess) = s_map.get_mut(&s_id) {
-                sess.active_turn_cancel = None;
+            let mut current_input = first_input_id;
+            let mut current_cancel = first_cancel;
+            loop {
+                if let Err(e) = orchestrator
+                    .run_session_turn(&s_id, &current_input, current_cancel.clone())
+                    .await
+                {
+                    tracing::error!("Error executing turn for session {}: {}", s_id, e);
+                }
+
+                // Settlement hand-off — MUST stay synchronous under ONE lock
+                // acquisition with no `.await` between `pop_front` and the
+                // `active_turn_cancel = None` clear. That atomicity is the proof
+                // that no parallel drain spawns and no queued item is stranded.
+                let mut s_map = sessions_clone.lock().await;
+                let Some(sess) = s_map.get_mut(&s_id) else {
+                    break; // Session evicted/torn down (e.g. shutdown).
+                };
+                match sess.queued.pop_front() {
+                    Some(next) => {
+                        // Mint a fresh token so a later abort targets exactly the
+                        // next turn, and keep the slot owned across the hand-off.
+                        let next_cancel = CancellationToken::new();
+                        sess.active_turn_cancel = Some(next_cancel.clone());
+                        sess.last_activity = std::time::Instant::now();
+                        current_input = next;
+                        current_cancel = next_cancel;
+                    }
+                    None => {
+                        sess.active_turn_cancel = None;
+                        break;
+                    }
+                }
             }
         });
 
         Ok(())
     }
 
+    /// Interrupt the active turn and stop the drain chain (session.md L163:
+    /// "stops the current chain while preserving pending/unpromoted durable inbox
+    /// rows for a later fresh wake"). We drop the in-memory queue so the drain
+    /// settles to empty and stops — the dropped inputs remain unpromoted
+    /// `session_input` rows (a later prompt is their fresh wake). Crucially we do
+    /// NOT `take()` `active_turn_cancel`: the drain loop owns clearing it, so the
+    /// slot stays owned and no parallel drain can spawn in the cancellation
+    /// window. (`shutdown` is terminal and may take it.)
     pub async fn abort_turn(&self, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let mut sessions = self.sessions.lock().await;
         if let Some(sess) = sessions.get_mut(session_id) {
             sess.last_activity = std::time::Instant::now();
-            if let Some(cancel) = sess.active_turn_cancel.take() {
+            sess.queued.clear();
+            if let Some(cancel) = &sess.active_turn_cancel {
                 cancel.cancel();
-                return Ok(());
             }
         }
         Ok(())
@@ -380,7 +459,7 @@ mod tests {
     use super::*;
     use futures_util::stream::{BoxStream, StreamExt};
     use private_code_core::db::{connect_db, create_project, create_session, run_migrations};
-    use private_code_protocol::message::ChatMessage;
+    use private_code_protocol::message::{ChatMessage, ContentBlock, Role};
     use private_code_providers::provider::{ModelProvider, ProviderError, ProviderEvent};
     use std::time::Duration;
     use tempfile::TempDir;
@@ -479,6 +558,8 @@ mod tests {
                 .any(|e| matches!(e, ProtocolEvent::MessageCompleted { .. })),
             "get_history must replay the durable MessageCompleted"
         );
+
+        coord.shutdown(Duration::from_secs(5)).await;
     }
 
     /// A tool whose permission_class ("write_file") maps to Ask under the build
@@ -625,6 +706,305 @@ mod tests {
             );
         }
 
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// A text-only provider whose FIRST `stream_chat` call blocks until a oneshot
+    /// fires. This pins turn 1 "in flight" so later prompts are forced to queue,
+    /// making the FIFO drain deterministic instead of racing the fast happy path.
+    struct GatedProvider {
+        gate: std::sync::Mutex<Option<oneshot::Receiver<()>>>,
+    }
+
+    impl GatedProvider {
+        fn new(rx: oneshot::Receiver<()>) -> Self {
+            Self {
+                gate: std::sync::Mutex::new(Some(rx)),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ModelProvider for GatedProvider {
+        async fn stream_chat(
+            &self,
+            _model_id: &str,
+            _system_prompt: Option<&str>,
+            _max_tokens: u32,
+            _messages: &[ChatMessage],
+            _tools: &[serde_json::Value],
+        ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError>
+        {
+            // Only the first call holds the receiver; later turns find None and
+            // proceed immediately.
+            let waiter = self.gate.lock().unwrap().take();
+            if let Some(rx) = waiter {
+                let _ = rx.await;
+            }
+            let evs = vec![
+                Ok(ProviderEvent::TextDelta("ok".into())),
+                Ok(ProviderEvent::MessageStop {
+                    usage: UsageStats::default(),
+                    finish_reason: Some("end_turn".into()),
+                }),
+            ];
+            Ok(futures_util::stream::iter(evs).boxed())
+        }
+        fn count_tokens(&self, _m: &str, t: &str) -> usize {
+            t.len() / 4
+        }
+    }
+
+    /// Two prompts admitted while a turn is in flight are NOT rejected (the old
+    /// code returned "a turn is already running") — they are queued and drained
+    /// FIFO as separate activities once the active turn settles.
+    #[tokio::test]
+    async fn queued_prompts_run_fifo_as_separate_turns() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(&pool, &sid, &project_id, ws_str, ws_str, "t", "build", &cfg)
+            .await
+            .unwrap();
+
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(GatedProvider::new(gate_rx)),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+
+        // Turn 1 starts and blocks in the provider; the next two are admitted
+        // while it is in flight. They must succeed (no rejection) and queue.
+        coord.run_turn(&sid, "first", "queue").await.unwrap();
+        coord.run_turn(&sid, "second", "queue").await.unwrap();
+        coord.run_turn(&sid, "third", "queue").await.unwrap();
+        {
+            let map = coord.sessions.lock().await;
+            let sess = map.get(&sid).unwrap();
+            assert!(sess.active_turn_cancel.is_some(), "a drain is running");
+            assert_eq!(
+                sess.queued.len(),
+                2,
+                "two inputs queued behind the active turn"
+            );
+        }
+
+        // Release turn 1; the drain runs all three FIFO, one activity at a time.
+        gate_tx.send(()).unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut user_texts: Vec<String> = Vec::new();
+        while tokio::time::Instant::now() < deadline {
+            let msgs = db::get_messages(&pool, &sid).await.unwrap();
+            user_texts = msgs
+                .iter()
+                .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+                .filter(|m| m.role == Role::User)
+                .filter_map(|m| {
+                    m.content.iter().find_map(|c| match c {
+                        ContentBlock::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                })
+                .collect();
+            if user_texts.len() >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            user_texts,
+            vec![
+                "first".to_string(),
+                "second".to_string(),
+                "third".to_string()
+            ],
+            "queued prompts promote in FIFO order"
+        );
+
+        assert!(
+            db::get_pending_inputs(&pool, &sid)
+                .await
+                .unwrap()
+                .is_empty(),
+            "inbox fully drained"
+        );
+        {
+            let map = coord.sessions.lock().await;
+            let sess = map.get(&sid).unwrap();
+            assert!(
+                sess.active_turn_cancel.is_none(),
+                "slot released after drain"
+            );
+            assert!(sess.queued.is_empty());
+        }
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// Once the backlog reaches `MAX_BACKLOG` behind an active turn, further
+    /// admissions are rejected (and the rejected prompt is never queued).
+    #[tokio::test]
+    async fn backlog_cap_rejects_admission_when_queue_full() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(&pool, &sid, &project_id, ws_str, ws_str, "t", "build", &cfg)
+            .await
+            .unwrap();
+
+        let (gate_tx, gate_rx) = oneshot::channel();
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(GatedProvider::new(gate_rx)),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+
+        // Turn 1 starts and blocks; fill the backlog to exactly MAX_BACKLOG.
+        coord.run_turn(&sid, "active", "queue").await.unwrap();
+        for i in 0..MAX_BACKLOG {
+            coord
+                .run_turn(&sid, &format!("q{i}"), "queue")
+                .await
+                .unwrap();
+        }
+        {
+            let map = coord.sessions.lock().await;
+            assert_eq!(
+                map.get(&sid).unwrap().queued.len(),
+                MAX_BACKLOG,
+                "queue filled to cap"
+            );
+        }
+
+        // The next admission must be rejected and must not enqueue.
+        assert!(
+            coord.run_turn(&sid, "overflow", "queue").await.is_err(),
+            "run_turn rejects once the backlog is full"
+        );
+        {
+            let map = coord.sessions.lock().await;
+            assert_eq!(
+                map.get(&sid).unwrap().queued.len(),
+                MAX_BACKLOG,
+                "the rejected prompt was not queued"
+            );
+        }
+
+        // Releasing the gate lets the drain finish; shutdown cancels the rest.
+        drop(gate_tx);
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// Abort interrupts the active turn AND stops the drain chain, while the
+    /// queued input is preserved as an unpromoted inbox row (session.md L163:
+    /// "stops the current chain while preserving pending/unpromoted durable inbox
+    /// rows for a later fresh wake").
+    #[tokio::test]
+    async fn abort_stops_chain_and_preserves_queued_rows() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(&pool, &sid, &project_id, ws_str, ws_str, "t", "build", &cfg)
+            .await
+            .unwrap();
+
+        // Turn 1 emits a write_file tool call (-> Ask), parking on the permission.
+        let provider = Arc::new(private_code_providers::testkit::ScriptedProvider::new(
+            vec![vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                },
+                ProviderEvent::ToolUseComplete {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({}),
+                },
+                ProviderEvent::MessageStop {
+                    usage: UsageStats::default(),
+                    finish_reason: Some("tool_use".into()),
+                },
+            ]],
+        ));
+        let mut reg = private_code_tools::ToolRegistry::new();
+        reg.register(Box::new(AskTool));
+        let coord =
+            SessionCoordinator::new(pool.clone(), std::env::temp_dir(), provider, Arc::new(reg));
+
+        coord.run_turn(&sid, "first", "queue").await.unwrap();
+        // Let turn 1 reach the (unanswered) permission park.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // Enqueue a second prompt behind the parked turn.
+        coord.run_turn(&sid, "second", "queue").await.unwrap();
+        {
+            let map = coord.sessions.lock().await;
+            let sess = map.get(&sid).unwrap();
+            assert!(sess.active_turn_cancel.is_some());
+            assert_eq!(
+                sess.queued.len(),
+                1,
+                "second is queued behind the parked turn"
+            );
+        }
+
+        // Abort: C5 makes the permission wait interruptible, and abort_turn clears
+        // the in-memory queue. The drain then settles to an empty queue and stops.
+        coord.abort_turn(&sid).await.unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            {
+                let map = coord.sessions.lock().await;
+                let sess = map.get(&sid).unwrap();
+                if sess.active_turn_cancel.is_none() && sess.queued.is_empty() {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the drain chain must stop after an abort"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // "second" was never promoted: it remains an unpromoted inbox row,
+        // preserved for a later fresh wake. "first" was promoted before it parked.
+        let pending = db::get_pending_inputs(&pool, &sid).await.unwrap();
+        assert!(
+            pending.iter().any(|i| i.prompt == "second"),
+            "the aborted queue row is preserved unpromoted"
+        );
+        assert!(
+            !pending.iter().any(|i| i.prompt == "first"),
+            "the active turn's input was promoted before it parked"
+        );
         coord.shutdown(Duration::from_secs(5)).await;
     }
 }
