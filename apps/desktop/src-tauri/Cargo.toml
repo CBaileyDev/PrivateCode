@@ -32,6 +32,9 @@ thiserror = "1"
 private-code-providers = { path = "../../../crates/providers", features = ["testkit"] }
 tempfile = "3"
 async-trait = "0.1"
+# `test` exposes tauri::test::mock_app + MockRuntime so the command layer can be
+# driven headless (no webview) over a managed SessionCoordinator.
+tauri = { version = "2", features = ["test"] }
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
