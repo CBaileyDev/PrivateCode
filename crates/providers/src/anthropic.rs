@@ -442,6 +442,15 @@ impl ModelProvider for AnthropicProvider {
     }
 }
 
+/// The model's context window in tokens. Phase-1 stopgap (all current Claude
+/// families are 200K) keyed by family, until the model catalog supplies it.
+pub fn context_window(model_id: &str) -> u32 {
+    // All current Claude families (opus / sonnet / haiku) are 200K tokens.
+    // Keyed on the id for when the catalog introduces differing windows.
+    let _ = model_id;
+    200_000
+}
+
 /// Per-million-token prices `(input, output, cache_read, cache_write)` in USD.
 /// A Phase-1 stopgap until the model catalog (Phase 5) supplies pricing — keyed
 /// by model-family substring rather than assuming a single model's rates.

@@ -4,7 +4,7 @@ pub mod provider;
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
-pub use anthropic::AnthropicProvider;
+pub use anthropic::{AnthropicProvider, context_window};
 pub use provider::{ModelProvider, ProviderError, ProviderEvent, resolve_api_key};
 
 #[cfg(test)]

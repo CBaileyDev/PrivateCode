@@ -12,7 +12,7 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | C1 | Provider parser extraction + base_url DI + testkit | ✅ done |
 | C2 | SSE-byte replay harness + edit/patch property tests | ✅ done |
 | C3 | Phase-1 orchestrator correctness bugs | ✅ done |
-| C4 | Git-backed E2E turn + reconcile-arms + compaction impl | ⬜ pending |
+| C4 | Git-backed E2E turn + reconcile-arms + compaction impl | ✅ done |
 | C5 | Permission-park + tool.run cancellability (CRITICAL prereq) | ⬜ pending |
 | C6 | Daemon serve refactor (build_router/serve_daemon/DI) | ⬜ pending |
 | C7 | Daemon graceful shutdown + WS round-trip test | ⬜ pending |
@@ -27,6 +27,10 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | C16 | Perf instrumentation (--selftest + criterion + perf.yml) | ⬜ pending |
 
 Dependency order: C0 → C1 → {C2,C3,C4} → C5,C6 → {C7,C8,C9} → C10 → {C11,C12,C13} → {C14,C15} → C16
+
+## Carry-forward notes
+- **C12/C15 (frontend):** the new `compaction` message `type` needs render handling — the message store's `JSON.parse` fallback will otherwise show the raw `{compacted_through_seq,summary}` JSON. Render it as a "history compacted" divider (or hide it; the summary already reaches the model via the system prefix).
+- Compaction summary is a deterministic non-LLM stub (Phase 1); `auto=true` by default but only fires near the 200K window.
 
 ## Notes / caveats (honesty log)
 - Remote CI green is **pending the user's authed push + an actual Actions run** — I verify by running each job's exact commands locally where the tool is installed.

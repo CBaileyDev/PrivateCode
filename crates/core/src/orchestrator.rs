@@ -5,7 +5,7 @@ use crate::db::{self};
 use crate::permissions::{self, PermissionDecision, PermissionPrompt, PermissionRule};
 use private_code_protocol::event::{DeltaPayload, ProtocolEvent, UsageStats};
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role, ToolResultContent};
-use private_code_providers::provider::{ModelProvider, ProviderEvent};
+use private_code_providers::provider::{ModelProvider, ProviderError, ProviderEvent};
 use private_code_tools::tool::{ToolContext, ToolRegistry};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -41,6 +41,84 @@ enum PartialBlock {
         name: String,
         input: String,
     },
+}
+
+/// Durable boundary marker for a compaction. Stored as a `compaction`-type
+/// session_message; its `summary` is prepended as a System message and messages
+/// with `seq <= compacted_through_seq` are dropped from the provider request.
+/// The summary lives HERE (not in the epoch baseline) so the cached source
+/// baseline stays warm and a later source-driven baseline rebuild can't wipe it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompactionMarker {
+    compacted_through_seq: i64,
+    summary: String,
+}
+
+/// True if a provider 400 looks like a context-length overflow (so compaction
+/// might recover it). Distinct from the streaming `model_context_window_exceeded`
+/// finish_reason, which is a SUCCESSFUL (if truncated) turn and never compacts.
+fn is_context_overflow(message: &str) -> bool {
+    let m = message.to_ascii_lowercase();
+    m.contains("too long") || m.contains("context length") || m.contains("context window")
+}
+
+/// A clean turn boundary to cut at: a real user prompt (not a tool_result
+/// carrier), so every retained assistant tool_use keeps its following tool_result.
+fn is_clean_turn_start(m: &ChatMessage) -> bool {
+    m.role == Role::User
+        && !m
+            .content
+            .iter()
+            .any(|c| matches!(c, ContentBlock::ToolResult { .. }))
+}
+
+/// Flatten a content block to text for token estimation / summarization.
+fn block_text(block: &ContentBlock) -> String {
+    match block {
+        ContentBlock::Text { text } => text.clone(),
+        ContentBlock::Reasoning { reasoning, .. } => reasoning.clone(),
+        ContentBlock::ToolUse { input, .. } => input.to_string(),
+        ContentBlock::ToolResult { content, .. } => match content {
+            ToolResultContent::Text(t) => t.clone(),
+            ToolResultContent::Json(v) => v.to_string(),
+        },
+    }
+}
+
+/// Deterministic, non-LLM rolling summary (Phase-1 stopgap). Cumulative: keeps
+/// the prior summary verbatim and appends role-tagged snippets of the newly
+/// dropped messages, bounded in length.
+fn build_summary(prev: &str, dropped: &[&ChatMessage]) -> String {
+    let mut s = String::new();
+    if prev.is_empty() {
+        s.push_str("[Earlier conversation was auto-compacted to save context. Summary follows.]\n");
+    } else {
+        s.push_str(prev);
+        s.push('\n');
+    }
+    for m in dropped {
+        let role = match m.role {
+            Role::User => "User",
+            Role::Assistant => "Assistant",
+            Role::System => "System",
+        };
+        for b in &m.content {
+            let t = block_text(b);
+            if t.trim().is_empty() {
+                continue;
+            }
+            let snippet: String = t.chars().take(300).collect();
+            s.push_str(role);
+            s.push_str(": ");
+            s.push_str(snippet.trim());
+            s.push('\n');
+        }
+    }
+    if s.chars().count() > 6000 {
+        s = s.chars().take(6000).collect::<String>();
+        s.push_str("\n…(summary truncated)");
+    }
+    s
 }
 
 impl Orchestrator {
@@ -289,44 +367,102 @@ impl Orchestrator {
             }
             turn_count += 1;
 
-            // Fetch current messages
+            // Fetch current messages, applying any compaction boundary.
             let db_msgs = db::get_messages(&self.pool, session_id).await?;
-            let mut chat_msgs = Vec::new();
-            for m in db_msgs {
-                let cm: ChatMessage = serde_json::from_str(&m.data)?;
-                chat_msgs.push(cm);
-            }
+            let mut chat_msgs = Self::assemble_chat_messages(&db_msgs)?;
 
             // Expose schemas
             let tool_schemas = self.tool_registry.list_schemas();
 
-            // Run provider chat. The epoch baseline is the cached top-level system
-            // prompt; mid-conversation deltas live in `chat_msgs` as system messages.
-            let stream_res = self
-                .provider
-                .stream_chat(
-                    model_id,
-                    system_prompt.as_deref(),
-                    max_tokens,
-                    &chat_msgs,
-                    &tool_schemas,
-                )
-                .await;
+            // Proactive compaction: if the estimated request exceeds the context
+            // window (minus the output reservation + buffer), fold older turns into
+            // a summary once before streaming. Single-pass — the 400 retry below is
+            // the backstop if one clean cut still doesn't fit.
+            let mut compacted_this_turn = false;
+            if app_config.compaction.auto {
+                let estimate = self.estimate_tokens(model_id, &chat_msgs, system_prompt.as_deref());
+                let window = private_code_providers::context_window(model_id) as usize;
+                let budget = window
+                    .saturating_sub(max_tokens as usize)
+                    .saturating_sub(app_config.compaction.buffer_tokens as usize);
+                if estimate > budget
+                    && self
+                        .perform_compaction(
+                            session_id,
+                            model_id,
+                            app_config.compaction.keep_tokens as usize,
+                        )
+                        .await?
+                {
+                    compacted_this_turn = true;
+                    let db2 = db::get_messages(&self.pool, session_id).await?;
+                    chat_msgs = Self::assemble_chat_messages(&db2)?;
+                }
+            }
 
-            let mut stream = match stream_res {
-                Ok(s) => s,
-                Err(e) => {
-                    self.event_tx
-                        .send(ProtocolEvent::Error {
-                            session_id: session_id.to_string(),
-                            seq: 0,
-                            code: "provider_error".to_string(),
-                            message: e.to_string(),
-                            retryable: true,
-                        })
-                        .await
-                        .ok();
-                    return Err(e.into());
+            // Run provider chat with a single context-overflow retry. The epoch
+            // baseline is the cached top-level system prompt; mid-conversation
+            // deltas and the compaction summary live in `chat_msgs` as system messages.
+            let mut stream = loop {
+                match self
+                    .provider
+                    .stream_chat(
+                        model_id,
+                        system_prompt.as_deref(),
+                        max_tokens,
+                        &chat_msgs,
+                        &tool_schemas,
+                    )
+                    .await
+                {
+                    Ok(s) => break s,
+                    // Context-too-long 400: compact once and retry (if not already).
+                    Err(ProviderError::Api {
+                        status: 400,
+                        message,
+                    }) if is_context_overflow(&message) && !compacted_this_turn => {
+                        compacted_this_turn = true;
+                        if app_config.compaction.auto
+                            && self
+                                .perform_compaction(
+                                    session_id,
+                                    model_id,
+                                    app_config.compaction.keep_tokens as usize,
+                                )
+                                .await?
+                        {
+                            let db2 = db::get_messages(&self.pool, session_id).await?;
+                            chat_msgs = Self::assemble_chat_messages(&db2)?;
+                            continue;
+                        }
+                        self.event_tx
+                            .send(ProtocolEvent::Error {
+                                session_id: session_id.to_string(),
+                                seq: 0,
+                                code: "context_overflow".to_string(),
+                                message: message.clone(),
+                                retryable: false,
+                            })
+                            .await
+                            .ok();
+                        return Err(format!(
+                            "context overflow, compaction could not recover: {message}"
+                        )
+                        .into());
+                    }
+                    Err(e) => {
+                        self.event_tx
+                            .send(ProtocolEvent::Error {
+                                session_id: session_id.to_string(),
+                                seq: 0,
+                                code: "provider_error".to_string(),
+                                message: e.to_string(),
+                                retryable: true,
+                            })
+                            .await
+                            .ok();
+                        return Err(e.into());
+                    }
                 }
             };
 
@@ -868,6 +1004,134 @@ impl Orchestrator {
         }
 
         Ok(())
+    }
+
+    /// Build the provider-visible message list from durable rows, applying the
+    /// latest compaction boundary: prepend the summary as a System message and
+    /// drop messages at or before the compacted_through_seq (and the markers).
+    fn assemble_chat_messages(
+        db_msgs: &[db::MessageRow],
+    ) -> Result<Vec<ChatMessage>, serde_json::Error> {
+        let marker = db_msgs
+            .iter()
+            .filter(|m| m.type_ == "compaction")
+            .max_by_key(|m| m.seq);
+        let (boundary, summary) = match marker {
+            Some(m) => {
+                let cm: CompactionMarker = serde_json::from_str(&m.data)?;
+                (cm.compacted_through_seq, Some(cm.summary))
+            }
+            None => (-1, None),
+        };
+
+        let mut out = Vec::new();
+        if let Some(text) = summary {
+            out.push(ChatMessage {
+                id: "compaction-summary".to_string(),
+                role: Role::System,
+                content: vec![ContentBlock::Text { text }],
+                created_at: 0,
+            });
+        }
+        for m in db_msgs {
+            if m.type_ == "compaction" || m.seq <= boundary {
+                continue;
+            }
+            out.push(serde_json::from_str(&m.data)?);
+        }
+        Ok(out)
+    }
+
+    /// Coarse token estimate for a request: system prompt + every content block.
+    fn estimate_tokens(&self, model_id: &str, msgs: &[ChatMessage], system: Option<&str>) -> usize {
+        let mut total = system
+            .map(|s| self.provider.count_tokens(model_id, s))
+            .unwrap_or(0);
+        for m in msgs {
+            for b in &m.content {
+                total += self.provider.count_tokens(model_id, &block_text(b));
+            }
+        }
+        total
+    }
+
+    /// Fold the oldest live messages into a summary marker, cutting only at a
+    /// clean user turn-start within `keep_tokens`. Returns true if it compacted.
+    /// Durable rows are never deleted; the summary supersedes via the new marker.
+    async fn perform_compaction(
+        &self,
+        session_id: &str,
+        model_id: &str,
+        keep_tokens: usize,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let db_msgs = db::get_messages(&self.pool, session_id).await?;
+
+        // Prior boundary + summary (cumulative across repeated compactions).
+        let prev_marker = db_msgs
+            .iter()
+            .filter(|m| m.type_ == "compaction")
+            .max_by_key(|m| m.seq);
+        let (prev_boundary, prev_summary) = match prev_marker {
+            Some(m) => {
+                let cm: CompactionMarker = serde_json::from_str(&m.data)?;
+                (cm.compacted_through_seq, cm.summary)
+            }
+            None => (-1, String::new()),
+        };
+
+        // Live messages = post prev-boundary, excluding markers.
+        let mut live: Vec<(i64, ChatMessage)> = Vec::new();
+        for m in &db_msgs {
+            if m.type_ == "compaction" || m.seq <= prev_boundary {
+                continue;
+            }
+            live.push((m.seq, serde_json::from_str(&m.data)?));
+        }
+        if live.len() < 2 {
+            return Ok(false);
+        }
+
+        // Walk back from the end: keep the most-recent messages within keep_tokens,
+        // and cut at the OLDEST clean turn-start that still fits (index > 0 so the
+        // dropped set is non-empty).
+        let mut acc = 0usize;
+        let mut best_start: Option<usize> = None;
+        for i in (0..live.len()).rev() {
+            for b in &live[i].1.content {
+                acc += self.provider.count_tokens(model_id, &block_text(b));
+            }
+            if acc > keep_tokens {
+                break;
+            }
+            if i > 0 && is_clean_turn_start(&live[i].1) {
+                best_start = Some(i);
+            }
+        }
+        let start = match best_start {
+            Some(s) => s,
+            None => return Ok(false), // no safe cut (one turn, or a giant recent turn)
+        };
+
+        let boundary_new = live[start - 1].0;
+        let dropped: Vec<&ChatMessage> = live[..start].iter().map(|(_, m)| m).collect();
+        let summary = build_summary(&prev_summary, &dropped);
+
+        let mut tx = self.pool.begin().await?;
+        let seq = db::next_sequence(&mut tx, session_id).await?;
+        let marker_id = Uuid::new_v4().to_string();
+        let marker = CompactionMarker {
+            compacted_through_seq: boundary_new,
+            summary,
+        };
+        let data = serde_json::to_string(&marker)?;
+        db::append_message(&mut tx, &marker_id, session_id, seq, "compaction", &data).await?;
+        tx.commit().await?;
+
+        info!(
+            "Compacted session {}: folded {} message(s) through seq {} into a summary",
+            session_id, start, boundary_new
+        );
+        Ok(true)
     }
 
     async fn recover_interrupted_tools(&self, session_id: &str) -> Result<(), sqlx::Error> {

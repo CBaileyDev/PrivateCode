@@ -18,10 +18,34 @@ pub struct ModelConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CompactionConfig {
+    /// Proactively compact before a turn whose estimated tokens would exceed the
+    /// model's context window (minus the output reservation and buffer).
+    pub auto: bool,
+    /// Headroom kept free below the context window when deciding to compact.
+    pub buffer_tokens: u32,
+    /// Token budget for the most-recent messages retained after compaction
+    /// (older messages are folded into a summary).
+    pub keep_tokens: u32,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            buffer_tokens: 4_096,
+            keep_tokens: 120_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AppConfig {
     pub snapshots: bool,
     pub max_turns: usize,
     pub default_provider: ModelConfig,
+    #[serde(default)]
+    pub compaction: CompactionConfig,
 }
 
 impl Default for AppConfig {
@@ -34,6 +58,7 @@ impl Default for AppConfig {
                 model_id: DEFAULT_MODEL_ID.to_string(),
                 api_key: None,
             },
+            compaction: CompactionConfig::default(),
         }
     }
 }
