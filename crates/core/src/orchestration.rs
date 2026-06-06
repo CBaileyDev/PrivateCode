@@ -1,16 +1,16 @@
-//! Multi-model orchestration (Phase 4, Step 4.8): the configuration model and
-//! the parallel **fan-out** engine.
+//! Multi-model orchestration (Phase 4, Steps 4.8–4.11): the configuration model,
+//! the parallel **fan-out** engine, and the synthesis/single-stream helpers.
 //!
 //! A fan-out turn dispatches one shared request to N candidate models in
 //! parallel, streams each candidate's tokens to the client as **ephemeral**
 //! `Candidate*` events (see [`private_code_protocol::event::ProtocolEvent`] — they
 //! are excluded from `is_durable_event`, so they never enter the durable history
 //! buffer; only the synthesized answer persists), and returns each candidate's
-//! assembled text + usage + outcome. The synthesis pass that folds those
-//! candidates into the one durable answer, plus role-based routing and the live
-//! turn integration, land in C9 — this module deliberately stops at "produce the
-//! candidate outcomes", keeping `fan_out` provider-agnostic and unit-testable
-//! with scripted providers (no network, no live turn machinery).
+//! assembled text + usage + outcome. [`stream_single`] + [`build_synthesis_messages`]
+//! drive the synthesis pass and the role-based final stage. This module stays
+//! provider-agnostic and unit-testable with scripted providers (no DB, no network);
+//! the live turn integration that wires it in — resolving providers, persisting the
+//! one durable answer — lives in `orchestrator::run_orchestrated_turn` (C9).
 //!
 //! Design invariants (advisor-confirmed):
 //! - **Candidate events are ephemeral.** Only the synthesized `MessageCompleted`
@@ -51,9 +51,14 @@ pub enum OrchestrationMode {
     #[default]
     Single,
     /// N candidates in parallel, then a synthesizer folds them into one answer.
+    /// Accepts the documented kebab-case spelling `"fan-out"` as an alias for the
+    /// canonical snake_case `"fan_out"` (the config schema in the docs uses the
+    /// hyphenated form).
+    #[serde(alias = "fan-out")]
     FanOut,
-    /// Candidates selected by role (planner / coder / reviewer …). Routing logic
-    /// lands in C9; the config shape is validated here.
+    /// Candidates selected by role (planner / coder / reviewer …). Accepts the
+    /// kebab-case `"role-based"` as an alias for `"role_based"`.
+    #[serde(alias = "role-based")]
     RoleBased,
 }
 
@@ -61,6 +66,7 @@ pub enum OrchestrationMode {
 /// `model_config`). Model references are `"provider/model"` strings resolved
 /// against the coordinator's registered providers at turn time.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
 pub struct OrchestrationConfig {
     #[serde(default)]
     pub mode: OrchestrationMode,
@@ -129,6 +135,18 @@ impl OrchestrationConfig {
                         return Err(OrchestrationError::UnknownRole(r.clone()));
                     }
                 }
+                // A non-empty `role_order` must list EVERY role — otherwise
+                // `ordered_roles` would silently drop the omitted ones, running a
+                // shorter pipeline than configured with no diagnostic. (Validated
+                // both directions: role_order ⊆ roles above, roles ⊆ role_order
+                // here ⇒ a permutation.)
+                if !self.role_order.is_empty() {
+                    for k in self.roles.keys() {
+                        if !self.role_order.contains(k) {
+                            return Err(OrchestrationError::RoleOrderIncomplete(k.clone()));
+                        }
+                    }
+                }
                 if let Some(s) = &self.synthesizer {
                     ModelRef::parse(s)?;
                 }
@@ -184,6 +202,8 @@ pub enum OrchestrationError {
     NoRoles,
     #[error("role_order references role '{0}' that is not in roles")]
     UnknownRole(String),
+    #[error("role_order is set but omits role '{0}' (it must list every role)")]
+    RoleOrderIncomplete(String),
 }
 
 /// A fan-out candidate with its provider already resolved. The caller (the
@@ -625,6 +645,54 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(no_roles.validate(), Err(OrchestrationError::NoRoles));
+    }
+
+    /// Serde: the documented kebab-case mode works via alias; the canonical
+    /// snake_case works; an unknown variant is a HARD error (not silently
+    /// defaulted); and a typo'd field name is rejected (deny_unknown_fields) so it
+    /// can't silently no-op. These guard the C11 "malformed config silently
+    /// degrades to single-model" finding at the deserialization layer.
+    #[test]
+    fn mode_accepts_kebab_alias_and_rejects_unknown_variant_or_field() {
+        let kebab: OrchestrationConfig =
+            serde_json::from_str(r#"{"mode":"fan-out","candidates":["a/b","c/d"]}"#).unwrap();
+        assert_eq!(kebab.mode, OrchestrationMode::FanOut);
+
+        let snake: OrchestrationConfig = serde_json::from_str(r#"{"mode":"role_based"}"#).unwrap();
+        assert_eq!(snake.mode, OrchestrationMode::RoleBased);
+        let kebab2: OrchestrationConfig = serde_json::from_str(r#"{"mode":"role-based"}"#).unwrap();
+        assert_eq!(kebab2.mode, OrchestrationMode::RoleBased);
+
+        // Unknown variant string → deserialization error (caller surfaces it).
+        assert!(serde_json::from_str::<OrchestrationConfig>(r#"{"mode":"fanout"}"#).is_err());
+        // Typo'd field name → rejected, not silently ignored.
+        assert!(
+            serde_json::from_str::<OrchestrationConfig>(
+                r#"{"mode":"fan_out","candidates":["a/b","c/d"],"synthezizer":"a/b"}"#
+            )
+            .is_err()
+        );
+    }
+
+    /// A non-empty `role_order` must list EVERY role; omitting one is rejected so a
+    /// stage can't be silently dropped from the pipeline.
+    #[test]
+    fn role_order_must_list_every_role() {
+        let mut roles = BTreeMap::new();
+        roles.insert("architect".to_string(), "p/a".to_string());
+        roles.insert("implementer".to_string(), "p/i".to_string());
+        let cfg = OrchestrationConfig {
+            mode: OrchestrationMode::RoleBased,
+            roles,
+            role_order: vec!["architect".into()], // omits implementer
+            ..Default::default()
+        };
+        assert_eq!(
+            cfg.validate(),
+            Err(OrchestrationError::RoleOrderIncomplete(
+                "implementer".into()
+            ))
+        );
     }
 
     #[test]

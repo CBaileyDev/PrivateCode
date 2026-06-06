@@ -493,10 +493,33 @@ impl Orchestrator {
         // into a non-Single mode, this turn fans out (or runs a role pipeline) and
         // synthesizes ONE durable assistant message instead of the normal tool
         // loop. The whole fan-out+synthesis runs as this single drain activity.
-        let orch_config: orchestration::OrchestrationConfig = model_val
-            .get("orchestration")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or_default();
+        //
+        // A PRESENT-but-malformed `orchestration` block is a loud, non-retryable
+        // error — NOT silently swallowed to a single-model turn. (A prior `.ok()`
+        // here demoted a typo'd multi-model config — e.g. an unknown `mode` string
+        // or wrong field type — to an ordinary single-model turn with no
+        // diagnostic, the strictly-worse outcome for the strictly-more-broken
+        // input vs. the validate() path below.) Absent → default Single.
+        let orch_config: orchestration::OrchestrationConfig = match model_val.get("orchestration") {
+            None => orchestration::OrchestrationConfig::default(),
+            Some(v) => match serde_json::from_value(v.clone()) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    let seq = self.next_event_seq(session_id).await;
+                    self.event_tx
+                        .send(ProtocolEvent::Error {
+                            session_id: session_id.to_string(),
+                            seq,
+                            code: "orchestration_config_invalid".to_string(),
+                            message: format!("could not parse orchestration config: {e}"),
+                            retryable: false,
+                        })
+                        .await
+                        .ok();
+                    return Err(format!("invalid orchestration config: {e}").into());
+                }
+            },
+        };
         if orch_config.mode != OrchestrationMode::Single {
             if let Err(e) = orch_config.validate() {
                 let seq = self.next_event_seq(session_id).await;

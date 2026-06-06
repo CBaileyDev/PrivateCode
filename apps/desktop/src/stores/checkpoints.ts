@@ -9,6 +9,7 @@
  * and the tree hash truncated for a compact commit-hash-style label.
  */
 import { createStore } from "solid-js/store";
+import { getDisplayedSession } from "./messages";
 
 export interface CheckpointInfo {
   id: string;
@@ -45,18 +46,22 @@ function shapeCheckpoints(rows: CheckpointInfo[]): CheckpointInfo[] {
     .sort((a, b) => b.created_at - a.created_at);
 }
 
-/** Fetch and shape the checkpoint history for a session. */
+/** Fetch and shape the checkpoint history for a session. The store write is
+ * gated on `sessionId` still being the displayed session, so an out-of-order
+ * late resolve (e.g. a slow checkpoint_created-triggered load for session A
+ * resolving after the user switched to B) can't render A's history under B. */
 async function loadCheckpoints(sessionId: string) {
   setCheckpointStore("loading", true);
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const rows = (await invoke("list_checkpoints", { sessionId })) as CheckpointInfo[];
+    if (sessionId !== getDisplayedSession()) return; // superseded by a session switch
     setCheckpointStore("checkpoints", shapeCheckpoints(rows));
   } catch (e) {
     console.error("Failed to load checkpoints:", e);
-    setCheckpointStore("checkpoints", []);
+    if (sessionId === getDisplayedSession()) setCheckpointStore("checkpoints", []);
   } finally {
-    setCheckpointStore("loading", false);
+    if (sessionId === getDisplayedSession()) setCheckpointStore("loading", false);
   }
 }
 

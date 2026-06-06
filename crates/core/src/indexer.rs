@@ -33,8 +33,13 @@ pub async fn index_workspace(pool: &SqlitePool, root: &Path) -> Result<usize, sq
         if syms.is_empty() {
             continue; // unsupported language or no top-level symbols
         }
-        symbols::index_file(pool, &rel_str, &syms).await?;
-        indexed += 1;
+        // Best-effort persistence: a per-file DB error (e.g. a transient
+        // SQLITE_BUSY) must NOT abort indexing of every remaining file — log and
+        // skip, matching the read/parse skip-and-continue above.
+        match symbols::index_file(pool, &rel_str, &syms).await {
+            Ok(()) => indexed += 1,
+            Err(e) => tracing::warn!("index_workspace: failed to persist {rel_str}: {e}"),
+        }
     }
     Ok(indexed)
 }
@@ -77,8 +82,12 @@ pub async fn index_workspace_background(
 
     let mut indexed = 0usize;
     while let Some((rel, syms)) = rx.recv().await {
-        symbols::index_file(pool, &rel, &syms).await?;
-        indexed += 1;
+        // Best-effort (see index_workspace): a per-file persistence error skips
+        // that file rather than aborting the whole background index.
+        match symbols::index_file(pool, &rel, &syms).await {
+            Ok(()) => indexed += 1,
+            Err(e) => tracing::warn!("index_workspace_background: failed to persist {rel}: {e}"),
+        }
     }
     let _ = producer.await;
     Ok(indexed)

@@ -30,8 +30,19 @@ function statusLabel(p: CandidatePane): string {
 }
 
 export default function ComparisonView() {
+  // True when the keystroke is destined for a text field (the composer, an input,
+  // or any contenteditable). The global listener must NOT hijack arrow keys or
+  // clobber the clipboard while the user is typing — only act on navigation keys
+  // when focus is outside an editable element.
+  function isEditableTarget(e: KeyboardEvent): boolean {
+    const t = e.target as HTMLElement | null;
+    if (!t) return false;
+    return t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable;
+  }
+
   function onKey(e: KeyboardEvent) {
     if (candidateStore.panes.length === 0) return;
+    if (isEditableTarget(e)) return; // don't steal keystrokes from the composer
     if (e.key === "ArrowRight") {
       e.preventDefault();
       selectNext();

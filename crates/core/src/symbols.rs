@@ -67,6 +67,28 @@ pub async fn remove_file(pool: &SqlitePool, filepath: &str) -> Result<(), sqlx::
     Ok(())
 }
 
+/// Remove the symbols for `path` AND every symbol stored UNDER it as a directory
+/// prefix (`path/...`). A directory rename or delete delivers only the directory
+/// path (its children's inodes are untouched, so no per-file events fire), and
+/// symbols are keyed by child FILE path — so an exact-match delete would orphan
+/// every child symbol. The `LIKE` uses an explicit ESCAPE so a path containing
+/// `%`/`_`/`\` matches literally. For a plain file this degrades to the exact
+/// delete (the `path/%` branch matches nothing).
+pub async fn remove_under(pool: &SqlitePool, path: &str) -> Result<(), sqlx::Error> {
+    let prefix = format!(
+        "{}/%",
+        path.replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_")
+    );
+    sqlx::query("DELETE FROM symbols WHERE filepath = ?1 OR filepath LIKE ?2 ESCAPE '\\'")
+        .bind(path)
+        .bind(prefix)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Full-text symbol search via FTS5 `MATCH`, bm25-ranked (best first), capped to
 /// `limit`. The raw `query` is sanitized into a safe prefix query (see
 /// [`fts5_prefix_query`]) so caller/model input can't inject FTS5 operators or
@@ -227,6 +249,29 @@ pub fn unrelated_helper() {}
                 .unwrap()
                 .iter()
                 .any(|h| h.name == "load")
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_under_purges_directory_subtree_but_spares_siblings() {
+        let pool = fresh_pool().await;
+        for (path, src) in [
+            ("src/old/a.rs", "pub fn alpha() {}"),
+            ("src/old/nested/b.rs", "pub fn beta() {}"),
+            ("src/older/c.rs", "pub fn gamma() {}"), // sibling sharing a prefix
+        ] {
+            let syms = SymbolExtractor::new().extract(path, src);
+            index_file(&pool, path, &syms).await.unwrap();
+        }
+
+        // Removing the "src/old" directory purges its (nested) children …
+        remove_under(&pool, "src/old").await.unwrap();
+        assert!(search_symbols(&pool, "alpha", 10).await.unwrap().is_empty());
+        assert!(search_symbols(&pool, "beta", 10).await.unwrap().is_empty());
+        // … but must NOT touch the prefix-sharing sibling directory "src/older".
+        assert!(
+            !search_symbols(&pool, "gamma", 10).await.unwrap().is_empty(),
+            "remove_under('src/old') must not delete 'src/older' (prefix boundary)"
         );
     }
 

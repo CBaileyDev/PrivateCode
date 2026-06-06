@@ -12,10 +12,25 @@ use notify_debouncer_full::notify::{RecommendedWatcher, RecursiveMode};
 use notify_debouncer_full::{
     DebounceEventResult, Debouncer, RecommendedCache, new_debouncer, notify,
 };
-use private_code_codeintel::SymbolExtractor;
+use private_code_codeintel::{EntryType, SymbolExtractor, WalkOptions, walk};
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+
+/// Compute a changed path's index key (relative to the workspace root, forward
+/// slashes). Canonicalizing the root defeats the macOS `/var → /private/var`
+/// symlink trap: FSEvents delivers symlink-RESOLVED paths, so stripping the raw
+/// (unresolved) root would fail and leave an absolute, machine-specific key that
+/// fragments the index. Try the canonical root first (matches resolved paths),
+/// then the raw root (matches as-watched paths on Linux/inotify); only fall back
+/// to the absolute path if neither prefixes it.
+fn rel_key(canonical_root: &Path, root: &Path, path: &Path) -> String {
+    path.strip_prefix(canonical_root)
+        .or_else(|_| path.strip_prefix(root))
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
 
 /// Debounce window: coalesces a burst of saves into one re-index.
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
@@ -26,22 +41,57 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(200);
 /// per-file unit the watcher drives — deterministic and unit-testable without any
 /// filesystem-event timing.
 pub async fn reindex_path(pool: &SqlitePool, root: &Path, path: &Path) -> Result<(), sqlx::Error> {
-    let rel = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
+    let canonical_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let rel = rel_key(&canonical_root, root, path);
+
+    // A created / renamed-IN directory arrives as a single directory event — its
+    // child files get no per-file events — so walk it and (re)index each file.
+    if path.is_dir() {
+        return reindex_dir(pool, &canonical_root, root, path).await;
+    }
+
     match std::fs::read_to_string(path) {
         Ok(source) => {
             let syms = SymbolExtractor::new().extract(&rel, &source);
             if syms.is_empty() {
-                symbols::remove_file(pool, &rel).await?;
+                symbols::remove_under(pool, &rel).await?;
             } else {
                 symbols::index_file(pool, &rel, &syms).await?;
             }
         }
         Err(_) => {
-            symbols::remove_file(pool, &rel).await?;
+            // The path is gone: a deleted file OR a removed/renamed-AWAY directory
+            // (indistinguishable now that it no longer exists). `remove_under`
+            // purges both the exact entry and everything stored under it as a
+            // directory prefix — an exact-only delete would orphan a renamed
+            // directory's child symbols (their inodes move untouched, firing no
+            // per-file delete events).
+            symbols::remove_under(pool, &rel).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Walk a (newly-created or renamed-in) directory and index every supported file
+/// under it, keyed relative to the workspace root. Best-effort per file.
+async fn reindex_dir(
+    pool: &SqlitePool,
+    canonical_root: &Path,
+    root: &Path,
+    dir: &Path,
+) -> Result<(), sqlx::Error> {
+    let extractor = SymbolExtractor::new();
+    for entry in walk(dir, &WalkOptions::default()) {
+        if entry.file_type != EntryType::File {
+            continue;
+        }
+        let rel = rel_key(canonical_root, root, &entry.path);
+        let Ok(source) = std::fs::read_to_string(&entry.path) else {
+            continue;
+        };
+        let syms = extractor.extract(&rel, &source);
+        if !syms.is_empty() {
+            symbols::index_file(pool, &rel, &syms).await?;
         }
     }
     Ok(())
@@ -132,6 +182,53 @@ mod tests {
         fs::remove_file(&file).unwrap();
         reindex_path(&pool, root, &file).await.unwrap();
         assert!(search_symbols(&pool, "beta", 10).await.unwrap().is_empty());
+    }
+
+    /// A directory rename/delete delivers only the directory path (no per-file
+    /// events). reindex_path on a now-gone directory must purge ALL symbols stored
+    /// under it, not just an exact (never-matching) directory-path row.
+    #[tokio::test]
+    async fn reindex_path_purges_children_when_a_directory_is_removed() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join("pkg");
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.rs");
+        fs::write(&file, "pub fn alpha() {}").unwrap();
+        let pool = fresh_pool().await;
+
+        reindex_path(&pool, root, &file).await.unwrap();
+        assert!(!search_symbols(&pool, "alpha", 10).await.unwrap().is_empty());
+
+        // Remove the whole directory, then deliver only the DIRECTORY path (what a
+        // rename/delete event carries).
+        fs::remove_dir_all(&dir).unwrap();
+        reindex_path(&pool, root, &dir).await.unwrap();
+        assert!(
+            search_symbols(&pool, "alpha", 10).await.unwrap().is_empty(),
+            "a removed directory must purge its child-file symbols"
+        );
+    }
+
+    /// A created / renamed-IN directory (its children fire no per-file events) is
+    /// walked and its files indexed, keyed relative to the workspace root.
+    #[tokio::test]
+    async fn reindex_path_indexes_children_of_a_new_directory() {
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        let dir = root.join("pkg/sub");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("b.rs"), "pub struct Widget {}").unwrap();
+        let pool = fresh_pool().await;
+
+        // Deliver the directory path (not the file): the walk must find b.rs.
+        reindex_path(&pool, root, &root.join("pkg")).await.unwrap();
+        let hits = search_symbols(&pool, "Widget", 10).await.unwrap();
+        let hit = hits.iter().find(|h| h.name == "Widget").unwrap();
+        assert_eq!(
+            hit.filepath, "pkg/sub/b.rs",
+            "a newly-created directory's files are indexed at workspace-relative paths"
+        );
     }
 
     /// End-to-end watcher: a real file write, debounced, lands in the index.

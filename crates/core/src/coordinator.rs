@@ -2816,4 +2816,115 @@ mod tests {
 
         coord.shutdown(Duration::from_secs(5)).await;
     }
+
+    /// A PRESENT-but-malformed `orchestration` block (here an unknown `mode`
+    /// variant) must surface a durable `orchestration_config_invalid` Error and
+    /// persist NO assistant message — never silently demote to a single-model turn
+    /// (the C11 review's user-reachable finding).
+    #[tokio::test]
+    async fn malformed_orchestration_config_errors_not_silently_single_model() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        // `"mode":"fanout"` is not a valid variant (canonical is "fan_out" /
+        // alias "fan-out") → deserialization fails → loud Error.
+        let sid = create_orch_session(&pool, serde_json::json!({ "mode": "fanout" })).await;
+
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        let mut rx = coord.get_or_create_session(&sid).await.unwrap();
+        coord.run_turn(&sid, "hi", "steer").await.unwrap();
+
+        let done = wait_for_completed_or_error(&mut rx).await;
+        match done {
+            Some(ProtocolEvent::Error { code, .. }) => {
+                assert_eq!(code, "orchestration_config_invalid");
+            }
+            other => panic!("expected an orchestration_config_invalid Error, got {other:?}"),
+        }
+
+        let assistants = db::get_messages(&pool, &sid)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .filter(|m| m.role == Role::Assistant)
+            .count();
+        assert_eq!(
+            assistants, 0,
+            "a malformed config must not produce any assistant answer"
+        );
+
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// Aborting a fan-out turn mid-flight settles the drain cleanly and persists
+    /// nothing — the orchestrated branch honors the turn's CancellationToken end to
+    /// end (fan_out → run_fan_out's cancel check), closing the C9 residual that the
+    /// abort path had only unit (not live) coverage.
+    #[tokio::test]
+    async fn abort_during_fan_out_settles_and_persists_nothing() {
+        use private_code_providers::testkit::PendingProvider;
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let sid = create_orch_session(
+            &pool,
+            serde_json::json!({
+                "mode": "fan_out",
+                "candidates": ["c0/m0", "c1/m1"],
+                "synthesizer": "synth/ms",
+            }),
+        )
+        .await;
+
+        let mut coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        // Both candidates never resolve, so the turn is parked inside fan_out until
+        // the abort fires.
+        coord.register_provider("c0", Arc::new(PendingProvider));
+        coord.register_provider("c1", Arc::new(PendingProvider));
+        coord.register_provider("synth", Arc::new(OneShotTextProvider));
+
+        coord.get_or_create_session(&sid).await.unwrap();
+        coord.run_turn(&sid, "go", "steer").await.unwrap();
+        // Let the drain reach the parked fan-out.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        coord.abort_turn(&sid).await.unwrap();
+
+        // The drain must settle (active_turn_cancel cleared) promptly.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let map = coord.sessions.lock().await;
+                if let Some(sess) = map.get(&sid)
+                    && sess.active_turn_cancel.is_none()
+                {
+                    break;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "aborted fan-out turn must settle the drain"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let assistants = db::get_messages(&pool, &sid)
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .filter(|m| m.role == Role::Assistant)
+            .count();
+        assert_eq!(assistants, 0, "an aborted fan-out persists no answer");
+
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
 }

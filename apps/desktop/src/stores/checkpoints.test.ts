@@ -9,6 +9,7 @@ import {
   shortHash,
   type CheckpointInfo,
 } from "./checkpoints";
+import { setDisplayedSession } from "./messages";
 
 const mk = (id: string, tool: string, hash: string, at: number): CheckpointInfo => ({
   id,
@@ -19,7 +20,10 @@ const mk = (id: string, tool: string, hash: string, at: number): CheckpointInfo 
   created_at: at,
 });
 
-beforeEach(() => clearCheckpoints());
+beforeEach(() => {
+  clearCheckpoints();
+  setDisplayedSession(null);
+});
 afterEach(() => clearMocks());
 
 describe("checkpoint shaping (pure)", () => {
@@ -41,6 +45,7 @@ describe("checkpoint shaping (pure)", () => {
 
 describe("loadCheckpoints (IPC)", () => {
   it("fetches, shapes, and stores the timeline", async () => {
+    setDisplayedSession("A");
     mockIPC((cmd) => {
       if (cmd === "list_checkpoints") {
         return [
@@ -58,11 +63,23 @@ describe("loadCheckpoints (IPC)", () => {
   });
 
   it("clears to empty on an IPC error", async () => {
+    setDisplayedSession("A");
     mockIPC(() => {
       throw new Error("boom");
     });
     await loadCheckpoints("A");
     expect(checkpointStore.checkpoints).toEqual([]);
     expect(checkpointStore.loading).toBe(false);
+  });
+
+  it("ignores a late load whose session is no longer displayed (out-of-order guard)", async () => {
+    // The user is now on session B; a stale load for A resolves afterward.
+    setDisplayedSession("B");
+    mockIPC((cmd) => {
+      if (cmd === "list_checkpoints") return [mk("1", "turn", "aaaabbbb", 10)];
+      return null;
+    });
+    await loadCheckpoints("A");
+    expect(checkpointStore.checkpoints).toEqual([]); // A's rows must NOT render under B
   });
 });

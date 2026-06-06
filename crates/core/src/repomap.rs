@@ -49,14 +49,20 @@ pub fn render(symbols: &[Symbol], token_budget: usize) -> String {
     let mut omitted = 0usize;
 
     for (path, syms) in &groups {
-        let block = render_file_block(path, syms);
-        let block_tokens = est_tokens(&block);
-        if used_tokens + block_tokens > token_budget && !out.is_empty() {
+        let remaining = token_budget.saturating_sub(used_tokens);
+        // A file needs at least its header plus one symbol line to be worth
+        // emitting; if the remaining budget can't cover the header, omit the file
+        // entirely. This (unlike the prior `!out.is_empty()` exemption) means even
+        // the FIRST, richest file is bounded — a single huge file can no longer
+        // blow the budget by orders of magnitude.
+        let header_tokens = est_tokens(&format!("{path}\n"));
+        if remaining <= header_tokens {
             omitted += 1;
             continue;
         }
+        let block = render_file_block(path, syms, remaining);
+        used_tokens += est_tokens(&block);
         out.push_str(&block);
-        used_tokens += block_tokens;
     }
 
     if omitted > 0 {
@@ -65,18 +71,31 @@ pub fn render(symbols: &[Symbol], token_budget: usize) -> String {
     out
 }
 
-fn render_file_block(path: &str, syms: &[&Symbol]) -> String {
+/// Render one file's block, bounded to `max_tokens`: emit the header then as many
+/// symbol lines as fit, replacing the overflow tail with a per-file "… N more
+/// symbol(s) omitted" marker. Bounding INTRA-block (not just whole-block) is what
+/// stops a single large file from overflowing the budget.
+fn render_file_block(path: &str, syms: &[&Symbol], max_tokens: usize) -> String {
     let mut block = format!("{path}\n");
-    for s in syms {
+    let mut omitted_in_file = 0usize;
+    for (i, s) in syms.iter().enumerate() {
         // Top-level items at 2 spaces; members (with a parent scope) at 4.
         let indent = if s.parent_scope.is_some() {
             "    "
         } else {
             "  "
         };
-        block.push_str(indent);
-        block.push_str(&compact_signature(s));
-        block.push('\n');
+        let line = format!("{indent}{}\n", compact_signature(s));
+        if est_tokens(&block) + est_tokens(&line) > max_tokens {
+            omitted_in_file = syms.len() - i;
+            break;
+        }
+        block.push_str(&line);
+    }
+    if omitted_in_file > 0 {
+        block.push_str(&format!(
+            "  … ({omitted_in_file} more symbol(s) omitted for budget)\n"
+        ));
     }
     block
 }
@@ -207,6 +226,36 @@ mod tests {
         assert!(
             files_rendered <= 2,
             "budget should cap rendered files, got {files_rendered}"
+        );
+    }
+
+    /// A SINGLE large file must not overflow the budget: intra-block truncation
+    /// keeps even the first (richest) file's block bounded, with a per-file
+    /// "symbol(s) omitted" marker. (Regression for the C11 finding where the first
+    /// block was emitted in full, blowing the cap ~50-80x.)
+    #[test]
+    fn single_large_file_does_not_overflow_the_budget() {
+        let mut syms = Vec::new();
+        for i in 0..400 {
+            syms.push(sym(
+                "src/huge.rs",
+                &format!("symbol_number_{i}"),
+                "function",
+                i as u32 + 1,
+                &format!("fn symbol_number_{i}(arg: SomeReasonablyLongType) -> Result<(), Error>"),
+                None,
+            ));
+        }
+        let budget = 100;
+        let map = render(&syms, budget);
+        let used = map.len().div_ceil(4);
+        assert!(
+            used <= budget * 2,
+            "a single large file must stay near the budget, used ~{used} tokens for budget {budget}"
+        );
+        assert!(
+            map.contains("more symbol(s) omitted"),
+            "the overflow tail must be summarized, got:\n{map}"
         );
     }
 

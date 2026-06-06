@@ -56,6 +56,11 @@ let displayedSessionId: string | null = null;
 function setDisplayedSession(id: string | null) {
   displayedSessionId = id;
 }
+/** The session currently displayed. Other stores gate their late-resolving
+ * writes on this (e.g. checkpoints), matching loadMessages' own guard. */
+function getDisplayedSession(): string | null {
+  return displayedSessionId;
+}
 
 /** Load messages from the backend for a given session. */
 async function loadMessages(sessionId: string) {
@@ -262,4 +267,5 @@ export {
   clearMessages,
   resetStreaming,
   setDisplayedSession,
+  getDisplayedSession,
 };

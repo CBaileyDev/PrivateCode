@@ -124,10 +124,12 @@ async function setActiveSession(session: SessionInfo) {
   persistActiveSessionId(session.id);
   const mySeq = ++subscriptionSeq;
   // Clear the previous conversation immediately so the user never sees stale
-  // content during the load below. The candidate-comparison panes are per-turn
-  // and per-session, so drop them on a switch too.
+  // content during the load below. The candidate-comparison panes and the
+  // checkpoint timeline are per-session, so drop them on a switch too (otherwise
+  // the prior session's rows linger until the new load resolves).
   clearMessages();
   clearCandidates();
+  clearCheckpoints();
 
   // Load the existing conversation from the DB (the source of truth) before we
   // start streaming live events. This is what makes switching/attaching show
