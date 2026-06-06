@@ -125,12 +125,26 @@ pub async fn start_daemon_with(
     // NEVER log the token value — daemon logs are not a secret store (security.md T4).
     let token = auth::get_or_create_token(&global_data_dir)?;
     let coordinator = Arc::new(SessionCoordinator::new(
-        pool,
+        pool.clone(),
         global_data_dir,
         provider,
         tool_registry,
     ));
-    serve_daemon(coordinator, token, listener, shutdown).await
+    // Map the (non-Send) Box<dyn Error> to a String immediately so this future
+    // stays Send while we hold the result across the drain awaits below.
+    let serve_result = serve_daemon(coordinator.clone(), token, listener, shutdown)
+        .await
+        .map_err(|e| e.to_string());
+
+    // axum has stopped accepting and let in-flight HTTP/WS finish. Now drain the
+    // coordinator's in-flight turns + router tasks under a bounded timeout, then
+    // close the pool so the SQLite WAL is checkpointed cleanly.
+    coordinator
+        .shutdown(std::time::Duration::from_secs(10))
+        .await;
+    pool.close().await;
+
+    serve_result.map_err(|e| e.into())
 }
 
 /// The real daemon entrypoint: register the production tools + Anthropic

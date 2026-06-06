@@ -5,8 +5,10 @@ use private_code_protocol::event::{ProtocolEvent, UsageStats};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 pub struct ActiveSession {
     pub session_id: String,
@@ -24,6 +26,9 @@ pub struct SessionCoordinator {
     pub global_data_dir: PathBuf,
     pub provider: Arc<dyn private_code_providers::ModelProvider>,
     pub tool_registry: Arc<private_code_tools::ToolRegistry>,
+    /// Tracks every spawned task (event/permission routers + turn drains) so a
+    /// graceful shutdown can wait for them to finish under a bounded timeout.
+    pub tracker: TaskTracker,
 }
 
 fn is_durable_event(event: &ProtocolEvent) -> bool {
@@ -57,7 +62,32 @@ impl SessionCoordinator {
             global_data_dir,
             provider,
             tool_registry,
+            tracker: TaskTracker::new(),
         }
+    }
+
+    /// Graceful drain: cancel every in-flight turn (now interruptible even when
+    /// parked on a permission, per C5), drop the live sessions so the router
+    /// tasks' channels close, then wait for all tracked tasks under `timeout`.
+    /// Tasks are abort-safe (a partial assistant message is already persisted),
+    /// so exceeding the timeout is acceptable — we proceed regardless.
+    pub async fn shutdown(&self, timeout: Duration) {
+        {
+            let mut sessions = self.sessions.lock().await;
+            for (_id, sess) in sessions.iter_mut() {
+                if let Some(cancel) = sess.active_turn_cancel.take() {
+                    cancel.cancel();
+                }
+                // Drop any parked permission oneshot so a waiting turn unblocks.
+                sess.pending_permission = None;
+            }
+            // Drop the ActiveSessions: their orchestrator/event senders close once
+            // the in-flight turn tasks (which also hold an Arc) finish, ending the
+            // router tasks' recv loops.
+            sessions.clear();
+        }
+        self.tracker.close();
+        let _ = tokio::time::timeout(timeout, self.tracker.wait()).await;
     }
 
     pub async fn get_or_create_session(
@@ -113,7 +143,7 @@ impl SessionCoordinator {
         let session_id_str = session_id.to_string();
         let sessions_clone = self.sessions.clone();
         let b_tx_clone = b_tx.clone();
-        tokio::spawn(async move {
+        self.tracker.spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 let mut s_map = sessions_clone.lock().await;
                 if let Some(sess) = s_map.get_mut(&session_id_str) {
@@ -143,7 +173,7 @@ impl SessionCoordinator {
         // Spawn permission routing task
         let session_id_str2 = session_id.to_string();
         let sessions_clone2 = self.sessions.clone();
-        tokio::spawn(async move {
+        self.tracker.spawn(async move {
             while let Some((prompt, resp_tx)) = permission_prompt_rx.recv().await {
                 let mut s_map = sessions_clone2.lock().await;
                 if let Some(sess) = s_map.get_mut(&session_id_str2) {
@@ -196,7 +226,7 @@ impl SessionCoordinator {
             }
         };
 
-        tokio::spawn(async move {
+        self.tracker.spawn(async move {
             if let Err(e) = orchestrator
                 .run_session_turn(&s_id, &input_id, cancel_token)
                 .await
@@ -374,6 +404,101 @@ mod tests {
             hist.iter()
                 .any(|e| matches!(e, ProtocolEvent::MessageCompleted { .. })),
             "get_history must replay the durable MessageCompleted"
+        );
+    }
+
+    /// A tool whose permission_class ("write_file") maps to Ask under the build
+    /// agent, parking the turn on the permission prompt.
+    struct AskTool;
+
+    #[async_trait::async_trait]
+    impl private_code_tools::Tool for AskTool {
+        fn name(&self) -> &str {
+            "write_file"
+        }
+        fn description(&self) -> &str {
+            "ask"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"name":"write_file","input_schema":{"type":"object"}})
+        }
+        fn mutates(&self) -> bool {
+            false
+        }
+        fn permission_class(&self) -> &str {
+            "write_file"
+        }
+        async fn run(
+            &self,
+            _ctx: &mut private_code_tools::ToolContext<'_>,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, private_code_tools::ToolError> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    /// Graceful shutdown must drain a turn that is PARKED on a permission prompt
+    /// (no reply ever arrives): cancelling it via shutdown unblocks the permission
+    /// wait (C5), so tracker.wait() completes well before the timeout.
+    #[tokio::test]
+    async fn shutdown_drains_a_permission_parked_turn() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        // Provider emits a write_file tool call (-> Ask), parking the turn.
+        let provider = Arc::new(private_code_providers::testkit::ScriptedProvider::new(
+            vec![vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                },
+                ProviderEvent::ToolUseComplete {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({}),
+                },
+                ProviderEvent::MessageStop {
+                    usage: UsageStats::default(),
+                    finish_reason: Some("tool_use".into()),
+                },
+            ]],
+        ));
+        let mut reg = private_code_tools::ToolRegistry::new();
+        reg.register(Box::new(AskTool));
+
+        let coord = SessionCoordinator::new(pool, std::env::temp_dir(), provider, Arc::new(reg));
+        coord.run_turn(&session_id, "hi", "steer").await.unwrap();
+
+        // Let the turn reach the (unanswered) permission wait.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let start = tokio::time::Instant::now();
+        coord.shutdown(Duration::from_secs(10)).await;
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "shutdown must drain a permission-parked turn promptly (took {:?})",
+            start.elapsed()
         );
     }
 }
