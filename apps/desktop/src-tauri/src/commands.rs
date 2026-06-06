@@ -1,14 +1,15 @@
 //! Tauri command handlers — the bridge between the Solid.js frontend and the
 //! in-process Private Code engine. Each `#[tauri::command]` is a typed RPC
 //! callable from JavaScript via `invoke("command_name", { ...args })`.
+//!
+//! Every command is a thin wrapper over the shared [`SessionCoordinator`]; the
+//! desktop owns no bespoke session state machine (see `state.rs`).
 
-use crate::state::EngineState;
-use private_code_core::db;
-use private_code_core::permissions::PermissionReply;
+use private_code_core::coordinator::{event_seq, should_forward, SessionCoordinator};
+use private_code_core::db::{self, SessionRow};
 use private_code_protocol::event::ProtocolEvent;
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, State};
-use tokio_util::sync::CancellationToken;
 
 // ─── Serializable response types ───────────────────────────────────────────
 
@@ -37,6 +38,26 @@ pub struct SessionInfo {
     pub updated_at: i64,
 }
 
+impl From<SessionRow> for SessionInfo {
+    fn from(r: SessionRow) -> Self {
+        SessionInfo {
+            id: r.id,
+            project_id: r.project_id,
+            title: r.title,
+            agent_id: r.agent_id,
+            model_config: r.model_config,
+            cost: r.cost,
+            tokens_input: r.tokens_input,
+            tokens_output: r.tokens_output,
+            tokens_reasoning: r.tokens_reasoning,
+            tokens_cache_read: r.tokens_cache_read,
+            tokens_cache_write: r.tokens_cache_write,
+            created_at: r.created_at,
+            updated_at: r.updated_at,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct MessageInfo {
     pub id: String,
@@ -61,8 +82,10 @@ pub struct CheckpointInfo {
 // ─── Project commands ──────────────────────────────────────────────────────
 
 #[tauri::command]
-pub async fn list_projects(engine: State<'_, EngineState>) -> Result<Vec<ProjectInfo>, String> {
-    let rows = db::list_projects(&engine.pool)
+pub async fn list_projects(
+    coord: State<'_, SessionCoordinator>,
+) -> Result<Vec<ProjectInfo>, String> {
+    let rows = db::list_projects(&coord.pool)
         .await
         .map_err(|e| e.to_string())?;
     Ok(rows
@@ -78,12 +101,12 @@ pub async fn list_projects(engine: State<'_, EngineState>) -> Result<Vec<Project
 
 #[tauri::command]
 pub async fn init_project(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     name: String,
     directory: String,
 ) -> Result<ProjectInfo, String> {
     let id = uuid::Uuid::new_v4().to_string();
-    db::create_project(&engine.pool, &id, &name, &directory)
+    db::create_project(&coord.pool, &id, &name, &directory)
         .await
         .map_err(|e| e.to_string())?;
     Ok(ProjectInfo {
@@ -98,7 +121,7 @@ pub async fn init_project(
 
 #[tauri::command]
 pub async fn create_session(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     project_id: String,
     title: String,
     workspace_path: String,
@@ -107,7 +130,7 @@ pub async fn create_session(
     let model_config =
         serde_json::json!({"provider_id": "anthropic", "model_id": "claude-opus-4-8"}).to_string();
     db::create_session(
-        &engine.pool,
+        &coord.pool,
         &id,
         &project_id,
         &workspace_path,
@@ -138,85 +161,77 @@ pub async fn create_session(
 
 #[tauri::command]
 pub async fn list_sessions(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     project_id: String,
 ) -> Result<Vec<SessionInfo>, String> {
-    let rows = db::list_sessions(&engine.pool, &project_id)
+    let rows = db::list_sessions(&coord.pool, &project_id)
         .await
         .map_err(|e| e.to_string())?;
-    Ok(rows
-        .into_iter()
-        .map(|r| SessionInfo {
-            id: r.id,
-            project_id: r.project_id,
-            title: r.title,
-            agent_id: r.agent_id,
-            model_config: r.model_config,
-            cost: r.cost,
-            tokens_input: r.tokens_input,
-            tokens_output: r.tokens_output,
-            tokens_reasoning: r.tokens_reasoning,
-            tokens_cache_read: r.tokens_cache_read,
-            tokens_cache_write: r.tokens_cache_write,
-            created_at: r.created_at,
-            updated_at: r.updated_at,
-        })
-        .collect())
+    Ok(rows.into_iter().map(SessionInfo::from).collect())
 }
 
 #[tauri::command]
 pub async fn get_session(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
 ) -> Result<SessionInfo, String> {
-    let row = db::get_session(&engine.pool, &session_id)
+    let row = db::get_session(&coord.pool, &session_id)
         .await
         .map_err(|e| e.to_string())?
         .ok_or_else(|| "Session not found".to_string())?;
-    Ok(SessionInfo {
-        id: row.id,
-        project_id: row.project_id,
-        title: row.title,
-        agent_id: row.agent_id,
-        model_config: row.model_config,
-        cost: row.cost,
-        tokens_input: row.tokens_input,
-        tokens_output: row.tokens_output,
-        tokens_reasoning: row.tokens_reasoning,
-        tokens_cache_read: row.tokens_cache_read,
-        tokens_cache_write: row.tokens_cache_write,
-        created_at: row.created_at,
-        updated_at: row.updated_at,
-    })
+    Ok(SessionInfo::from(row))
 }
 
 #[tauri::command]
 pub async fn delete_session(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
 ) -> Result<(), String> {
-    db::delete_session(&engine.pool, &session_id)
+    db::delete_session(&coord.pool, &session_id)
         .await
         .map_err(|e| e.to_string())?;
-
-    // Clean up the live session if it exists
-    let mut sessions = engine.sessions.lock().await;
-    if let Some(sess) = sessions.remove(&session_id) {
-        if let Some(cancel) = sess.active_turn_cancel {
-            cancel.cancel();
-        }
-    }
+    // The DB row is gone, so force-remove the live state (no recreate to race).
+    coord.remove_session(&session_id).await;
     Ok(())
+}
+
+/// Switch a session's model (`model_config` = JSON with `provider_id` +
+/// `model_id`). Returns `true` when the change is live now, `false` when a
+/// provider switch was persisted but deferred because a turn is active (the UI
+/// should surface "applies after the current turn" and re-issue once idle).
+#[tauri::command]
+pub async fn set_model(
+    coord: State<'_, SessionCoordinator>,
+    session_id: String,
+    model_config: String,
+) -> Result<bool, String> {
+    coord
+        .set_model(&session_id, &model_config)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Switch a session's agent. Takes effect on the next turn (no eviction).
+#[tauri::command]
+pub async fn set_agent(
+    coord: State<'_, SessionCoordinator>,
+    session_id: String,
+    agent_id: String,
+) -> Result<(), String> {
+    coord
+        .set_agent(&session_id, &agent_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 // ─── Message / turn commands ───────────────────────────────────────────────
 
 #[tauri::command]
 pub async fn get_messages(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
 ) -> Result<Vec<MessageInfo>, String> {
-    let rows = db::get_messages(&engine.pool, &session_id)
+    let rows = db::get_messages(&coord.pool, &session_id)
         .await
         .map_err(|e| e.to_string())?;
     Ok(rows
@@ -232,161 +247,145 @@ pub async fn get_messages(
         .collect())
 }
 
+/// Submit a prompt. Delegates to the coordinator, which admits the input to the
+/// durable inbox and either starts a drain or queues it behind the running turn
+/// (steer/queue semantics + backlog cap) — the desktop no longer hand-rolls the
+/// admit/spawn dance.
 #[tauri::command]
 pub async fn send_prompt(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
     prompt: String,
+    delivery: Option<String>,
 ) -> Result<(), String> {
-    engine.ensure_session(&session_id).await?;
-
-    let (orchestrator, cancel_token) = {
-        let mut sessions = engine.sessions.lock().await;
-        let sess = sessions
-            .get_mut(&session_id)
-            .ok_or("Session not found in engine")?;
-        if sess.active_turn_cancel.is_some() {
-            return Err("A turn is already running".to_string());
-        }
-        let cancel_token = CancellationToken::new();
-        sess.active_turn_cancel = Some(cancel_token.clone());
-        (sess.orchestrator.clone(), cancel_token)
-    };
-
-    let s_id = session_id.clone();
-    let sessions_ref = engine.sessions.clone();
-
-    let input_id = orchestrator
-        .admit_input(&s_id, &prompt, "steer")
+    let delivery = delivery.as_deref().unwrap_or("steer");
+    coord
+        .run_turn(&session_id, &prompt, delivery)
         .await
-        .map_err(|e| {
-            // Release the reserved slot on admission failure
-            let sessions_ref2 = sessions_ref.clone();
-            let s_id2 = s_id.clone();
-            tokio::spawn(async move {
-                let mut s = sessions_ref2.lock().await;
-                if let Some(sess) = s.get_mut(&s_id2) {
-                    sess.active_turn_cancel = None;
-                }
-            });
-            e.to_string()
-        })?;
-
-    tokio::spawn(async move {
-        if let Err(e) = orchestrator
-            .run_session_turn(&s_id, &input_id, cancel_token)
-            .await
-        {
-            tracing::error!("Turn error for session {}: {}", s_id, e);
-        }
-        let mut s_map = sessions_ref.lock().await;
-        if let Some(sess) = s_map.get_mut(&s_id) {
-            sess.active_turn_cancel = None;
-        }
-    });
-
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn abort_session(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
 ) -> Result<(), String> {
-    let mut sessions = engine.sessions.lock().await;
-    if let Some(sess) = sessions.get_mut(&session_id) {
-        if let Some(cancel) = sess.active_turn_cancel.take() {
-            cancel.cancel();
-        }
-    }
-    Ok(())
+    coord
+        .abort_turn(&session_id)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub async fn reply_permission(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
     permission_id: String,
     reply: String,
     feedback: Option<String>,
 ) -> Result<(), String> {
-    // Handle "always" — persist the permission rule
-    if reply == "always" {
-        if let Ok(Some(sess_row)) = db::get_session(&engine.pool, &session_id).await {
-            let sessions = engine.sessions.lock().await;
-            if let Some(active) = sessions.get(&session_id) {
-                if let Some((prompt, _)) = &active.pending_permission {
-                    if prompt.permission_id == permission_id {
-                        let action = prompt.action.clone();
-                        let resource = prompt
-                            .resources
-                            .first()
-                            .cloned()
-                            .unwrap_or_else(|| "*".to_string());
-                        let _ = db::save_permission(
-                            &engine.pool,
-                            &sess_row.project_id,
-                            &action,
-                            &resource,
-                        )
-                        .await;
-                    }
-                }
-            }
-        }
-    }
+    // The coordinator handles grant/deny AND (for "always") persisting the saved
+    // rule, lock-safely and shared with the daemon.
+    coord
+        .reply_permission(&session_id, &permission_id, &reply, feedback.as_deref())
+        .await
+        .map_err(|e| e.to_string())
+}
 
-    let mut sessions = engine.sessions.lock().await;
-    if let Some(sess) = sessions.get_mut(&session_id) {
-        if let Some((prompt, _)) = &sess.pending_permission {
-            if prompt.permission_id == permission_id {
-                let (_, resp_tx) = sess.pending_permission.take().unwrap();
-                let decision = match reply.as_str() {
-                    "always" | "once" => PermissionReply::Allow,
-                    _ => PermissionReply::Deny { feedback },
-                };
-                let _ = resp_tx.send(decision);
-                return Ok(());
-            }
-        }
+// ─── Compaction / revert commands ──────────────────────────────────────────
+
+#[tauri::command]
+pub async fn compact_session(
+    coord: State<'_, SessionCoordinator>,
+    session_id: String,
+) -> Result<(), String> {
+    coord
+        .compact_session(&session_id)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn revert_session(
+    coord: State<'_, SessionCoordinator>,
+    session_id: String,
+) -> Result<SessionInfo, String> {
+    match coord
+        .revert_session(&session_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Some(row) => Ok(SessionInfo::from(row)),
+        None => Err("No checkpoints available to revert to".to_string()),
     }
-    Err("No matching pending permission".to_string())
+}
+
+#[tauri::command]
+pub async fn unrevert_session(
+    coord: State<'_, SessionCoordinator>,
+    session_id: String,
+) -> Result<SessionInfo, String> {
+    match coord
+        .unrevert_session(&session_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        Some(row) => Ok(SessionInfo::from(row)),
+        None => Err("No revert backups available to unrevert to".to_string()),
+    }
 }
 
 // ─── Event subscription ────────────────────────────────────────────────────
 
-/// Subscribe to a session's event stream via a Tauri Channel.
-/// The frontend calls `invoke("subscribe_session", { sessionId })` and
-/// receives typed `ProtocolEvent` objects on the returned channel.
+/// Subscribe to a session's event stream via a Tauri Channel. The frontend
+/// calls `invoke("subscribe_session", { sessionId, afterSeq })` and receives
+/// typed `ProtocolEvent` objects on the returned channel.
+///
+/// Exactly-once delivery (the C9b dedup): we subscribe to the live broadcast
+/// FIRST (`get_or_create_session` returns the receiver), THEN snapshot durable
+/// history — so an event emitted in the gap between subscribe and snapshot is
+/// covered by the replay watermark and is skipped by the live forwarder rather
+/// than delivered twice. Mirrors the daemon WS handler.
 #[tauri::command]
 pub async fn subscribe_session(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
+    after_seq: Option<i64>,
     channel: Channel<ProtocolEvent>,
 ) -> Result<(), String> {
-    let mut rx = engine.ensure_session(&session_id).await?;
+    let mut rx = coord
+        .get_or_create_session(&session_id)
+        .await
+        .map_err(|e| e.to_string())?;
 
-    // Replay durable history
-    {
-        let sessions = engine.sessions.lock().await;
-        if let Some(sess) = sessions.get(&session_id) {
-            for event in &sess.history {
-                let _ = channel.send(event.clone());
-            }
+    let after = after_seq.unwrap_or(0);
+    let mut watermark = after;
+    let history = coord
+        .get_history(&session_id, after)
+        .await
+        .map_err(|e| e.to_string())?;
+    for event in history {
+        watermark = watermark.max(event_seq(&event));
+        if channel.send(event).is_err() {
+            return Ok(()); // frontend already disconnected
         }
     }
 
-    // Stream live events
     tokio::spawn(async move {
+        use tokio::sync::broadcast::error::RecvError;
         loop {
             match rx.recv().await {
                 Ok(event) => {
+                    // Skip any durable event already delivered via replay.
+                    if !should_forward(&event, watermark) {
+                        continue;
+                    }
                     if channel.send(event).is_err() {
-                        break; // Frontend disconnected
+                        break; // frontend disconnected
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Closed) => break,
             }
         }
     });
@@ -398,10 +397,10 @@ pub async fn subscribe_session(
 
 #[tauri::command]
 pub async fn list_checkpoints(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
 ) -> Result<Vec<CheckpointInfo>, String> {
-    let rows = db::list_checkpoints(&engine.pool, &session_id)
+    let rows = db::list_checkpoints(&coord.pool, &session_id)
         .await
         .map_err(|e| e.to_string())?;
     Ok(rows
@@ -425,21 +424,22 @@ pub async fn get_config() -> Result<serde_json::Value, String> {
         "default_model": "anthropic/claude-opus-4-8",
         "default_agent": "build",
         "agents": ["build", "plan", "general", "explore"],
-        "providers": ["anthropic"],
+        "providers": ["anthropic", "nvidia"],
     }))
 }
 
 #[tauri::command]
 pub async fn get_usage(
-    engine: State<'_, EngineState>,
+    coord: State<'_, SessionCoordinator>,
     session_id: String,
 ) -> Result<serde_json::Value, String> {
-    let sessions = engine.sessions.lock().await;
+    let sessions = coord.sessions.lock().await;
     if let Some(sess) = sessions.get(&session_id) {
         Ok(serde_json::to_value(&sess.current_usage).map_err(|e| e.to_string())?)
     } else {
-        // Fall back to DB
-        let row = db::get_session(&engine.pool, &session_id)
+        // Fall back to the DB for an evicted/cold session.
+        drop(sessions);
+        let row = db::get_session(&coord.pool, &session_id)
             .await
             .map_err(|e| e.to_string())?
             .ok_or("Session not found")?;

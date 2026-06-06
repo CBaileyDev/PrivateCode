@@ -1,20 +1,17 @@
 //! Private Code Desktop — Tauri 2 binary entrypoint.
 //!
-//! Boots the in-process engine (SQLite pool, provider, tool registry),
-//! registers all Tauri commands, and launches the Tauri application.
+//! Boots the in-process engine (SQLite pool + shared `SessionCoordinator`),
+//! starts the idle-session reaper, registers all Tauri commands, and runs the
+//! app — draining the coordinator on exit.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use private_code_desktop::commands;
-use private_code_desktop::state::EngineState;
+use private_code_desktop::state::build_coordinator;
 
+use private_code_core::coordinator::SessionCoordinator;
 use private_code_core::db;
-use private_code_providers::AnthropicProvider;
-use private_code_tools::{
-    BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadFileTool, ToolRegistry, WebFetchTool,
-    WriteFileTool,
-};
-use std::sync::Arc;
+use std::time::Duration;
 use tauri::Manager;
 use tracing_subscriber::EnvFilter;
 
@@ -26,7 +23,7 @@ fn main() {
         )
         .init();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
@@ -54,22 +51,11 @@ fn main() {
                 pool
             });
 
-            // Register tools
-            let mut tool_registry = ToolRegistry::new();
-            tool_registry.register(Box::new(ReadFileTool));
-            tool_registry.register(Box::new(WriteFileTool));
-            tool_registry.register(Box::new(GlobTool));
-            tool_registry.register(Box::new(GrepTool));
-            tool_registry.register(Box::new(EditTool));
-            tool_registry.register(Box::new(PatchTool));
-            tool_registry.register(Box::new(BashTool));
-            tool_registry.register(Box::new(WebFetchTool::new()));
-
-            let provider = Arc::new(AnthropicProvider::new());
-
-            let engine_state = EngineState::new(pool, data_dir, provider, Arc::new(tool_registry));
-
-            app.manage(engine_state);
+            // Build the shared coordinator (Anthropic default + NVIDIA), start
+            // the idle reaper, and manage it as global state.
+            let coordinator = build_coordinator(pool, data_dir);
+            coordinator.start_reaper(Duration::from_secs(30 * 60), Duration::from_secs(60));
+            app.manage(coordinator);
 
             Ok(())
         })
@@ -80,15 +66,31 @@ fn main() {
             commands::list_sessions,
             commands::get_session,
             commands::delete_session,
+            commands::set_model,
+            commands::set_agent,
             commands::get_messages,
             commands::send_prompt,
             commands::abort_session,
             commands::reply_permission,
+            commands::compact_session,
+            commands::revert_session,
+            commands::unrevert_session,
             commands::subscribe_session,
             commands::list_checkpoints,
             commands::get_config,
             commands::get_usage,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Private Code");
+        .build(tauri::generate_context!())
+        .expect("error while building Private Code");
+
+    // Drive the event loop, draining the coordinator's in-flight turns + router
+    // tasks (under a bounded timeout) when the app is asked to exit. Best-effort:
+    // a hard kill skips this, but tasks are abort-safe (partial assistant output
+    // is already persisted).
+    app.run(|app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            let coordinator = app_handle.state::<SessionCoordinator>();
+            tauri::async_runtime::block_on(coordinator.shutdown(Duration::from_secs(10)));
+        }
+    });
 }

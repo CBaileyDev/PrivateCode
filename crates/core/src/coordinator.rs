@@ -801,6 +801,21 @@ impl SessionCoordinator {
         db::update_session_agent(&self.pool, session_id, agent_id).await?;
         Ok(())
     }
+
+    /// Force-remove a session's live state regardless of activity. Unlike
+    /// [`evict_session`] (idle-guarded, for model/agent refresh) this is for
+    /// DELETE: the DB row is being removed, so there is no recreate to race the
+    /// torn-down drain. Cancels the active turn and the router tasks; a drain
+    /// mid-settlement finds the session gone and breaks cleanly.
+    pub async fn remove_session(&self, session_id: &str) {
+        let mut sessions = self.sessions.lock().await;
+        if let Some(sess) = sessions.remove(session_id) {
+            if let Some(cancel) = &sess.active_turn_cancel {
+                cancel.cancel();
+            }
+            sess.session_cancel.cancel();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1980,6 +1995,55 @@ mod tests {
                 .model_config,
             back,
             "model_config is persisted even when the eviction is deferred"
+        );
+    }
+
+    /// `remove_session` (DELETE path) force-removes live state even when a turn
+    /// is active — unlike the idle-guarded `evict_session`.
+    #[tokio::test]
+    async fn remove_session_force_removes_even_when_busy() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        let coord = SessionCoordinator::new(
+            pool,
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+
+        coord.get_or_create_session(&session_id).await.unwrap();
+        {
+            let mut s = coord.sessions.lock().await;
+            s.get_mut(&session_id).unwrap().active_turn_cancel = Some(CancellationToken::new());
+        }
+        // evict refuses (busy); remove forces it regardless.
+        assert!(!coord.evict_session(&session_id).await);
+        coord.remove_session(&session_id).await;
+        assert!(
+            !coord.sessions.lock().await.contains_key(&session_id),
+            "remove_session force-removes a busy session"
         );
     }
 }
