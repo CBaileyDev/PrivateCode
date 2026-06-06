@@ -319,16 +319,30 @@ body {
 
 /* ─── Message List Container ────────────────────────────────────────────── */
 .message-container {
+  /* The VList inside owns the scroll; this is just the positioning context for
+     the scroll-to-bottom FAB. `min-height: 0` lets the flex child shrink so the
+     VList gets a bounded height. */
   flex: 1;
-  overflow-y: auto;
-  overflow-x: hidden;
-  scroll-behavior: smooth;
+  min-height: 0;
+  overflow: hidden;
+  position: relative;
 }
 
-.message-list {
+.message-vlist {
+  overflow-x: hidden;
+}
+
+/* Centers each virtualized row to the old max-width column. */
+.message-row {
   max-width: 860px;
   margin: 0 auto;
-  padding: var(--space-4) var(--space-6);
+  padding: 0 var(--space-6);
+}
+.message-row:first-child {
+  padding-top: var(--space-4);
+}
+.message-row:last-child {
+  padding-bottom: var(--space-4);
 }
 
 /* ─── Message Items ─────────────────────────────────────────────────────── */

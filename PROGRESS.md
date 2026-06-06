@@ -23,7 +23,7 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | C11 | Desktop command-layer test harness | ✅ done |
 | C12 | Desktop frontend bugs (XSS, session bleed, locks, panics) | ✅ done |
 | C13 | Wire model/agent dropdowns + slash commands | ✅ done |
-| C14 | MessageList virtualization (virtua) + real Shiki-in-worker | ⬜ pending |
+| C14 | MessageList virtualization (virtua) + real Shiki-in-worker | ✅ done |
 | C15 | Frontend store test suite (vitest + mockIPC) | ⬜ pending |
 | C16 | Perf instrumentation (--selftest + criterion + perf.yml) | ⬜ pending |
 
@@ -77,6 +77,12 @@ Six scope items; five fixed, one (plugins) consciously scoped out:
 - **Deny-feedback (carry-forward MUST):** `PermissionDialog` has an optional "Reason" input; `replyPermission("reject", feedback)` forwards it to the `reply_permission` command → the model sees it in the denied tool_result. The `y`/`a`/`n` single-key shortcuts are now SUPPRESSED while an input/textarea is focused (else typing "no…" would trigger reject); Escape in the field still rejects-with-feedback.
 - **CommandPalette** revert/compact/clear/help wired to the same backend functions (no dead UI). `new-session`/`switch-model`/`switch-agent` palette entries remain close-only (they need an inline value-prompt flow) — minor follow-up, the dropdowns + slash commands cover the function.
 - typecheck + build + 12 vitest green. Runtime coverage of these wirings (mockIPC) lands in C15 — checklist: set_model/set_agent invoke + store patch; `/revert`→revert_session (not abort); deny-feedback forwarded; **deferred provider switch is NOT applied to a different session** (the session-keying regression).
+
+## C14 done (virtua virtualization + real offline Shiki-in-worker)
+- **Shiki:** real, offline, WASM-free highlighting (see the Shiki commit note). Pure `highlight()` pinned in node (4 tests); CodeBlock degrades to escaped plain text until/if highlighting resolves. Singleton worker + id-keyed dispatcher avoids the per-component-listener leak that virtua's mount/unmount churn would otherwise cause.
+- **virtua:** `MessageList` now renders a `<VList>` (`virtua/solid`) over a single `data` array of `{kind:'msg'} | {kind:'streaming'}` rows — virtua measures dynamic heights including the streaming bubble growing token-by-token. Auto-scroll is intentionally dumb: a `createEffect` on row-count + streaming buffers calls `handle.scrollToIndex(last, {align:'end'})` only while pinned to bottom; `onScroll` recomputes `atBottom` from `scrollSize/scrollOffset/viewportSize` and toggles the FAB. The VList owns the scroll (`.message-container` is now `min-height:0; overflow:hidden`); rows are re-centered to the 860px column via `.message-row`.
+- **Honesty ceiling (advisor):** C14 is the LEAST verifiable cluster — typecheck + build + the pure-Shiki vitest prove "compiles, bundles, doesn't throw on import, highlight logic correct, degrades gracefully," but they do NOT prove virtualization scrolls, auto-scroll-on-stream works, height measurement settles, or that highlighting/line-numbers render. Those need a human GUI launch and are on the C15/human list. virtua is **not** headless-unit-testable (jsdom has no layout). Recorded as "implemented per library docs + pure logic tested + degrades gracefully," not "verified" — same honesty log as the `block_on` shutdown.
+- Bundle: Shiki sits in its own ~677KB async worker chunk (loaded on first highlight); virtua adds ~20KB to the main bundle (52→72KB). CSP `cdn.jsdelivr.net` removed (bundled).
 
 ## Carry-forward notes
 - **Deferred (Lagged-while-connected recovery):** the WS forward loop `continue`s on `broadcast::RecvError::Lagged`, relying on the client reconciling durable state from the DB. That holds for messages/checkpoints/usage but not for `Error` (in-memory only) — a client that lags past the 16384 buffer mid-turn could miss an error with no reconnect. Real but low-probability and a riskier hot-path change; the right fix is the forward loop re-syncing in-memory durable history on Lagged (track last-forwarded seq, replay history beyond it). Not bundled with the Error-seq fix.
