@@ -5,11 +5,9 @@ use axum::{
     Json,
 };
 use futures_util::stream::Stream;
-use private_code_core::checkpoint::{GitSnapshotEngine, Snapshot, TreeHash};
 use private_code_core::coordinator::SessionCoordinator;
 use private_code_core::db::{self, CheckpointRow, MessageRow, ProjectRow, SessionRow};
 use private_code_protocol::event::ProtocolEvent;
-use private_code_protocol::message::ChatMessage;
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::path::Path as StdPath;
@@ -183,23 +181,10 @@ pub async fn compact_session(
     Path((_project_id, session_id)): Path<(String, String)>,
     State(coord): State<Arc<SessionCoordinator>>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let mut tx = coord
-        .pool
-        .begin()
+    coord
+        .compact_session(&session_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    // Prune messages older than the last 10 messages (or 4 turns)
-    sqlx::query("DELETE FROM session_message WHERE session_id = ?1 AND seq < (SELECT MAX(seq) - 10 FROM session_message WHERE session_id = ?1)")
-        .bind(&session_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    tx.commit()
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
     Ok(StatusCode::OK)
 }
 
@@ -208,109 +193,16 @@ pub async fn revert_session(
     Path((_project_id, session_id)): Path<(String, String)>,
     State(coord): State<Arc<SessionCoordinator>>,
 ) -> Result<Json<SessionRow>, (StatusCode, String)> {
-    let checkpoints = db::list_checkpoints(&coord.pool, &session_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let session = db::get_session(&coord.pool, &session_id)
+    match coord
+        .revert_session(&session_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
-
-    // We revert to the last checkpoint (excluding any revert_backup checkpoints)
-    let target_cp = checkpoints.iter().find(|cp| cp.kind != "revert_backup");
-
-    if let Some(cp) = target_cp {
-        let checkpoint_engine = GitSnapshotEngine::new(
-            &session_id,
-            StdPath::new(&session.workspace_path),
-            &coord.global_data_dir,
-            true,
-        );
-
-        // Take a revert_backup checkpoint of the current dirty state so we can unrevert
-        if let Ok(Some(backup_hash)) = checkpoint_engine.track().await {
-            let mut tx = coord
-                .pool
-                .begin()
-                .await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            let b_msg_id = Uuid::new_v4().to_string();
-            let _ = db::create_checkpoint(
-                &mut tx,
-                &Uuid::new_v4().to_string(),
-                &session_id,
-                &b_msg_id,
-                &backup_hash.0,
-                "revert_backup",
-                "revert_backup",
-            )
-            .await;
-            let _ = tx.commit().await;
-        }
-
-        checkpoint_engine
-            .restore(&TreeHash(cp.tree_hash.clone()))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        // Append a system message indicating success
-        let sys_msg_id = Uuid::new_v4().to_string();
-        let sys_msg = ChatMessage {
-            id: sys_msg_id.clone(),
-            role: private_code_protocol::Role::System,
-            content: vec![private_code_protocol::ContentBlock::Text {
-                text: format!(
-                    "Workspace successfully reverted to checkpoint: {}",
-                    cp.tree_hash
-                ),
-            }],
-            created_at: chrono::Utc::now().timestamp(),
-        };
-        let sys_json = serde_json::to_string(&sys_msg)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let mut tx = coord
-            .pool
-            .begin()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let seq = db::next_sequence(&mut tx, &session_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        db::append_message(&mut tx, &sys_msg_id, &session_id, seq, "system", &sys_json)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        // Update session's revert field
-        let revert_state = serde_json::json!({
-            "message_id": cp.message_id.clone(),
-            "tree_hash": cp.tree_hash.clone()
-        })
-        .to_string();
-        sqlx::query("UPDATE session SET revert = ?1 WHERE id = ?2")
-            .bind(&revert_state)
-            .bind(&session_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        tx.commit()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        // Refresh and return the session row
-        let updated_session = db::get_session(&coord.pool, &session_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .unwrap();
-
-        Ok(Json(updated_session))
-    } else {
-        Err((
+    {
+        Some(row) => Ok(Json(row)),
+        None => Err((
             StatusCode::BAD_REQUEST,
             "No checkpoints available to revert to".to_string(),
-        ))
+        )),
     }
 }
 
@@ -319,84 +211,16 @@ pub async fn unrevert_session(
     Path((_project_id, session_id)): Path<(String, String)>,
     State(coord): State<Arc<SessionCoordinator>>,
 ) -> Result<Json<SessionRow>, (StatusCode, String)> {
-    let checkpoints = db::list_checkpoints(&coord.pool, &session_id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-    let session = db::get_session(&coord.pool, &session_id)
+    match coord
+        .unrevert_session(&session_id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
-
-    // Find the latest revert_backup checkpoint
-    let backup_cp = checkpoints.iter().find(|cp| cp.kind == "revert_backup");
-
-    if let Some(cp) = backup_cp {
-        let checkpoint_engine = GitSnapshotEngine::new(
-            &session_id,
-            StdPath::new(&session.workspace_path),
-            &coord.global_data_dir,
-            true,
-        );
-
-        checkpoint_engine
-            .restore(&TreeHash(cp.tree_hash.clone()))
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        // Remove the backup checkpoint from db
-        sqlx::query("DELETE FROM checkpoint WHERE id = ?1")
-            .bind(&cp.id)
-            .execute(&coord.pool)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        // Clear session revert field
-        sqlx::query("UPDATE session SET revert = NULL WHERE id = ?1")
-            .bind(&session_id)
-            .execute(&coord.pool)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        // Append system message indicating success
-        let sys_msg_id = Uuid::new_v4().to_string();
-        let sys_msg = ChatMessage {
-            id: sys_msg_id.clone(),
-            role: private_code_protocol::Role::System,
-            content: vec![private_code_protocol::ContentBlock::Text {
-                text: "Workspace successfully un-reverted.".to_string(),
-            }],
-            created_at: chrono::Utc::now().timestamp(),
-        };
-        let sys_json = serde_json::to_string(&sys_msg)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let mut tx = coord
-            .pool
-            .begin()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        let seq = db::next_sequence(&mut tx, &session_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        db::append_message(&mut tx, &sys_msg_id, &session_id, seq, "system", &sys_json)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-        tx.commit()
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-
-        let updated_session = db::get_session(&coord.pool, &session_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .unwrap();
-
-        Ok(Json(updated_session))
-    } else {
-        Err((
+    {
+        Some(row) => Ok(Json(row)),
+        None => Err((
             StatusCode::BAD_REQUEST,
             "No revert backups available to unrevert to".to_string(),
-        ))
+        )),
     }
 }
 
@@ -430,31 +254,8 @@ pub async fn reply_permission(
     State(coord): State<Arc<SessionCoordinator>>,
     Json(body): Json<PermissionReplyBody>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    // If reply is "always", save to permissions_saved
-    if body.reply == "always" {
-        let sess = db::get_session(&coord.pool, &session_id)
-            .await
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-            .ok_or((StatusCode::NOT_FOUND, "Session not found".to_string()))?;
-
-        let sessions = coord.sessions.lock().await;
-        if let Some(active) = sessions.get(&session_id) {
-            if let Some((prompt, _)) = &active.pending_permission {
-                if prompt.permission_id == permission_id {
-                    let action = prompt.action.clone();
-                    let resource = prompt
-                        .resources
-                        .first()
-                        .cloned()
-                        .unwrap_or_else(|| "*".to_string());
-                    db::save_permission(&coord.pool, &sess.project_id, &action, &resource)
-                        .await
-                        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-                }
-            }
-        }
-    }
-
+    // The coordinator handles the grant/deny AND (for "always") persisting the
+    // saved rule — lock-safely and shared with the desktop front-end.
     coord
         .reply_permission(
             &session_id,

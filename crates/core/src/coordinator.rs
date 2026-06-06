@@ -1,3 +1,4 @@
+use crate::checkpoint::{GitSnapshotEngine, Snapshot, TreeHash};
 use crate::db;
 use crate::orchestrator::Orchestrator;
 use crate::permissions::{PermissionPrompt, PermissionReply};
@@ -476,6 +477,16 @@ impl SessionCoordinator {
         Ok(())
     }
 
+    /// Resolve a parked permission. `reply` is `"always"` | `"once"` (both grant)
+    /// or anything else (deny, optionally carrying `feedback` the model sees).
+    /// `"always"` additionally persists a saved rule for the session's project.
+    ///
+    /// The saved-rule write happens AFTER releasing the `sessions` lock — we
+    /// capture the prompt's action/resource under the lock, send the decision,
+    /// then do the DB write with the lock dropped (never await while holding
+    /// `sessions`; that would block event routing and every other session). The
+    /// save is best-effort: failing to persist the rule must not fail the grant
+    /// (which unblocks the turn) — the user is simply asked again next time.
     pub async fn reply_permission(
         &self,
         session_id: &str,
@@ -483,27 +494,52 @@ impl SessionCoordinator {
         reply: &str,
         feedback: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(sess) = sessions.get_mut(session_id) {
+        let save_rule: Option<(String, String)> = {
+            let mut sessions = self.sessions.lock().await;
+            let Some(sess) = sessions.get_mut(session_id) else {
+                return Err(
+                    "No pending permission prompt matches the requested permission ID".into(),
+                );
+            };
             sess.last_activity = std::time::Instant::now();
-            if let Some((prompt, _)) = &sess.pending_permission
-                && prompt.permission_id == permission_id
-            {
-                let (_, resp_tx) = sess.pending_permission.take().unwrap();
-                // "always" also persists a saved rule (handled by the caller);
-                // here both allow variants grant. Anything else is a denial,
-                // which may carry feedback for the model.
-                let decision = match reply {
-                    "always" | "once" => PermissionReply::Allow,
-                    _ => PermissionReply::Deny {
-                        feedback: feedback.map(str::to_string),
-                    },
-                };
-                let _ = resp_tx.send(decision);
-                return Ok(());
+            let matches = matches!(
+                &sess.pending_permission,
+                Some((p, _)) if p.permission_id == permission_id
+            );
+            if !matches {
+                return Err(
+                    "No pending permission prompt matches the requested permission ID".into(),
+                );
             }
+            let (prompt, resp_tx) = sess.pending_permission.take().unwrap();
+            let decision = match reply {
+                "always" | "once" => PermissionReply::Allow,
+                _ => PermissionReply::Deny {
+                    feedback: feedback.map(str::to_string),
+                },
+            };
+            let _ = resp_tx.send(decision);
+            if reply == "always" {
+                let resource = prompt
+                    .resources
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "*".to_string());
+                Some((prompt.action.clone(), resource))
+            } else {
+                None
+            }
+        };
+
+        // Persist the "always" rule outside the lock (best-effort).
+        if let Some((action, resource)) = save_rule
+            && let Ok(Some(sess_row)) = db::get_session(&self.pool, session_id).await
+            && let Err(e) =
+                db::save_permission(&self.pool, &sess_row.project_id, &action, &resource).await
+        {
+            tracing::warn!("failed to persist 'always' permission rule: {e}");
         }
-        Err("No pending permission prompt matches the requested permission ID".into())
+        Ok(())
     }
 
     /// Replay durable events emitted since `after_seq` for a reconnecting client.
@@ -528,6 +564,159 @@ impl SessionCoordinator {
             .filter(|e| event_seq(e) > after_seq)
             .cloned()
             .collect())
+    }
+
+    // ── Session-store operations (pure DB / git; no live-state mutation) ──────
+    //
+    // Hoisted here so the daemon HTTP routes and the desktop Tauri commands share
+    // one implementation instead of duplicating the SQL/git logic across the two
+    // front-ends.
+
+    /// Compact a session's transcript by pruning all but roughly the most recent
+    /// 10 messages. The summary already reaches the model via the system prefix
+    /// (Phase-1 compaction), so this only bounds the stored row count.
+    pub async fn compact_session(
+        &self,
+        session_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM session_message WHERE session_id = ?1 AND seq < \
+             (SELECT MAX(seq) - 10 FROM session_message WHERE session_id = ?1)",
+        )
+        .bind(session_id)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Revert the workspace to its most recent non-backup checkpoint, first
+    /// snapshotting the current (dirty) state as a `revert_backup` so the change
+    /// is reversible via [`unrevert_session`]. Returns the refreshed session row,
+    /// or `Ok(None)` when there is no checkpoint to revert to (the caller maps
+    /// that to a client error).
+    pub async fn revert_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<db::SessionRow>, Box<dyn std::error::Error>> {
+        let checkpoints = db::list_checkpoints(&self.pool, session_id).await?;
+        let session = db::get_session(&self.pool, session_id)
+            .await?
+            .ok_or("Session not found")?;
+
+        let Some(cp) = checkpoints.iter().find(|cp| cp.kind != "revert_backup") else {
+            return Ok(None);
+        };
+
+        let engine = GitSnapshotEngine::new(
+            session_id,
+            std::path::Path::new(&session.workspace_path),
+            &self.global_data_dir,
+            true,
+        );
+
+        // Back up current dirty state so unrevert can restore it.
+        if let Ok(Some(backup_hash)) = engine.track().await {
+            let mut tx = self.pool.begin().await?;
+            let b_msg_id = uuid::Uuid::new_v4().to_string();
+            let _ = db::create_checkpoint(
+                &mut tx,
+                &uuid::Uuid::new_v4().to_string(),
+                session_id,
+                &b_msg_id,
+                &backup_hash.0,
+                "revert_backup",
+                "revert_backup",
+            )
+            .await;
+            let _ = tx.commit().await;
+        }
+
+        engine.restore(&TreeHash(cp.tree_hash.clone())).await?;
+
+        // Append a system message + record the revert pointer atomically.
+        let sys_msg_id = uuid::Uuid::new_v4().to_string();
+        let sys_msg = private_code_protocol::message::ChatMessage {
+            id: sys_msg_id.clone(),
+            role: private_code_protocol::Role::System,
+            content: vec![private_code_protocol::ContentBlock::Text {
+                text: format!(
+                    "Workspace successfully reverted to checkpoint: {}",
+                    cp.tree_hash
+                ),
+            }],
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let sys_json = serde_json::to_string(&sys_msg)?;
+        let revert_state = serde_json::json!({
+            "message_id": cp.message_id.clone(),
+            "tree_hash": cp.tree_hash.clone(),
+        })
+        .to_string();
+
+        let mut tx = self.pool.begin().await?;
+        let seq = db::next_sequence(&mut tx, session_id).await?;
+        db::append_message(&mut tx, &sys_msg_id, session_id, seq, "system", &sys_json).await?;
+        sqlx::query("UPDATE session SET revert = ?1 WHERE id = ?2")
+            .bind(&revert_state)
+            .bind(session_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+
+        Ok(db::get_session(&self.pool, session_id).await?)
+    }
+
+    /// Undo the most recent [`revert_session`]: restore the `revert_backup`
+    /// snapshot, drop it, clear the session's revert pointer, and append a system
+    /// message. Returns the refreshed row, or `Ok(None)` if there is no backup.
+    pub async fn unrevert_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<db::SessionRow>, Box<dyn std::error::Error>> {
+        let checkpoints = db::list_checkpoints(&self.pool, session_id).await?;
+        let session = db::get_session(&self.pool, session_id)
+            .await?
+            .ok_or("Session not found")?;
+
+        let Some(cp) = checkpoints.iter().find(|cp| cp.kind == "revert_backup") else {
+            return Ok(None);
+        };
+
+        let engine = GitSnapshotEngine::new(
+            session_id,
+            std::path::Path::new(&session.workspace_path),
+            &self.global_data_dir,
+            true,
+        );
+        engine.restore(&TreeHash(cp.tree_hash.clone())).await?;
+
+        sqlx::query("DELETE FROM checkpoint WHERE id = ?1")
+            .bind(&cp.id)
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("UPDATE session SET revert = NULL WHERE id = ?1")
+            .bind(session_id)
+            .execute(&self.pool)
+            .await?;
+
+        let sys_msg_id = uuid::Uuid::new_v4().to_string();
+        let sys_msg = private_code_protocol::message::ChatMessage {
+            id: sys_msg_id.clone(),
+            role: private_code_protocol::Role::System,
+            content: vec![private_code_protocol::ContentBlock::Text {
+                text: "Workspace successfully un-reverted.".to_string(),
+            }],
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let sys_json = serde_json::to_string(&sys_msg)?;
+        let mut tx = self.pool.begin().await?;
+        let seq = db::next_sequence(&mut tx, session_id).await?;
+        db::append_message(&mut tx, &sys_msg_id, session_id, seq, "system", &sys_json).await?;
+        tx.commit().await?;
+
+        Ok(db::get_session(&self.pool, session_id).await?)
     }
 }
 
@@ -1329,5 +1518,159 @@ mod tests {
         );
         // Unparseable config falls back to the default rather than failing.
         assert_eq!(coord.select_provider("not json").count_tokens("m", "x"), 1);
+    }
+
+    /// Hoisted session-store ops: a compact prune plus a full revert → unrevert
+    /// round-trip over a REAL git workspace. None of these were covered by a test
+    /// before they moved from the daemon route into the coordinator, so "the same
+    /// tests pass" proves nothing about the move — this is the regression net.
+    #[tokio::test]
+    async fn session_ops_compact_and_revert_unrevert_round_trip() {
+        use crate::checkpoint::GitSnapshotEngine;
+
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let data_dir = TempDir::new().unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_path = ws.path();
+        let ws_str = ws_path.to_str().unwrap();
+
+        // Init the workspace as a git repo with an initial commit (file = "v1").
+        let repo = git2::Repository::init(ws_path).unwrap();
+        {
+            let mut cfg = repo.config().unwrap();
+            cfg.set_str("user.name", "Test").unwrap();
+            cfg.set_str("user.email", "test@example.com").unwrap();
+        }
+        let file = ws_path.join("f.txt");
+        std::fs::write(&file, "v1\n").unwrap();
+        {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("f.txt")).unwrap();
+            index.write().unwrap();
+            let oid = index.write_tree().unwrap();
+            let tree = repo.find_tree(oid).unwrap();
+            let sig = repo.signature().unwrap();
+            repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+                .unwrap();
+        }
+
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let model_cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &model_cfg,
+        )
+        .await
+        .unwrap();
+
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            data_dir.path().to_path_buf(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+
+        // Snapshot the v1 state and record it as a (non-backup) checkpoint.
+        let engine = GitSnapshotEngine::new(&session_id, ws_path, data_dir.path(), true);
+        let v1_hash = engine.track().await.unwrap().unwrap();
+        {
+            let mut tx = pool.begin().await.unwrap();
+            db::create_checkpoint(
+                &mut tx,
+                &uuid::Uuid::new_v4().to_string(),
+                &session_id,
+                "m1",
+                &v1_hash.0,
+                "edit",
+                "tool",
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+
+        // Mutate the workspace to v2 (uncommitted).
+        std::fs::write(&file, "v2\n").unwrap();
+
+        // ── compact: append >10 messages, then prune to roughly the last 10 ──
+        for i in 1..=15 {
+            let mut tx = pool.begin().await.unwrap();
+            let seq = db::next_sequence(&mut tx, &session_id).await.unwrap();
+            db::append_message(
+                &mut tx,
+                &uuid::Uuid::new_v4().to_string(),
+                &session_id,
+                seq,
+                "user",
+                &format!("m{i}"),
+            )
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let before = db::get_messages(&pool, &session_id).await.unwrap().len();
+        coord.compact_session(&session_id).await.unwrap();
+        let after = db::get_messages(&pool, &session_id).await.unwrap().len();
+        assert!(
+            after < before && after <= 11,
+            "compact must prune old rows (before={before}, after={after})"
+        );
+
+        // ── revert: workspace returns to v1; pointer set; backup snapshot taken ──
+        let reverted = coord
+            .revert_session(&session_id)
+            .await
+            .unwrap()
+            .expect("a checkpoint to revert to");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "v1\n",
+            "revert restores the v1 snapshot"
+        );
+        assert!(
+            reverted.revert.is_some(),
+            "revert records the revert pointer"
+        );
+        let cps = db::list_checkpoints(&pool, &session_id).await.unwrap();
+        assert!(
+            cps.iter().any(|c| c.kind == "revert_backup"),
+            "revert snapshots the current (v2) state as a backup"
+        );
+
+        // ── unrevert: workspace returns to v2; pointer cleared; backup dropped ──
+        let unreverted = coord
+            .unrevert_session(&session_id)
+            .await
+            .unwrap()
+            .expect("a backup to unrevert");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "v2\n",
+            "unrevert restores the pre-revert v2 state"
+        );
+        assert!(
+            unreverted.revert.is_none(),
+            "unrevert clears the revert pointer"
+        );
+        let cps = db::list_checkpoints(&pool, &session_id).await.unwrap();
+        assert!(
+            !cps.iter().any(|c| c.kind == "revert_backup"),
+            "unrevert drops the backup checkpoint"
+        );
+
+        // ── nothing left to unrevert → Ok(None) ──
+        assert!(coord.unrevert_session(&session_id).await.unwrap().is_none());
     }
 }
