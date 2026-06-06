@@ -232,8 +232,22 @@ async fn git_backed_turn_persists_messages_events_and_checkpoints() {
         "tree hashes non-empty"
     );
 
-    // (c) Event sequence: ToolPermissionRequired -> ToolOutput(ok) -> a post_step
-    //     CheckpointCreated -> MessageCompleted.
+    // (c) Event sequence: ToolRequested -> ToolPermissionRequired -> ToolOutput(ok)
+    //     -> a post_step CheckpointCreated -> MessageCompleted.
+    let tool_requested_idx = events
+        .iter()
+        .position(|e| matches!(e, ProtocolEvent::ToolRequested { .. }));
+    let tool_output_idx = events
+        .iter()
+        .position(|e| matches!(e, ProtocolEvent::ToolOutput { .. }));
+    assert!(
+        tool_requested_idx.is_some(),
+        "a durable ToolRequested must be emitted"
+    );
+    assert!(
+        tool_requested_idx < tool_output_idx,
+        "ToolRequested must precede ToolOutput"
+    );
     assert!(
         events
             .iter()

@@ -793,6 +793,26 @@ impl Orchestrator {
                     continue;
                 }
 
+                // Durable boundary: emit tool.requested before running the tool so
+                // a client reconnecting after an auto-approved tool ran can render
+                // which call produced the following tool.output (api_protocol §3
+                // classifies tool.requested as durable; the coordinator replays it).
+                {
+                    let mut tx = self.pool.begin().await?;
+                    let seq = db::next_sequence(&mut tx, session_id).await?;
+                    tx.commit().await?;
+                    self.event_tx
+                        .send(ProtocolEvent::ToolRequested {
+                            session_id: session_id.to_string(),
+                            seq,
+                            tool_call_id: call_id.clone(),
+                            tool_name: tool_name.to_string(),
+                            arguments: arguments.clone(),
+                        })
+                        .await
+                        .ok();
+                }
+
                 let tool_opt = self.tool_registry.get(tool_name);
                 let tool = match tool_opt {
                     Some(t) => t,
