@@ -10,6 +10,7 @@ use axum::{
 };
 use coordinator::SessionCoordinator;
 use private_code_providers::anthropic::AnthropicProvider;
+use private_code_providers::ModelProvider;
 use private_code_tools::{
     BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadFileTool, ToolRegistry, WebFetchTool,
     WriteFileTool,
@@ -17,41 +18,27 @@ use private_code_tools::{
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
-pub async fn start_daemon(
-    pool: sqlx::SqlitePool,
-    global_data_dir: PathBuf,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // 1. Get or create the loopback auth token. NEVER log the token value —
-    //    daemon logs are not a secret store (security.md T4).
-    let token = auth::get_or_create_token(&global_data_dir)?;
-    tracing::info!("Starting daemon on port {}", port);
+/// The default tool set the real daemon serves.
+fn default_tool_registry() -> ToolRegistry {
+    let mut r = ToolRegistry::new();
+    r.register(Box::new(ReadFileTool));
+    r.register(Box::new(WriteFileTool));
+    r.register(Box::new(GlobTool));
+    r.register(Box::new(GrepTool));
+    r.register(Box::new(EditTool));
+    r.register(Box::new(PatchTool));
+    r.register(Box::new(BashTool));
+    r.register(Box::new(WebFetchTool::new()));
+    r
+}
 
-    // 2. Register tools
-    let mut tool_registry = ToolRegistry::new();
-    tool_registry.register(Box::new(ReadFileTool));
-    tool_registry.register(Box::new(WriteFileTool));
-    tool_registry.register(Box::new(GlobTool));
-    tool_registry.register(Box::new(GrepTool));
-    tool_registry.register(Box::new(EditTool));
-    tool_registry.register(Box::new(PatchTool));
-    tool_registry.register(Box::new(BashTool));
-    tool_registry.register(Box::new(WebFetchTool::new()));
-    let tool_registry = Arc::new(tool_registry);
-
-    let provider = Arc::new(AnthropicProvider::new());
-
-    // 3. Create Session Coordinator
-    let coordinator = Arc::new(SessionCoordinator::new(
-        pool,
-        global_data_dir,
-        provider,
-        tool_registry,
-    ));
-
-    // 4. Build Axum Router
-    let app = Router::new()
+/// Build the full axum router (all routes + loopback auth middleware) over a
+/// coordinator. Pure construction — no I/O — so tests can mount it directly.
+pub fn build_router(coordinator: Arc<SessionCoordinator>, token: String) -> Router {
+    Router::new()
         .route(
             "/project",
             get(routes::list_projects).post(routes::init_project),
@@ -106,15 +93,82 @@ pub async fn start_daemon(
         .layer(middleware::from_fn(move |req, next| {
             auth::auth_middleware(token.clone(), req, next)
         }))
-        .with_state(coordinator);
+        .with_state(coordinator)
+}
 
-    // 5. Listen and serve on loopback
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = tokio::net::TcpListener::bind(addr).await?;
-    tracing::info!("Listening on {}", addr);
-    axum::serve(listener, app).await?;
-
+/// Serve the router on `listener` until `shutdown` is cancelled, letting
+/// in-flight HTTP/WS connections finish (axum 0.7 graceful shutdown).
+pub async fn serve_daemon(
+    coordinator: Arc<SessionCoordinator>,
+    token: String,
+    listener: TcpListener,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let app = build_router(coordinator, token);
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move { shutdown.cancelled().await })
+        .await?;
     Ok(())
+}
+
+/// Dependency-injected entrypoint used by both the real daemon and tests: the
+/// caller supplies the provider, tool registry, a pre-bound listener, and a
+/// shutdown token. The loopback auth token is read/created from global_data_dir.
+pub async fn start_daemon_with(
+    pool: sqlx::SqlitePool,
+    global_data_dir: PathBuf,
+    provider: Arc<dyn ModelProvider>,
+    tool_registry: Arc<ToolRegistry>,
+    listener: TcpListener,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // NEVER log the token value — daemon logs are not a secret store (security.md T4).
+    let token = auth::get_or_create_token(&global_data_dir)?;
+    let coordinator = Arc::new(SessionCoordinator::new(
+        pool,
+        global_data_dir,
+        provider,
+        tool_registry,
+    ));
+    serve_daemon(coordinator, token, listener, shutdown).await
+}
+
+/// The real daemon entrypoint: register the production tools + Anthropic
+/// provider, bind loopback, and serve until Ctrl-C.
+pub async fn start_daemon(
+    pool: sqlx::SqlitePool,
+    global_data_dir: PathBuf,
+    port: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tracing::info!("Starting daemon on port {}", port);
+
+    let tool_registry = Arc::new(default_tool_registry());
+    let provider: Arc<dyn ModelProvider> = Arc::new(AnthropicProvider::new());
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("Listening on {}", addr);
+
+    // Cancel on Ctrl-C so axum drains gracefully. (The full SIGTERM + drain
+    // sequence is wired in cluster C7.)
+    let shutdown = CancellationToken::new();
+    let sd = shutdown.clone();
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            tracing::info!("Ctrl-C received; shutting down");
+            sd.cancel();
+        }
+    });
+
+    start_daemon_with(
+        pool,
+        global_data_dir,
+        provider,
+        tool_registry,
+        listener,
+        shutdown,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -199,5 +253,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn start_daemon_with_injects_provider_and_drains_on_shutdown() {
+        use private_code_providers::testkit::ScriptedProvider;
+        use private_code_providers::ModelProvider;
+        use tokio_util::sync::CancellationToken;
+
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().to_path_buf();
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let token = auth::get_or_create_token(&dir).unwrap();
+
+        // DI: a mock provider, no network, on an ephemeral port.
+        let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::one_shot_text("hi"));
+        let registry = Arc::new(ToolRegistry::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = CancellationToken::new();
+        let sd = shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            // Discard the non-Send Box<dyn Error> result; we only assert the task ends.
+            let _ = start_daemon_with(pool, dir, provider, registry, listener, sd).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let client = reqwest::Client::new();
+        let resp = client
+            .get(format!("http://{}/provider", addr))
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        assert!(resp.text().await.unwrap().contains("anthropic"));
+
+        // Graceful shutdown: cancelling the token makes the server task return.
+        shutdown.cancel();
+        let res = tokio::time::timeout(std::time::Duration::from_secs(3), handle).await;
+        assert!(
+            res.is_ok(),
+            "serve_daemon must return after the shutdown token is cancelled"
+        );
     }
 }

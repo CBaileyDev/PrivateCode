@@ -32,12 +32,14 @@ fn run_tool(
         .block_on(tool.run(&mut ctx, args))
 }
 
-/// A set of distinct, patch-safe lines (no leading +/-/space/@, never empty).
+/// A set of distinct, patch-safe lines. Fixed-width (zero-padded) so no line is a
+/// substring of another — EditTool matches by substring, so `ln5` ⊂ `ln51` would
+/// be (correctly) ambiguous; equal-length distinct lines can't contain each other.
 fn distinct_lines(min: usize, max: usize) -> impl Strategy<Value = Vec<String>> {
     prop::collection::hash_set(0u32..1_000_000, min..max).prop_map(|set| {
         let mut v: Vec<u32> = set.into_iter().collect();
         v.sort_unstable();
-        v.into_iter().map(|n| format!("ln{n}")).collect()
+        v.into_iter().map(|n| format!("line_{n:07}")).collect()
     })
 }
 
