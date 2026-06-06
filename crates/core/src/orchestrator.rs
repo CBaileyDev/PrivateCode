@@ -239,6 +239,26 @@ impl Orchestrator {
         let _ = self.event_tx.try_send(ev);
     }
 
+    /// Allocate a fresh monotonic durable sequence for an event. Used for `Error`
+    /// events so they carry a real replay cursor: `get_history` filters by
+    /// `seq > after_seq`, so a `seq == 0` error is categorically un-replayable (it
+    /// is also not persisted to any content table). Best-effort — falls back to 0
+    /// if the DB write fails (the error still streams live), preserving the
+    /// original error rather than masking it with a sequence-allocation failure.
+    async fn next_event_seq(&self, session_id: &str) -> i64 {
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(_) => return 0,
+        };
+        match db::next_sequence(&mut tx, session_id).await {
+            Ok(seq) => {
+                let _ = tx.commit().await;
+                seq
+            }
+            Err(_) => 0,
+        }
+    }
+
     pub async fn run_session_turn(
         &self,
         session_id: &str,
@@ -520,10 +540,11 @@ impl Orchestrator {
                             chat_msgs = Self::assemble_chat_messages(&db2)?;
                             continue;
                         }
+                        let seq = self.next_event_seq(session_id).await;
                         self.event_tx
                             .send(ProtocolEvent::Error {
                                 session_id: session_id.to_string(),
-                                seq: 0,
+                                seq,
                                 code: "context_overflow".to_string(),
                                 message: message.clone(),
                                 retryable: false,
@@ -536,10 +557,11 @@ impl Orchestrator {
                         .into());
                     }
                     Err(e) => {
+                        let seq = self.next_event_seq(session_id).await;
                         self.event_tx
                             .send(ProtocolEvent::Error {
                                 session_id: session_id.to_string(),
-                                seq: 0,
+                                seq,
                                 code: "provider_error".to_string(),
                                 message: e.to_string(),
                                 retryable: true,
@@ -796,10 +818,13 @@ impl Orchestrator {
             // a retryable error and stop — we do NOT present truncated output as a
             // clean completion, nor execute half-parsed tool calls.
             if let Some(err_msg) = stream_error {
+                // A FRESH seq, not asst_seq: reusing the assistant message's cursor
+                // would make two durable events share a seq and break replay dedup.
+                let seq = self.next_event_seq(session_id).await;
                 self.event_tx
                     .send(ProtocolEvent::Error {
                         session_id: session_id.to_string(),
-                        seq: asst_seq.unwrap_or(0),
+                        seq,
                         code: "stream_error".to_string(),
                         message: err_msg.clone(),
                         retryable: true,
@@ -2444,6 +2469,75 @@ mod tests {
                     .map(|cm| cm.content.is_empty())
                     .unwrap_or(false)),
             "a content-less errored turn must not persist an empty-content message"
+        );
+    }
+
+    /// An emitted Error event must carry a FRESH, non-zero sequence. With seq=0 it
+    /// was categorically un-replayable: the daemon's get_history filters
+    /// `event_seq > after_seq`, so 0 > N is always false, and errors are not
+    /// persisted to any content table — a client that missed the live event could
+    /// never learn the turn failed.
+    #[tokio::test]
+    async fn error_event_carries_a_fresh_replayable_seq() {
+        let ws = TempDir::new().unwrap();
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let pid = Uuid::new_v4().to_string();
+        create_project(&pool, &pid, "t", ws.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let sid = Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &sid,
+            &pid,
+            ws.path().to_str().unwrap(),
+            ws.path().to_str().unwrap(),
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        let (ptx, _prx) = mpsc::channel::<(PermissionPrompt, oneshot::Sender<PermissionReply>)>(10);
+        let (etx, mut erx) = mpsc::channel::<ProtocolEvent>(4096);
+        let events = Arc::new(StdMutex::new(Vec::<ProtocolEvent>::new()));
+        let events2 = events.clone();
+        let collector = tokio::spawn(async move {
+            while let Some(ev) = erx.recv().await {
+                events2.lock().unwrap().push(ev);
+            }
+        });
+
+        let orch = Arc::new(Orchestrator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(ImmediateErrorProvider),
+            Arc::new(ToolRegistry::new()),
+            ptx,
+            etx,
+        ));
+        let input_id = orch.admit_input(&sid, "hi", "steer").await.unwrap();
+        let _ = orch
+            .run_session_turn(&sid, &input_id, CancellationToken::new())
+            .await;
+        drop(orch); // close the event sender so the collector ends
+        let _ = collector.await;
+        let events = Arc::try_unwrap(events).unwrap().into_inner().unwrap();
+
+        let err_seq = events
+            .iter()
+            .find_map(|e| match e {
+                ProtocolEvent::Error { seq, .. } => Some(*seq),
+                _ => None,
+            })
+            .expect("an Error event must be emitted");
+        assert!(
+            err_seq > 0,
+            "Error events need a fresh replayable seq (0 is un-replayable by get_history); got {err_seq}"
         );
     }
 }
