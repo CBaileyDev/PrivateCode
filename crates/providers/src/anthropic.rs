@@ -404,10 +404,35 @@ fn escape_system_update(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Append a lowered message, MERGING into the previous one when it has the same
+/// role. The Anthropic API requires roles to alternate: consecutive same-role
+/// messages are rejected ("roles must alternate ... found multiple user roles in
+/// a row") on Bedrock, on older versions, and observed even on the first-party
+/// API (claude-code#1162). The recent server-side auto-merge is not dependable
+/// across endpoints/versions, so we normalize client-side. This is the shape a
+/// mid-turn steer produces: `user(tool_result)` immediately followed by
+/// `user(steer)` (see the orchestrator's `promote_pending_steers`). Merging
+/// concatenates content blocks in chronological order — semantically identical,
+/// and our message blocks carry no per-block `cache_control` so no cache
+/// breakpoint is disturbed.
+fn push_or_merge(out: &mut Vec<AnthropicMessage>, role: &str, content: Vec<serde_json::Value>) {
+    if let Some(last) = out.last_mut()
+        && last.role == role
+    {
+        last.content.extend(content);
+        return;
+    }
+    out.push(AnthropicMessage {
+        role: role.to_string(),
+        content,
+    });
+}
+
 /// Lower our protocol [`ChatMessage`]s to the Anthropic `messages` array. System
 /// messages become a native inline `role:"system"` block only on a model +
 /// position the API accepts, else a visible `<system-update>` user message;
-/// reasoning replays only with its signature; empty-content messages are dropped.
+/// reasoning replays only with its signature; empty-content messages are dropped;
+/// adjacent same-role messages are merged so roles strictly alternate.
 fn lower_messages(model_id: &str, messages: &[ChatMessage]) -> Vec<AnthropicMessage> {
     let mut out: Vec<AnthropicMessage> = Vec::new();
     for (index, msg) in messages.iter().enumerate() {
@@ -515,10 +540,7 @@ fn lower_messages(model_id: &str, messages: &[ChatMessage]) -> Vec<AnthropicMess
             continue;
         }
 
-        out.push(AnthropicMessage {
-            role: role.to_string(),
-            content,
-        });
+        push_or_merge(&mut out, role, content);
     }
     out
 }
@@ -641,6 +663,74 @@ mod tests {
         assert!(
             merged.contains("&lt;/system-update&gt;"),
             "must XML-escape the payload"
+        );
+    }
+
+    fn assistant_tool_use(id: &str) -> ChatMessage {
+        ChatMessage {
+            id: "a".into(),
+            role: Role::Assistant,
+            content: vec![ContentBlock::ToolUse {
+                id: id.into(),
+                name: "write_file".into(),
+                input: serde_json::json!({"path": "x"}),
+            }],
+            created_at: 0,
+        }
+    }
+    fn user_tool_result(id: &str) -> ChatMessage {
+        ChatMessage {
+            id: "tr".into(),
+            role: Role::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: id.into(),
+                content: private_code_protocol::message::ToolResultContent::Text("ok".into()),
+                is_error: false,
+            }],
+            created_at: 0,
+        }
+    }
+
+    #[test]
+    fn adjacent_same_role_messages_are_merged_so_roles_alternate() {
+        // The exact shape a mid-turn steer produces: a tool_result (user) is
+        // immediately followed by the steer (user). The Anthropic API rejects
+        // consecutive same-role messages, so lowering MUST merge them.
+        let msgs = vec![
+            usr("please write"),
+            assistant_tool_use("t1"),
+            user_tool_result("t1"),
+            usr("actually, write to output/ instead"),
+        ];
+        let out = lower_messages("claude-opus-4-8", &msgs);
+
+        // Four input messages collapse to three: user, assistant, user.
+        let roles: Vec<&str> = out.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user"],
+            "roles must alternate"
+        );
+
+        // The merged final user message carries BOTH the tool_result block and the
+        // steer text, in chronological order.
+        let last = out.last().unwrap();
+        assert_eq!(last.role, "user");
+        assert!(
+            last.content.iter().any(|b| b["type"] == "tool_result"),
+            "merged user message keeps the tool_result block"
+        );
+        assert!(
+            last.content
+                .iter()
+                .any(|b| b["text"].as_str().is_some_and(|t| t.contains("output/"))),
+            "merged user message keeps the steer text"
+        );
+
+        // The real regression guard: no two adjacent output messages share a role.
+        assert!(
+            out.windows(2).all(|w| w[0].role != w[1].role),
+            "no two adjacent messages may share a role"
         );
     }
 }
