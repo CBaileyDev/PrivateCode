@@ -166,12 +166,18 @@ pub async fn start_daemon(
     let tool_registry = Arc::new(default_tool_registry());
     let provider: Arc<dyn ModelProvider> = Arc::new(AnthropicProvider::new());
     // Additional providers selected per-session by `model_config.provider_id`.
-    // NVIDIA's OpenAI-compatible gateway (key: NVIDIA_API_KEY or keyring
-    // "private-code/nvidia"); the key is resolved lazily on first use.
-    let extra_providers: Vec<(String, Arc<dyn ModelProvider>)> = vec![(
-        "nvidia".to_string(),
-        Arc::new(private_code_providers::OpenAiCompatProvider::nvidia()),
-    )];
+    // Anthropic is ALSO registered by name (same Arc as the default) so a
+    // multi-model fan-out from ANY session can resolve "anthropic/<model>" — the
+    // orchestration resolver matches only registered ids and never silently falls
+    // back to the default. NVIDIA's OpenAI-compatible gateway (key: NVIDIA_API_KEY
+    // or keyring "private-code/nvidia"); keys resolve lazily on first use.
+    let extra_providers: Vec<(String, Arc<dyn ModelProvider>)> = vec![
+        ("anthropic".to_string(), provider.clone()),
+        (
+            "nvidia".to_string(),
+            Arc::new(private_code_providers::OpenAiCompatProvider::nvidia()),
+        ),
+    ];
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).await?;

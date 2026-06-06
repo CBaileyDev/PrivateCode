@@ -42,9 +42,13 @@ pub fn build_coordinator(pool: SqlitePool, global_data_dir: PathBuf) -> SessionC
     let mut coord = SessionCoordinator::new(
         pool,
         global_data_dir,
-        provider,
+        provider.clone(),
         Arc::new(default_tool_registry()),
     );
+    // Register Anthropic by name too (same Arc as the default) so a multi-model
+    // fan-out from any session can resolve "anthropic/<model>" — the orchestration
+    // resolver matches only registered ids, never silently falling back.
+    coord.register_provider("anthropic", provider);
     // NVIDIA's OpenAI-compatible gateway; the API key resolves lazily on first use.
     coord.register_provider("nvidia", Arc::new(OpenAiCompatProvider::nvidia()));
     coord
