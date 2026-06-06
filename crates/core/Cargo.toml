@@ -26,6 +26,7 @@ json_comments.workspace = true
 schemars.workspace = true
 nucleo.workspace = true
 rayon.workspace = true
+notify-debouncer-full.workspace = true
 similar.workspace = true
 ignore.workspace = true
 tempfile.workspace = true

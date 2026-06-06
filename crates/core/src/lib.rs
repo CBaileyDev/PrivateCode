@@ -10,3 +10,4 @@ pub mod orchestrator;
 pub mod permissions;
 pub mod repomap;
 pub mod symbols;
+pub mod watcher;

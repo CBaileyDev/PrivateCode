@@ -50,5 +50,6 @@ tokio-tungstenite = "0.21"
 http = "1"
 criterion = "0.5"
 rayon = "1"
+notify-debouncer-full = "0.7"
 
 
