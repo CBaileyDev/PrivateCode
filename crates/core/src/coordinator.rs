@@ -2046,4 +2046,119 @@ mod tests {
             "remove_session force-removes a busy session"
         );
     }
+
+    /// `set_agent` is a raw `sqlx::query` (no compile-time column check), so a
+    /// column-name typo would only surface at runtime — pin the write.
+    #[tokio::test]
+    async fn set_agent_persists_to_the_db() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+
+        coord.set_agent(&session_id, "plan").await.unwrap();
+        assert_eq!(
+            db::get_session(&pool, &session_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .agent_id,
+            "plan",
+            "set_agent must persist the new agent_id"
+        );
+    }
+
+    /// The `"always"` branch of `reply_permission` persists a saved rule for the
+    /// session's project. This is the lock-safe save we folded in + reordered in
+    /// C10; only the grant/deny path was covered before, the DB write was dark.
+    #[tokio::test]
+    async fn reply_permission_always_persists_a_saved_rule() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            ws_str,
+            ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        coord.get_or_create_session(&session_id).await.unwrap();
+
+        // Park a permission prompt for a write to `/foo`.
+        let _rx = {
+            let mut s = coord.sessions.lock().await;
+            let (tx, rx) = oneshot::channel::<PermissionReply>();
+            s.get_mut(&session_id).unwrap().pending_permission = Some((
+                PermissionPrompt {
+                    permission_id: "perm-1".into(),
+                    tool_name: "write_file".into(),
+                    action: "write".into(),
+                    resources: vec!["/foo".into()],
+                    preview: String::new(),
+                },
+                tx,
+            ));
+            rx
+        };
+
+        coord
+            .reply_permission(&session_id, "perm-1", "always", None)
+            .await
+            .unwrap();
+
+        let saved = db::get_saved_permissions(&pool, &project_id).await.unwrap();
+        assert_eq!(saved.len(), 1, "'always' must persist exactly one rule");
+        assert_eq!(saved[0].action, "write");
+        assert_eq!(saved[0].resource, "/foo");
+
+        // The parked oneshot received the grant.
+        assert_eq!(_rx.await.unwrap(), PermissionReply::Allow);
+    }
 }
