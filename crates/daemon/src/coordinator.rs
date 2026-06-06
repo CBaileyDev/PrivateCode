@@ -63,7 +63,7 @@ fn is_durable_event(event: &ProtocolEvent) -> bool {
 }
 
 /// The durable replay-cursor sequence for an event (0 for ephemeral/uncounted events).
-fn event_seq(event: &ProtocolEvent) -> i64 {
+pub fn event_seq(event: &ProtocolEvent) -> i64 {
     match event {
         ProtocolEvent::MessageCompleted { seq, .. }
         | ProtocolEvent::ToolRequested { seq, .. }
@@ -74,6 +74,18 @@ fn event_seq(event: &ProtocolEvent) -> i64 {
         | ProtocolEvent::Error { seq, .. } => *seq,
         _ => 0,
     }
+}
+
+/// Whether a live broadcast event should be forwarded to a client that already
+/// replayed durable events up to `watermark`. Forwards everything with no replay
+/// cursor (`event_seq == 0`: ephemeral deltas and any unsequenced durable event)
+/// and everything strictly newer than the watermark; skips a durable event whose
+/// seq was already in the replayed range — the exactly-once dedup. Keying on
+/// `seq > 0` (not "is durable") means a durable-but-unsequenced event can never be
+/// silently dropped.
+pub fn should_forward(event: &ProtocolEvent, watermark: i64) -> bool {
+    let seq = event_seq(event);
+    seq == 0 || seq > watermark
 }
 
 impl SessionCoordinator {
@@ -1168,6 +1180,40 @@ mod tests {
         fn count_tokens(&self, _m: &str, _t: &str) -> usize {
             self.0
         }
+    }
+
+    /// `should_forward` is the exactly-once replay dedup: a client that replayed
+    /// durable events 1..=3 must, on the live stream, see only seq>3 — but every
+    /// seq-0 event (ephemeral deltas) always flows. This fails without the
+    /// watermark (the overlapping seq 2,3 double-deliver).
+    #[test]
+    fn should_forward_dedups_replayed_range_but_passes_deltas() {
+        let completed = |seq: i64| ProtocolEvent::MessageCompleted {
+            session_id: "s".into(),
+            seq,
+            message_id: "m".into(),
+            usage: UsageStats::default(),
+        };
+        let delta = ProtocolEvent::MessageDelta {
+            session_id: "s".into(),
+            delta: private_code_protocol::event::DeltaPayload::Text { text: "x".into() },
+        };
+
+        // Replayed [1,2,3] → watermark 3. Live overlap [2,3,4]: only 4 forwards.
+        let watermark = 3;
+        assert!(
+            !should_forward(&completed(2), watermark),
+            "2 already replayed"
+        );
+        assert!(
+            !should_forward(&completed(3), watermark),
+            "3 already replayed"
+        );
+        assert!(should_forward(&completed(4), watermark), "4 is new");
+        // Ephemeral (seq 0) deltas always forward, regardless of watermark.
+        assert!(should_forward(&delta, watermark));
+        // With no replay (watermark 0), every durable event forwards.
+        assert!(should_forward(&completed(1), 0));
     }
 
     /// `select_provider` routes by `model_config.provider_id`: a registered name

@@ -98,10 +98,15 @@ async fn handle_socket(socket: WebSocket, query: WsQuery, coord: Arc<SessionCoor
         }
     };
 
-    // Replay history
+    // Replay history. Track the highest durable seq replayed so the live forward
+    // loop below can dedup: an event emitted between our subscribe (above) and
+    // this snapshot is in BOTH the broadcast buffer and the replay, so without a
+    // watermark it would be delivered twice.
     let after_seq = query.after_seq.unwrap_or(0);
+    let mut replay_watermark = after_seq;
     if let Ok(history) = get_session_history(&coord, &query.session_id, after_seq).await {
         for event in history {
+            replay_watermark = replay_watermark.max(crate::coordinator::event_seq(&event));
             if let Ok(msg_str) = serde_json::to_string(&event) {
                 if ws_tx.send(Message::Text(msg_str)).await.is_err() {
                     return;
@@ -130,6 +135,10 @@ async fn handle_socket(socket: WebSocket, query: WsQuery, coord: Arc<SessionCoor
         loop {
             match event_rx.recv().await {
                 Ok(event) => {
+                    // Dedup: skip any durable event already delivered via replay.
+                    if !crate::coordinator::should_forward(&event, replay_watermark) {
+                        continue;
+                    }
                     if let Ok(msg_str) = serde_json::to_string(&event) {
                         if command_tx_clone.send(Message::Text(msg_str)).await.is_err() {
                             break;
