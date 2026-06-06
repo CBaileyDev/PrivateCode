@@ -9,6 +9,17 @@ pub enum PermissionDecision {
     Ask,
 }
 
+/// A user's reply to an interactive permission prompt (the runtime answer carried
+/// on the prompt's response channel). Distinct from [`PermissionDecision`], which
+/// is the *evaluation* result of rules and can never carry human feedback — a
+/// rule-based deny stays feedback-less. A user `Deny` may attach feedback that is
+/// surfaced to the model in the tool result so it can adjust course.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PermissionReply {
+    Allow,
+    Deny { feedback: Option<String> },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PermissionRule {
     pub action: String,

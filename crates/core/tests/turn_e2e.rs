@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use private_code_core::checkpoint::{GitSnapshotEngine, Snapshot, TreeHash};
 use private_code_core::db;
 use private_code_core::orchestrator::Orchestrator;
-use private_code_core::permissions::{PermissionDecision, PermissionPrompt};
+use private_code_core::permissions::{PermissionPrompt, PermissionReply};
 use private_code_protocol::event::{ProtocolEvent, UsageStats};
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role};
 use private_code_providers::ProviderEvent;
@@ -138,14 +138,13 @@ async fn git_backed_turn_persists_messages_events_and_checkpoints() {
     let mut reg = ToolRegistry::new();
     reg.register(Box::new(WriteMockTool));
 
-    let (ptx, mut prx) =
-        mpsc::channel::<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>(10);
+    let (ptx, mut prx) = mpsc::channel::<(PermissionPrompt, oneshot::Sender<PermissionReply>)>(10);
     let (etx, mut erx) = mpsc::channel::<ProtocolEvent>(4096);
 
     // Permission responder: auto-Allow every prompt (exercises Ask->Allow).
     let responder = tokio::spawn(async move {
         while let Some((_prompt, resp_tx)) = prx.recv().await {
-            let _ = resp_tx.send(PermissionDecision::Allow);
+            let _ = resp_tx.send(PermissionReply::Allow);
         }
     });
 

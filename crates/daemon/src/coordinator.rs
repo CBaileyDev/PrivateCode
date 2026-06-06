@@ -1,6 +1,6 @@
 use private_code_core::db;
 use private_code_core::orchestrator::Orchestrator;
-use private_code_core::permissions::{PermissionDecision, PermissionPrompt};
+use private_code_core::permissions::{PermissionPrompt, PermissionReply};
 use private_code_protocol::event::{ProtocolEvent, UsageStats};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -19,7 +19,7 @@ pub struct ActiveSession {
     pub orchestrator: Arc<Orchestrator>,
     pub event_tx: broadcast::Sender<ProtocolEvent>,
     pub history: Vec<ProtocolEvent>, // last 1000 durable events
-    pub pending_permission: Option<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>,
+    pub pending_permission: Option<(PermissionPrompt, oneshot::Sender<PermissionReply>)>,
     pub current_usage: UsageStats,
     /// `Some` iff a drain chain is running for this session. This is the single
     /// concurrency invariant: it is set ONLY by `run_turn` (atomically with the
@@ -469,6 +469,7 @@ impl SessionCoordinator {
         session_id: &str,
         permission_id: &str,
         reply: &str,
+        feedback: Option<&str>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut sessions = self.sessions.lock().await;
         if let Some(sess) = sessions.get_mut(session_id) {
@@ -476,9 +477,14 @@ impl SessionCoordinator {
             if let Some((prompt, _)) = &sess.pending_permission {
                 if prompt.permission_id == permission_id {
                     let (_, resp_tx) = sess.pending_permission.take().unwrap();
+                    // "always" also persists a saved rule (handled by the caller);
+                    // here both allow variants grant. Anything else is a denial,
+                    // which may carry feedback for the model.
                     let decision = match reply {
-                        "always" | "once" => PermissionDecision::Allow,
-                        _ => PermissionDecision::Deny,
+                        "always" | "once" => PermissionReply::Allow,
+                        _ => PermissionReply::Deny {
+                            feedback: feedback.map(str::to_string),
+                        },
                     };
                     let _ = resp_tx.send(decision);
                     return Ok(());

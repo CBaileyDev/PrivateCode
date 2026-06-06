@@ -5,7 +5,7 @@
 //! process is spawned. Events flow to the frontend via typed Tauri Channels.
 
 use private_code_core::orchestrator::Orchestrator;
-use private_code_core::permissions::{PermissionDecision, PermissionPrompt};
+use private_code_core::permissions::{PermissionPrompt, PermissionReply};
 use private_code_protocol::event::{ProtocolEvent, UsageStats};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -20,7 +20,7 @@ pub struct ActiveSession {
     pub orchestrator: Arc<Orchestrator>,
     pub event_tx: broadcast::Sender<ProtocolEvent>,
     pub history: Vec<ProtocolEvent>,
-    pub pending_permission: Option<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>,
+    pub pending_permission: Option<(PermissionPrompt, oneshot::Sender<PermissionReply>)>,
     pub current_usage: UsageStats,
     pub active_turn_cancel: Option<CancellationToken>,
 }

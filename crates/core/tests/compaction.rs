@@ -9,7 +9,7 @@ use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
 use private_code_core::db;
 use private_code_core::orchestrator::Orchestrator;
-use private_code_core::permissions::{PermissionDecision, PermissionPrompt};
+use private_code_core::permissions::{PermissionPrompt, PermissionReply};
 use private_code_protocol::event::{ProtocolEvent, UsageStats};
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role};
 use private_code_providers::provider::{ModelProvider, ProviderError, ProviderEvent};
@@ -60,7 +60,7 @@ async fn setup(provider: Arc<dyn ModelProvider>, project_config_json: &str) -> H
     .await
     .unwrap();
 
-    let (ptx, _prx) = mpsc::channel::<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>(10);
+    let (ptx, _prx) = mpsc::channel::<(PermissionPrompt, oneshot::Sender<PermissionReply>)>(10);
     let (etx, mut erx) = mpsc::channel::<ProtocolEvent>(4096);
     tokio::spawn(async move { while erx.recv().await.is_some() {} });
 

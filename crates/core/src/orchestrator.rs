@@ -2,7 +2,9 @@ use crate::checkpoint::{GitSnapshotEngine, Snapshot};
 use crate::config::{AppConfig, DEFAULT_MODEL_ID};
 use crate::context::{Reconcile, SystemContextRegistry};
 use crate::db::{self};
-use crate::permissions::{self, PermissionDecision, PermissionPrompt, PermissionRule};
+use crate::permissions::{
+    self, PermissionDecision, PermissionPrompt, PermissionReply, PermissionRule,
+};
 use private_code_protocol::event::{DeltaPayload, ProtocolEvent, UsageStats};
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role, ToolResultContent};
 use private_code_providers::provider::{ModelProvider, ProviderError, ProviderEvent};
@@ -22,7 +24,7 @@ pub struct Orchestrator {
     pub provider: Arc<dyn ModelProvider>,
     pub context_registry: SystemContextRegistry,
     pub tool_registry: Arc<ToolRegistry>,
-    pub permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>,
+    pub permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionReply>)>,
     pub event_tx: mpsc::Sender<ProtocolEvent>,
 }
 
@@ -142,7 +144,7 @@ impl Orchestrator {
         global_data_dir: PathBuf,
         provider: Arc<dyn ModelProvider>,
         tool_registry: Arc<ToolRegistry>,
-        permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>,
+        permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionReply>)>,
         event_tx: mpsc::Sender<ProtocolEvent>,
     ) -> Self {
         Self {
@@ -934,6 +936,10 @@ impl Orchestrator {
                     &saved_rules,
                 );
 
+                // Feedback the user may attach to an interactive denial; surfaced
+                // to the model in the tool result so it can adjust course. Stays
+                // None for rule-based denials and allows.
+                let mut deny_feedback: Option<String> = None;
                 let granted = match decision {
                     PermissionDecision::Allow => true,
                     PermissionDecision::Deny => false,
@@ -985,9 +991,12 @@ impl Orchestrator {
                                     false
                                 }
                                 d = resp_rx => match d {
-                                    Ok(PermissionDecision::Allow) => true,
-                                    Ok(PermissionDecision::Deny) => false,
-                                    _ => false,
+                                    Ok(PermissionReply::Allow) => true,
+                                    Ok(PermissionReply::Deny { feedback }) => {
+                                        deny_feedback = feedback;
+                                        false
+                                    }
+                                    Err(_) => false,
                                 },
                             }
                         }
@@ -1000,11 +1009,17 @@ impl Orchestrator {
                 }
 
                 if !granted {
+                    // Surface the user's denial feedback (if any) to the model so it
+                    // can change approach; otherwise the generic denial message.
+                    let content = match &deny_feedback {
+                        Some(fb) if !fb.trim().is_empty() => {
+                            format!("Permission denied by the user. Feedback: {fb}")
+                        }
+                        _ => "Permission Denied by user or rule policy.".to_string(),
+                    };
                     tool_results.push(ContentBlock::ToolResult {
                         tool_use_id: call_id.clone(),
-                        content: ToolResultContent::Text(
-                            "Permission Denied by user or rule policy.".to_string(),
-                        ),
+                        content: ToolResultContent::Text(content),
                         is_error: true,
                     });
                     continue;
@@ -2271,6 +2286,117 @@ mod tests {
             "no empty-content message may be persisted when cancelling a pending permission"
         );
         drop(_prx);
+    }
+
+    /// A user denial may carry free-text feedback; it must reach the model in the
+    /// tool result (not the generic "Permission Denied" string), so the model can
+    /// adjust course on the next turn.
+    #[tokio::test]
+    async fn deny_feedback_reaches_the_tool_result() {
+        let ws = TempDir::new().unwrap();
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let pid = Uuid::new_v4().to_string();
+        create_project(&pool, &pid, "t", ws.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let sid = Uuid::new_v4().to_string();
+        let model_config =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &sid,
+            &pid,
+            ws.path().to_str().unwrap(),
+            ws.path().to_str().unwrap(),
+            "t",
+            "build",
+            &model_config,
+        )
+        .await
+        .unwrap();
+
+        // Turn 1 requests write_file (-> Ask); turn 2 acknowledges after the deny.
+        let provider = Arc::new(ScriptedProvider {
+            turns: StdMutex::new(VecDeque::from(vec![
+                vec![
+                    ProviderEvent::ToolUseStart {
+                        id: "t1".into(),
+                        name: "write_file".into(),
+                    },
+                    ProviderEvent::ToolUseComplete {
+                        id: "t1".into(),
+                        name: "write_file".into(),
+                        input: serde_json::json!({}),
+                    },
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("tool_use".into()),
+                    },
+                ],
+                vec![
+                    ProviderEvent::TextDelta("understood".into()),
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("end_turn".into()),
+                    },
+                ],
+            ])),
+        });
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(AskTool));
+
+        let (ptx, mut prx) =
+            mpsc::channel::<(PermissionPrompt, oneshot::Sender<PermissionReply>)>(10);
+        let (etx, mut erx) = mpsc::channel(4096);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+
+        // Responder: deny WITH feedback.
+        let responder = tokio::spawn(async move {
+            while let Some((_prompt, resp)) = prx.recv().await {
+                let _ = resp.send(PermissionReply::Deny {
+                    feedback: Some("write to output/ instead".to_string()),
+                });
+            }
+        });
+
+        let orch = Arc::new(Orchestrator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            provider,
+            Arc::new(reg),
+            ptx,
+            etx,
+        ));
+        let input_id = orch
+            .admit_input(&sid, "please write", "steer")
+            .await
+            .unwrap();
+        orch.run_session_turn(&sid, &input_id, CancellationToken::new())
+            .await
+            .unwrap();
+        drop(orch);
+        let _ = responder.await;
+
+        // A denied (is_error) tool_result must carry the user's feedback verbatim.
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        let found = msgs
+            .iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .flat_map(|cm| cm.content)
+            .any(|b| match b {
+                ContentBlock::ToolResult {
+                    content: ToolResultContent::Text(t),
+                    is_error,
+                    ..
+                } => is_error && t.contains("write to output/ instead"),
+                _ => false,
+            });
+        assert!(
+            found,
+            "the deny feedback must be surfaced in the (is_error) tool_result"
+        );
     }
 
     /// A provider whose very first stream item is an error (no content emitted).

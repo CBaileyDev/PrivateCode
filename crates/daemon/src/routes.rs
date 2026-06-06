@@ -456,7 +456,12 @@ pub async fn reply_permission(
     }
 
     coord
-        .reply_permission(&session_id, &permission_id, &body.reply)
+        .reply_permission(
+            &session_id,
+            &permission_id,
+            &body.reply,
+            body.feedback.as_deref(),
+        )
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 

@@ -227,6 +227,8 @@ async fn process_rpc(
                 code: -32602,
                 message: "Missing reply parameter".to_string(),
             })?;
+            // Optional free-text feedback the model sees when a request is denied.
+            let feedback = params["feedback"].as_str();
 
             // If reply is "always", save to permissions_saved
             if reply == "always" {
@@ -255,7 +257,7 @@ async fn process_rpc(
             }
 
             coord
-                .reply_permission(session_id, perm_id, reply)
+                .reply_permission(session_id, perm_id, reply, feedback)
                 .await
                 .map_err(|e| JsonRpcError {
                     code: -32000,

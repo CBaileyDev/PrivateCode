@@ -4,7 +4,7 @@
 
 use crate::state::EngineState;
 use private_code_core::db;
-use private_code_core::permissions::PermissionDecision;
+use private_code_core::permissions::PermissionReply;
 use private_code_protocol::event::ProtocolEvent;
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, State};
@@ -308,6 +308,7 @@ pub async fn reply_permission(
     session_id: String,
     permission_id: String,
     reply: String,
+    feedback: Option<String>,
 ) -> Result<(), String> {
     // Handle "always" — persist the permission rule
     if reply == "always" {
@@ -341,8 +342,8 @@ pub async fn reply_permission(
             if prompt.permission_id == permission_id {
                 let (_, resp_tx) = sess.pending_permission.take().unwrap();
                 let decision = match reply.as_str() {
-                    "always" | "once" => PermissionDecision::Allow,
-                    _ => PermissionDecision::Deny,
+                    "always" | "once" => PermissionReply::Allow,
+                    _ => PermissionReply::Deny { feedback },
                 };
                 let _ = resp_tx.send(decision);
                 return Ok(());
