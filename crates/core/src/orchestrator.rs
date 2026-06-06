@@ -2,6 +2,7 @@ use crate::checkpoint::{GitSnapshotEngine, Snapshot};
 use crate::config::{AppConfig, DEFAULT_MODEL_ID};
 use crate::context::{Reconcile, SystemContextRegistry};
 use crate::db::{self};
+use crate::orchestration::{self, OrchestrationMode};
 use crate::permissions::{
     self, PermissionDecision, PermissionPrompt, PermissionReply, PermissionRule,
 };
@@ -22,6 +23,13 @@ pub struct Orchestrator {
     pub pool: SqlitePool,
     pub global_data_dir: PathBuf,
     pub provider: Arc<dyn ModelProvider>,
+    /// Providers resolvable by id for multi-model orchestration (fan-out /
+    /// role-based). Built by the coordinator from its registered providers plus
+    /// the session's own selected provider keyed by its `provider_id`. Unlike the
+    /// single-model path (which silently falls back to `provider`), fan-out
+    /// resolves ONLY from this map — an unregistered provider makes that candidate
+    /// fail honestly rather than silently running the default and mislabeling it.
+    pub providers: HashMap<String, Arc<dyn ModelProvider>>,
     pub context_registry: SystemContextRegistry,
     pub tool_registry: Arc<ToolRegistry>,
     pub permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionReply>)>,
@@ -54,6 +62,17 @@ enum PartialBlock {
 struct CompactionMarker {
     compacted_through_seq: i64,
     summary: String,
+}
+
+/// Accumulate one usage record into a running total (every field). Used to fold
+/// the synthesizer's spend onto the summed candidate spend for a multi-model turn.
+fn add_usage(total: &mut UsageStats, add: &UsageStats) {
+    total.input_tokens += add.input_tokens;
+    total.output_tokens += add.output_tokens;
+    total.cache_read_tokens += add.cache_read_tokens;
+    total.cache_write_tokens += add.cache_write_tokens;
+    total.reasoning_tokens += add.reasoning_tokens;
+    total.cost += add.cost;
 }
 
 /// True if a provider 400 looks like a context-length overflow (so compaction
@@ -151,11 +170,28 @@ impl Orchestrator {
             pool,
             global_data_dir,
             provider,
+            providers: HashMap::new(),
             context_registry: SystemContextRegistry::new(),
             tool_registry,
             permission_prompt_tx,
             event_tx,
         }
+    }
+
+    /// Attach the id→provider map used for multi-model orchestration. Builder so
+    /// existing `Orchestrator::new` call sites (single-model tests) stay unchanged
+    /// and keep an empty map (fan-out simply has nothing to resolve).
+    pub fn with_providers(mut self, providers: HashMap<String, Arc<dyn ModelProvider>>) -> Self {
+        self.providers = providers;
+        self
+    }
+
+    /// Resolve a candidate/synthesizer provider by id for orchestration. Returns
+    /// `None` when the id is not registered — the caller turns that into an honest
+    /// per-candidate failure (never a silent fallback to the default provider,
+    /// which would run the wrong model and mislabel it in the stream).
+    fn resolve_orch_provider(&self, provider_id: &str) -> Option<Arc<dyn ModelProvider>> {
+        self.providers.get(provider_id).cloned()
     }
 
     pub async fn admit_input(
@@ -290,6 +326,8 @@ impl Orchestrator {
         // This chain's ownership boundary: only steers admitted strictly after the
         // opening input fold into it (see `promote_pending_steers`).
         let chain_watermark = input_row.admitted_seq;
+        // The raw prompt text — needed verbatim by the multi-model synthesis pass.
+        let user_request = input_row.prompt.clone();
 
         let user_msg_seq = db::next_sequence(&mut tx, session_id).await?;
         db::promote_session_input(&mut tx, &input_row.id, user_msg_seq).await?;
@@ -299,7 +337,7 @@ impl Orchestrator {
             id: user_msg_id.clone(),
             role: Role::User,
             content: vec![ContentBlock::Text {
-                text: input_row.prompt.clone(),
+                text: user_request.clone(),
             }],
             created_at: chrono::Utc::now().timestamp(),
         };
@@ -450,6 +488,41 @@ impl Orchestrator {
         let model_val: serde_json::Value = serde_json::from_str(&session.model_config)?;
         let model_id = model_val["model_id"].as_str().unwrap_or(DEFAULT_MODEL_ID);
         let max_tokens = model_val["max_tokens"].as_u64().unwrap_or(8192) as u32;
+
+        // Multi-model orchestration branch. When `model_config.orchestration` opts
+        // into a non-Single mode, this turn fans out (or runs a role pipeline) and
+        // synthesizes ONE durable assistant message instead of the normal tool
+        // loop. The whole fan-out+synthesis runs as this single drain activity.
+        let orch_config: orchestration::OrchestrationConfig = model_val
+            .get("orchestration")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        if orch_config.mode != OrchestrationMode::Single {
+            if let Err(e) = orch_config.validate() {
+                let seq = self.next_event_seq(session_id).await;
+                self.event_tx
+                    .send(ProtocolEvent::Error {
+                        session_id: session_id.to_string(),
+                        seq,
+                        code: "orchestration_config_invalid".to_string(),
+                        message: e.to_string(),
+                        retryable: false,
+                    })
+                    .await
+                    .ok();
+                return Err(format!("invalid orchestration config: {e}").into());
+            }
+            return self
+                .run_orchestrated_turn(
+                    session_id,
+                    &user_request,
+                    system_prompt.as_deref(),
+                    max_tokens,
+                    &orch_config,
+                    &cancel,
+                )
+                .await;
+        }
 
         let mut turn_count = 0;
         let max_turns = app_config.max_turns;
@@ -1251,6 +1324,451 @@ impl Orchestrator {
             out.push(serde_json::from_str(&m.data)?);
         }
         Ok(out)
+    }
+
+    // ── Multi-model orchestration (Phase 4, Steps 4.9–4.11) ───────────────────
+    //
+    // A non-Single orchestration turn replaces the normal tool loop with a single
+    // fan-out (or sequential role pipeline) followed by a synthesis/final stream,
+    // persisting exactly ONE durable assistant `MessageCompleted`. Candidate
+    // streams are ephemeral `Candidate*` events; only the final answer persists.
+    // Ceilings (documented, matching plan 4.9/4.10): candidates/synthesis run with
+    // NO tool loop and NO proactive compaction.
+
+    /// Emit a durable, non-retryable orchestration `Error` and fail the turn (so
+    /// the spinner clears) WITHOUT persisting a garbage assistant message.
+    async fn fail_orchestration(
+        &self,
+        session_id: &str,
+        code: &str,
+        message: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let seq = self.next_event_seq(session_id).await;
+        self.event_tx
+            .send(ProtocolEvent::Error {
+                session_id: session_id.to_string(),
+                seq,
+                code: code.to_string(),
+                message: message.to_string(),
+                retryable: false,
+            })
+            .await
+            .ok();
+        Err(message.to_string().into())
+    }
+
+    /// Persist the one synthesized/final answer as a durable assistant message and
+    /// emit the single `MessageCompleted`. `seq` comes from the shared
+    /// `next_sequence` counter (same as the normal path) so replay-cursor dedup
+    /// holds across single- and multi-model turns alike.
+    async fn persist_orchestrated_answer(
+        &self,
+        session_id: &str,
+        text: &str,
+        usage: UsageStats,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let assistant_msg_id = Uuid::new_v4().to_string();
+        let msg = ChatMessage {
+            id: assistant_msg_id.clone(),
+            role: Role::Assistant,
+            content: vec![ContentBlock::Text {
+                text: text.to_string(),
+            }],
+            created_at: chrono::Utc::now().timestamp(),
+        };
+        let json = serde_json::to_string(&msg)?;
+        let mut tx = self.pool.begin().await?;
+        let seq = db::next_sequence(&mut tx, session_id).await?;
+        db::append_message(
+            &mut tx,
+            &assistant_msg_id,
+            session_id,
+            seq,
+            "assistant",
+            &json,
+        )
+        .await?;
+        db::update_usage(
+            &mut tx,
+            session_id,
+            usage.cost,
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.reasoning_tokens,
+            usage.cache_read_tokens,
+            usage.cache_write_tokens,
+        )
+        .await?;
+        tx.commit().await?;
+
+        self.event_tx
+            .send(ProtocolEvent::MessageCompleted {
+                session_id: session_id.to_string(),
+                seq,
+                message_id: assistant_msg_id,
+                usage,
+            })
+            .await
+            .ok();
+        Ok(())
+    }
+
+    /// Dispatch a non-Single orchestration turn. The config is already validated.
+    async fn run_orchestrated_turn(
+        &self,
+        session_id: &str,
+        user_request: &str,
+        system_prompt: Option<&str>,
+        max_tokens: u32,
+        cfg: &orchestration::OrchestrationConfig,
+        cancel: &CancellationToken,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // The conversation the candidates see (no tools — documented ceiling).
+        let db_msgs = db::get_messages(&self.pool, session_id).await?;
+        let chat_msgs = Self::assemble_chat_messages(&db_msgs)?;
+        let timeout = cfg.candidate_timeout();
+
+        match cfg.mode {
+            OrchestrationMode::Single => {
+                unreachable!("Single mode is handled before run_orchestrated_turn")
+            }
+            OrchestrationMode::FanOut => {
+                self.run_fan_out(
+                    session_id,
+                    user_request,
+                    system_prompt,
+                    max_tokens,
+                    cfg,
+                    &chat_msgs,
+                    cancel,
+                    timeout,
+                )
+                .await
+            }
+            OrchestrationMode::RoleBased => {
+                self.run_role_pipeline(
+                    session_id,
+                    user_request,
+                    system_prompt,
+                    max_tokens,
+                    cfg,
+                    &chat_msgs,
+                    cancel,
+                    timeout,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Fan-out: dispatch all candidates in parallel, then synthesize the survivors
+    /// into the one durable answer.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_fan_out(
+        &self,
+        session_id: &str,
+        user_request: &str,
+        system_prompt: Option<&str>,
+        max_tokens: u32,
+        cfg: &orchestration::OrchestrationConfig,
+        chat_msgs: &[ChatMessage],
+        cancel: &CancellationToken,
+        timeout: std::time::Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Resolve candidates; an unregistered provider fails THAT candidate
+        // honestly (Started + Completed-with-error) rather than silently running
+        // the default model under a misreported id.
+        let mut candidates = Vec::new();
+        for (i, spec) in cfg.candidates.iter().enumerate() {
+            let mref = orchestration::ModelRef::parse(spec)?;
+            match self.resolve_orch_provider(&mref.provider_id) {
+                Some(p) => candidates.push(orchestration::Candidate {
+                    index: i as u32,
+                    provider: p,
+                    model_id: mref.model_id,
+                }),
+                None => {
+                    let _ = self
+                        .event_tx
+                        .send(ProtocolEvent::CandidateStarted {
+                            session_id: session_id.to_string(),
+                            candidate_index: i as u32,
+                            model_id: spec.clone(),
+                        })
+                        .await;
+                    let _ = self
+                        .event_tx
+                        .send(ProtocolEvent::CandidateCompleted {
+                            session_id: session_id.to_string(),
+                            candidate_index: i as u32,
+                            usage: UsageStats::default(),
+                            finish_reason: None,
+                            error: Some(format!(
+                                "provider '{}' is not registered",
+                                mref.provider_id
+                            )),
+                        })
+                        .await;
+                }
+            }
+        }
+
+        let req = orchestration::FanOutRequest {
+            session_id,
+            system_prompt,
+            max_tokens,
+            messages: chat_msgs,
+            tools: &[],
+        };
+        let outcomes =
+            orchestration::fan_out(&candidates, &req, &self.event_tx, cancel, timeout).await;
+
+        // Cancelled mid-fan-out → persist nothing.
+        if cancel.is_cancelled() {
+            return Ok(());
+        }
+
+        let survivors: Vec<(String, String)> = outcomes
+            .iter()
+            .filter(|o| o.succeeded() && !o.text.trim().is_empty())
+            .map(|o| (o.model_id.clone(), o.text.clone()))
+            .collect();
+        if survivors.is_empty() {
+            return self
+                .fail_orchestration(
+                    session_id,
+                    "all_candidates_failed",
+                    "all fan-out candidates failed or returned no output",
+                )
+                .await;
+        }
+
+        // Synthesizer defaults to the first candidate spec when unset.
+        let synth_spec = cfg
+            .synthesizer
+            .clone()
+            .unwrap_or_else(|| cfg.candidates[0].clone());
+        let synth_ref = orchestration::ModelRef::parse(&synth_spec)?;
+        let Some(synth_provider) = self.resolve_orch_provider(&synth_ref.provider_id) else {
+            return self
+                .fail_orchestration(
+                    session_id,
+                    "synthesizer_unavailable",
+                    &format!(
+                        "synthesizer provider '{}' is not registered",
+                        synth_ref.provider_id
+                    ),
+                )
+                .await;
+        };
+
+        let synth_msgs = orchestration::build_synthesis_messages(user_request, &survivors);
+        let (synth_text, synth_usage) = match orchestration::stream_single(
+            &synth_provider,
+            &synth_ref.model_id,
+            session_id,
+            Some(orchestration::DEFAULT_SYNTHESIS_SYSTEM_PROMPT),
+            max_tokens,
+            &synth_msgs,
+            &self.event_tx,
+            cancel,
+            timeout,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) if e == "cancelled" => return Ok(()),
+            Err(e) => {
+                return self
+                    .fail_orchestration(session_id, "synthesis_failed", &e)
+                    .await;
+            }
+        };
+        if synth_text.trim().is_empty() {
+            return self
+                .fail_orchestration(
+                    session_id,
+                    "synthesis_empty",
+                    "synthesizer produced no output",
+                )
+                .await;
+        }
+
+        let mut total = orchestration::sum_candidate_usage(&outcomes);
+        add_usage(&mut total, &synth_usage);
+        self.persist_orchestrated_answer(session_id, &synth_text, total)
+            .await
+    }
+
+    /// Role-based pipeline: run each role's model sequentially, feeding prior
+    /// outputs forward. Intermediate stages stream as ephemeral `Candidate*`
+    /// events; the final deliverable persists. With NO synthesizer, the final
+    /// stage IS the answer (only-final-persists); WITH a synthesizer, every stage
+    /// is intermediate and the synthesis pass produces the durable answer.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_role_pipeline(
+        &self,
+        session_id: &str,
+        user_request: &str,
+        system_prompt: Option<&str>,
+        max_tokens: u32,
+        cfg: &orchestration::OrchestrationConfig,
+        chat_msgs: &[ChatMessage],
+        cancel: &CancellationToken,
+        timeout: std::time::Duration,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let stages = cfg.ordered_roles(); // validate() guaranteed non-empty
+        let has_synth = cfg.synthesizer.is_some();
+        let last_idx = stages.len() - 1;
+        let mut prior: Vec<(String, String)> = Vec::new();
+        let mut total = UsageStats::default();
+
+        for (i, (role, spec)) in stages.iter().enumerate() {
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            let mref = orchestration::ModelRef::parse(spec)?;
+            let Some(provider) = self.resolve_orch_provider(&mref.provider_id) else {
+                return self
+                    .fail_orchestration(
+                        session_id,
+                        "role_provider_unavailable",
+                        &format!(
+                            "role '{role}' provider '{}' is not registered",
+                            mref.provider_id
+                        ),
+                    )
+                    .await;
+            };
+            let stage_msgs = orchestration::build_role_stage_messages(chat_msgs, role, &prior);
+
+            // Final stage with no synthesizer = the answer: stream as MessageDelta
+            // and persist directly.
+            if i == last_idx && !has_synth {
+                let (text, usage) = match orchestration::stream_single(
+                    &provider,
+                    &mref.model_id,
+                    session_id,
+                    system_prompt,
+                    max_tokens,
+                    &stage_msgs,
+                    &self.event_tx,
+                    cancel,
+                    timeout,
+                )
+                .await
+                {
+                    Ok(v) => v,
+                    Err(e) if e == "cancelled" => return Ok(()),
+                    Err(e) => {
+                        return self
+                            .fail_orchestration(session_id, "role_stage_failed", &e)
+                            .await;
+                    }
+                };
+                if text.trim().is_empty() {
+                    return self
+                        .fail_orchestration(
+                            session_id,
+                            "role_stage_empty",
+                            &format!("final role '{role}' produced no output"),
+                        )
+                        .await;
+                }
+                add_usage(&mut total, &usage);
+                return self
+                    .persist_orchestrated_answer(session_id, &text, total)
+                    .await;
+            }
+
+            // Intermediate stage: stream as Candidate{index=i}.
+            let cand = vec![orchestration::Candidate {
+                index: i as u32,
+                provider,
+                model_id: mref.model_id.clone(),
+            }];
+            let req = orchestration::FanOutRequest {
+                session_id,
+                system_prompt,
+                max_tokens,
+                messages: &stage_msgs,
+                tools: &[],
+            };
+            let outcomes =
+                orchestration::fan_out(&cand, &req, &self.event_tx, cancel, timeout).await;
+            if cancel.is_cancelled() {
+                return Ok(());
+            }
+            let o = &outcomes[0];
+            if !o.succeeded() || o.text.trim().is_empty() {
+                return self
+                    .fail_orchestration(
+                        session_id,
+                        "role_stage_failed",
+                        &format!(
+                            "role '{role}' failed: {}",
+                            o.error.clone().unwrap_or_else(|| "no output".into())
+                        ),
+                    )
+                    .await;
+            }
+            add_usage(&mut total, &o.usage);
+            prior.push((role.clone(), o.text.clone()));
+        }
+
+        // Reached only when a synthesizer is set (every stage was intermediate):
+        // synthesize all stage outputs into the durable answer.
+        let synth_spec = cfg
+            .synthesizer
+            .clone()
+            .expect("loop falls through only when a synthesizer is configured");
+        let synth_ref = orchestration::ModelRef::parse(&synth_spec)?;
+        let Some(synth_provider) = self.resolve_orch_provider(&synth_ref.provider_id) else {
+            return self
+                .fail_orchestration(
+                    session_id,
+                    "synthesizer_unavailable",
+                    &format!(
+                        "synthesizer provider '{}' is not registered",
+                        synth_ref.provider_id
+                    ),
+                )
+                .await;
+        };
+        let synth_msgs = orchestration::build_synthesis_messages(user_request, &prior);
+        let (synth_text, synth_usage) = match orchestration::stream_single(
+            &synth_provider,
+            &synth_ref.model_id,
+            session_id,
+            Some(orchestration::DEFAULT_SYNTHESIS_SYSTEM_PROMPT),
+            max_tokens,
+            &synth_msgs,
+            &self.event_tx,
+            cancel,
+            timeout,
+        )
+        .await
+        {
+            Ok(v) => v,
+            Err(e) if e == "cancelled" => return Ok(()),
+            Err(e) => {
+                return self
+                    .fail_orchestration(session_id, "synthesis_failed", &e)
+                    .await;
+            }
+        };
+        if synth_text.trim().is_empty() {
+            return self
+                .fail_orchestration(
+                    session_id,
+                    "synthesis_empty",
+                    "synthesizer produced no output",
+                )
+                .await;
+        }
+        add_usage(&mut total, &synth_usage);
+        self.persist_orchestrated_answer(session_id, &synth_text, total)
+            .await
     }
 
     /// Coarse token estimate for a request: system prompt + every content block.

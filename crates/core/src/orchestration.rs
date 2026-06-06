@@ -72,10 +72,17 @@ pub struct OrchestrationConfig {
     /// answer. When unset, C9 falls back to the first candidate.
     #[serde(default)]
     pub synthesizer: Option<String>,
-    /// Role → model ref, for [`OrchestrationMode::RoleBased`] (consumed in C9).
-    /// `BTreeMap` so serialization is deterministic.
+    /// Role → model ref, for [`OrchestrationMode::RoleBased`]. `BTreeMap` so
+    /// serialization is deterministic.
     #[serde(default)]
     pub roles: BTreeMap<String, String>,
+    /// Explicit execution order for [`OrchestrationMode::RoleBased`]. Each entry
+    /// must be a key in `roles`. When empty, the order falls back to `roles`'
+    /// keys (alphabetical, via `BTreeMap`) — relying on that accidental order is
+    /// a latent bug, so set this explicitly for any real pipeline
+    /// (e.g. `["architect", "implementer", "reviewer"]`).
+    #[serde(default)]
+    pub role_order: Vec<String>,
     /// Per-candidate timeout in seconds; `0` means [`DEFAULT_CANDIDATE_TIMEOUT`].
     #[serde(default)]
     pub candidate_timeout_secs: u64,
@@ -117,12 +124,31 @@ impl OrchestrationConfig {
                 for v in self.roles.values() {
                     ModelRef::parse(v)?;
                 }
+                for r in &self.role_order {
+                    if !self.roles.contains_key(r) {
+                        return Err(OrchestrationError::UnknownRole(r.clone()));
+                    }
+                }
                 if let Some(s) = &self.synthesizer {
                     ModelRef::parse(s)?;
                 }
             }
         }
         Ok(())
+    }
+
+    /// The role execution order: `role_order` when set, else `roles`' keys in
+    /// `BTreeMap` (alphabetical) order. Pairs each role with its model ref string.
+    pub fn ordered_roles(&self) -> Vec<(String, String)> {
+        let order: Vec<String> = if self.role_order.is_empty() {
+            self.roles.keys().cloned().collect()
+        } else {
+            self.role_order.clone()
+        };
+        order
+            .into_iter()
+            .filter_map(|r| self.roles.get(&r).map(|m| (r, m.clone())))
+            .collect()
     }
 }
 
@@ -156,6 +182,8 @@ pub enum OrchestrationError {
     TooFewCandidates(usize),
     #[error("role-based mode requires at least one role mapping")]
     NoRoles,
+    #[error("role_order references role '{0}' that is not in roles")]
+    UnknownRole(String),
 }
 
 /// A fan-out candidate with its provider already resolved. The caller (the
@@ -365,6 +393,140 @@ async fn run_candidate(
         finish_reason,
         error,
     }
+}
+
+/// The default synthesis instruction. The synthesizer receives the user's request
+/// plus every surviving candidate's answer and must produce one best answer —
+/// merging strengths, correcting errors, resolving disagreements — WITHOUT
+/// revealing that multiple candidates existed (the user sees a single answer).
+pub const DEFAULT_SYNTHESIS_SYSTEM_PROMPT: &str = "\
+You are a synthesis engine combining multiple AI models' answers to one request. \
+You are given the user's request followed by several candidate answers. Produce a \
+single, best response: merge the strongest ideas, correct any errors, resolve \
+disagreements in favor of correctness, and fill gaps. Do not mention that there \
+were multiple candidates, do not refer to them by number, and do not describe \
+your process — output only the final answer as if you authored it directly.";
+
+/// Build the one-user-message request for the synthesizer: the original request
+/// followed by each surviving candidate's labeled answer. `candidates` is
+/// `(label, text)` pairs (the label is the candidate's model id or role name).
+pub fn build_synthesis_messages(
+    user_request: &str,
+    candidates: &[(String, String)],
+) -> Vec<ChatMessage> {
+    use private_code_protocol::message::{ContentBlock, Role};
+    let mut body = format!("User request:\n{user_request}\n\n");
+    for (i, (label, text)) in candidates.iter().enumerate() {
+        body.push_str(&format!(
+            "--- Candidate {} ({}) ---\n{}\n\n",
+            i + 1,
+            label,
+            text
+        ));
+    }
+    body.push_str("Synthesize these into a single best answer.");
+    vec![ChatMessage {
+        id: "synthesis-input".to_string(),
+        role: Role::User,
+        content: vec![ContentBlock::Text { text: body }],
+        created_at: 0,
+    }]
+}
+
+/// Build a role stage's request: the base conversation messages plus, when prior
+/// stages have run, an appended user message carrying their outputs and this
+/// role's instruction. The first stage gets the base messages unchanged.
+pub fn build_role_stage_messages(
+    base: &[ChatMessage],
+    role: &str,
+    prior: &[(String, String)],
+) -> Vec<ChatMessage> {
+    use private_code_protocol::message::{ContentBlock, Role};
+    let mut msgs = base.to_vec();
+    if !prior.is_empty() {
+        let mut body = String::from("Prior pipeline stages produced:\n\n");
+        for (stage_role, text) in prior {
+            body.push_str(&format!("--- {stage_role} ---\n{text}\n\n"));
+        }
+        body.push_str(&format!(
+            "You are the '{role}' stage. Build on the prior stages' work to perform your role on the user's request."
+        ));
+        msgs.push(ChatMessage {
+            id: format!("role-stage-{role}"),
+            role: Role::User,
+            content: vec![ContentBlock::Text { text: body }],
+            created_at: 0,
+        });
+    }
+    msgs
+}
+
+/// Stream ONE model's response as ordinary `MessageDelta` events (Text +
+/// Reasoning), accumulating the answer text and final usage. Used for the
+/// synthesis pass and the final role stage — i.e. the streams the user sees as
+/// "the assistant's answer". Races `cancel` and `timeout`; on either, returns
+/// `Err` and the caller persists nothing (a partial synthesis is not a real
+/// answer). No tools are offered (a documented fan-out/synthesis ceiling).
+#[allow(clippy::too_many_arguments)]
+pub async fn stream_single(
+    provider: &Arc<dyn ModelProvider>,
+    model_id: &str,
+    session_id: &str,
+    system_prompt: Option<&str>,
+    max_tokens: u32,
+    messages: &[ChatMessage],
+    event_tx: &mpsc::Sender<ProtocolEvent>,
+    cancel: &CancellationToken,
+    timeout: Duration,
+) -> Result<(String, UsageStats), String> {
+    let mut text = String::new();
+    let mut usage = UsageStats::default();
+
+    let stream_fut = async {
+        let mut stream = provider
+            .stream_chat(model_id, system_prompt, max_tokens, messages, &[])
+            .await
+            .map_err(|e| e.to_string())?;
+        while let Some(ev) = stream.next().await {
+            match ev {
+                Ok(ProviderEvent::TextDelta(t)) => {
+                    text.push_str(&t);
+                    let _ = event_tx
+                        .send(ProtocolEvent::MessageDelta {
+                            session_id: session_id.to_string(),
+                            delta: DeltaPayload::Text { text: t },
+                        })
+                        .await;
+                }
+                Ok(ProviderEvent::ReasoningDelta(r)) => {
+                    let _ = event_tx
+                        .send(ProtocolEvent::MessageDelta {
+                            session_id: session_id.to_string(),
+                            delta: DeltaPayload::Reasoning { reasoning: r },
+                        })
+                        .await;
+                }
+                Ok(ProviderEvent::MessageStop { usage: u, .. }) => {
+                    usage = u;
+                    break;
+                }
+                Ok(_) => {}
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Ok::<(), String>(())
+    };
+
+    let result: Result<(), String> = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("cancelled".to_string()),
+        r = tokio::time::timeout(timeout, stream_fut) => match r {
+            Ok(inner) => inner,
+            Err(_elapsed) => Err("timeout".to_string()),
+        }
+    };
+    result?;
+    Ok((text, usage))
 }
 
 #[cfg(test)]
@@ -749,5 +911,153 @@ mod tests {
         assert_eq!(total.input_tokens, 30);
         assert_eq!(total.output_tokens, 12);
         assert_eq!(total.cost, 3.5);
+    }
+
+    #[test]
+    fn ordered_roles_uses_explicit_order_then_falls_back() {
+        let mut roles = BTreeMap::new();
+        roles.insert("reviewer".to_string(), "p/r".to_string());
+        roles.insert("architect".to_string(), "p/a".to_string());
+        roles.insert("implementer".to_string(), "p/i".to_string());
+
+        // Explicit order wins.
+        let cfg = OrchestrationConfig {
+            mode: OrchestrationMode::RoleBased,
+            roles: roles.clone(),
+            role_order: vec!["architect".into(), "implementer".into(), "reviewer".into()],
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_ok());
+        let order: Vec<String> = cfg.ordered_roles().into_iter().map(|(r, _)| r).collect();
+        assert_eq!(order, vec!["architect", "implementer", "reviewer"]);
+
+        // No explicit order → BTreeMap (alphabetical) fallback.
+        let cfg2 = OrchestrationConfig {
+            mode: OrchestrationMode::RoleBased,
+            roles,
+            ..Default::default()
+        };
+        let order2: Vec<String> = cfg2.ordered_roles().into_iter().map(|(r, _)| r).collect();
+        assert_eq!(order2, vec!["architect", "implementer", "reviewer"]);
+
+        // An unknown role in role_order is rejected by validate.
+        let bad = OrchestrationConfig {
+            mode: OrchestrationMode::RoleBased,
+            roles: cfg.roles.clone(),
+            role_order: vec!["ghost".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            bad.validate(),
+            Err(OrchestrationError::UnknownRole("ghost".into()))
+        );
+    }
+
+    #[test]
+    fn build_synthesis_messages_includes_request_and_all_candidates() {
+        use private_code_protocol::message::{ContentBlock, Role};
+        let msgs = build_synthesis_messages(
+            "fix the bug",
+            &[
+                ("modelA".into(), "answer A".into()),
+                ("modelB".into(), "answer B".into()),
+            ],
+        );
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, Role::User);
+        let ContentBlock::Text { text } = &msgs[0].content[0] else {
+            panic!("expected text block");
+        };
+        assert!(text.contains("fix the bug"));
+        assert!(text.contains("answer A") && text.contains("answer B"));
+        assert!(text.contains("modelA") && text.contains("modelB"));
+    }
+
+    #[test]
+    fn build_role_stage_messages_appends_prior_only_after_first_stage() {
+        let base = user_msg("do the task");
+        // First stage: base unchanged.
+        let first = build_role_stage_messages(&base, "architect", &[]);
+        assert_eq!(first.len(), base.len());
+        // Later stage: prior outputs appended as an extra user message.
+        let later = build_role_stage_messages(
+            &base,
+            "implementer",
+            &[("architect".into(), "the design".into())],
+        );
+        assert_eq!(later.len(), base.len() + 1);
+        use private_code_protocol::message::ContentBlock;
+        let ContentBlock::Text { text } = &later.last().unwrap().content[0] else {
+            panic!("expected text");
+        };
+        assert!(text.contains("the design") && text.contains("implementer"));
+    }
+
+    /// `stream_single` emits ordinary MessageDelta (Text) events and returns the
+    /// assembled text + usage — the path the synthesis / final answer uses.
+    #[tokio::test]
+    async fn stream_single_emits_message_deltas_and_returns_text() {
+        let provider: Arc<dyn ModelProvider> =
+            Arc::new(ScriptedProvider::one_shot_text("synthesized"));
+        let (tx, mut rx) = mpsc::channel(64);
+        let cancel = CancellationToken::new();
+        let msgs = user_msg("hi");
+
+        let (text, _usage) = stream_single(
+            &provider,
+            "m",
+            "sess",
+            None,
+            128,
+            &msgs,
+            &tx,
+            &cancel,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_eq!(text, "synthesized");
+
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ProtocolEvent::MessageDelta {
+                    delta: DeltaPayload::Text { text },
+                    ..
+                } if text == "synthesized"
+            )),
+            "synthesis streams as a normal MessageDelta, not a candidate event"
+        );
+        // It must NOT emit any candidate events.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, ProtocolEvent::CandidateDelta { .. })),
+            "the final/synthesis stream is the assistant answer, not a candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_single_honors_cancellation() {
+        let provider: Arc<dyn ModelProvider> = Arc::new(PendingProvider);
+        let (tx, _rx) = mpsc::channel(8);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let msgs = user_msg("hi");
+        let err = stream_single(
+            &provider,
+            "m",
+            "sess",
+            None,
+            128,
+            &msgs,
+            &tx,
+            &cancel,
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err, "cancelled");
     }
 }

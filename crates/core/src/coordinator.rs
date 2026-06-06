@@ -262,14 +262,34 @@ impl SessionCoordinator {
 
         // Route to the session's configured provider (default if unregistered).
         let provider = self.select_provider(&session_row.model_config);
-        let orchestrator = Arc::new(Orchestrator::new(
-            self.pool.clone(),
-            self.global_data_dir.clone(),
-            provider,
-            self.tool_registry.clone(),
-            permission_prompt_tx,
-            event_tx,
-        ));
+
+        // Build the id→provider map for multi-model orchestration: every registered
+        // named provider, PLUS the session's own selected provider keyed by its
+        // configured `provider_id` (so a fan-out candidate naming the session's own
+        // provider — e.g. "anthropic" — resolves even though the default provider
+        // is not otherwise in the named map). Fan-out resolves ONLY from this map;
+        // an unregistered provider fails that candidate honestly.
+        let mut orch_providers = self.providers.clone();
+        if let Some(pid) = serde_json::from_str::<serde_json::Value>(&session_row.model_config)
+            .ok()
+            .and_then(|v| v["provider_id"].as_str().map(str::to_string))
+        {
+            orch_providers
+                .entry(pid)
+                .or_insert_with(|| provider.clone());
+        }
+
+        let orchestrator = Arc::new(
+            Orchestrator::new(
+                self.pool.clone(),
+                self.global_data_dir.clone(),
+                provider,
+                self.tool_registry.clone(),
+                permission_prompt_tx,
+                event_tx,
+            )
+            .with_providers(orch_providers),
+        );
 
         // Large enough that a burst of ephemeral token deltas can't evict durable
         // events before a slow client's forwarder drains them. Lagged receivers are
@@ -2468,5 +2488,332 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
         coord2.shutdown(Duration::from_secs(5)).await;
+    }
+
+    // ── Multi-model orchestration: live end-to-end through the coordinator ──────
+
+    /// Helper: a project + a session whose `model_config` carries `orchestration`.
+    async fn create_orch_session(
+        pool: &sqlx::SqlitePool,
+        orchestration: serde_json::Value,
+    ) -> String {
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap().to_string();
+        // Leak the TempDir so the workspace path stays valid for the turn.
+        std::mem::forget(ws);
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(pool, &project_id, "t", &ws_str)
+            .await
+            .unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let cfg = serde_json::json!({
+            "provider_id": "anthropic",
+            "model_id": "claude-opus-4-8",
+            "orchestration": orchestration,
+        })
+        .to_string();
+        create_session(
+            pool,
+            &sid,
+            &project_id,
+            &ws_str,
+            &ws_str,
+            "t",
+            "build",
+            &cfg,
+        )
+        .await
+        .unwrap();
+        sid
+    }
+
+    async fn wait_for_completed_or_error(
+        rx: &mut broadcast::Receiver<ProtocolEvent>,
+    ) -> Option<ProtocolEvent> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(ev @ ProtocolEvent::MessageCompleted { .. }))
+                | Ok(Ok(ev @ ProtocolEvent::Error { .. })) => return Some(ev),
+                Ok(Ok(_)) => continue,
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => continue,
+            }
+        }
+        None
+    }
+
+    /// THE locking test (advisor's C9 #3): a real fan-out turn through the
+    /// coordinator with 3 scripted candidates + 1 synthesizer must persist EXACTLY
+    /// ONE durable assistant message (the synthesis) — no candidate rows in
+    /// `session_message`, no `Candidate*` in `sess.history` — and the synthesizer
+    /// must have genuinely received all three DISTINCT candidate outputs (catches a
+    /// silent provider-resolver fallback collapsing 3 models into 3× the default).
+    #[tokio::test]
+    async fn fan_out_turn_persists_one_synthesis_and_runs_distinct_models() {
+        use private_code_providers::testkit::ScriptedProvider;
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        let sid = create_orch_session(
+            &pool,
+            serde_json::json!({
+                "mode": "fan_out",
+                "candidates": ["c0/m0", "c1/m1", "c2/m2"],
+                "synthesizer": "synth/ms",
+            }),
+        )
+        .await;
+
+        let c0 = Arc::new(ScriptedProvider::one_shot_text("alpha-answer"));
+        let c1 = Arc::new(ScriptedProvider::one_shot_text("beta-answer"));
+        let c2 = Arc::new(ScriptedProvider::one_shot_text("gamma-answer"));
+        let synth = Arc::new(ScriptedProvider::one_shot_text("THE SYNTHESIZED ANSWER"));
+
+        let mut coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider), // default, unused here
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        coord.register_provider("c0", c0.clone());
+        coord.register_provider("c1", c1.clone());
+        coord.register_provider("c2", c2.clone());
+        coord.register_provider("synth", synth.clone());
+
+        let mut rx = coord.get_or_create_session(&sid).await.unwrap();
+        coord.run_turn(&sid, "fix the bug", "steer").await.unwrap();
+
+        let done = wait_for_completed_or_error(&mut rx).await;
+        assert!(
+            matches!(done, Some(ProtocolEvent::MessageCompleted { .. })),
+            "fan-out turn must complete with a durable MessageCompleted, got {done:?}"
+        );
+
+        // (a) session_message: exactly one user + one assistant row, no candidates.
+        let msgs = db::get_messages(&pool, &sid).await.unwrap();
+        let parsed: Vec<ChatMessage> = msgs
+            .iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .collect();
+        let users = parsed.iter().filter(|m| m.role == Role::User).count();
+        let assistants: Vec<&ChatMessage> = parsed
+            .iter()
+            .filter(|m| m.role == Role::Assistant)
+            .collect();
+        assert_eq!(users, 1, "exactly the one user prompt");
+        assert_eq!(
+            assistants.len(),
+            1,
+            "EXACTLY one assistant row — no per-candidate rows persisted"
+        );
+        // (c) the persisted assistant text is the synthesizer's output.
+        let text = assistants[0].content.iter().find_map(|c| match c {
+            ContentBlock::Text { text } => Some(text.clone()),
+            _ => None,
+        });
+        assert_eq!(text.as_deref(), Some("THE SYNTHESIZED ANSWER"));
+
+        // (b) sess.history: exactly one MessageCompleted, zero Candidate* events.
+        {
+            let map = coord.sessions.lock().await;
+            let hist = &map.get(&sid).unwrap().history;
+            let completed = hist
+                .iter()
+                .filter(|e| matches!(e, ProtocolEvent::MessageCompleted { .. }))
+                .count();
+            assert_eq!(completed, 1, "one durable MessageCompleted in history");
+            assert!(
+                !hist.iter().any(|e| matches!(
+                    e,
+                    ProtocolEvent::CandidateStarted { .. }
+                        | ProtocolEvent::CandidateDelta { .. }
+                        | ProtocolEvent::CandidateCompleted { .. }
+                )),
+                "no ephemeral candidate events may leak into the durable history"
+            );
+        }
+
+        // (d) all three DISTINCT candidate models actually ran...
+        assert_eq!(c0.call_count(), 1, "candidate c0 ran");
+        assert_eq!(c1.call_count(), 1, "candidate c1 ran");
+        assert_eq!(c2.call_count(), 1, "candidate c2 ran");
+        // ...and the synthesizer received all three distinct outputs.
+        let synth_calls = synth.calls();
+        assert_eq!(synth_calls.len(), 1, "synthesizer ran once");
+        let synth_input = synth_calls[0]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match c {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        for needle in ["alpha-answer", "beta-answer", "gamma-answer", "fix the bug"] {
+            assert!(
+                synth_input.contains(needle),
+                "synthesis prompt must contain '{needle}' (proves distinct candidates fed in)"
+            );
+        }
+
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// All fan-out candidates failing surfaces a durable `Error` and persists NO
+    /// assistant message (no synthesizing from empty text into a garbage row).
+    #[tokio::test]
+    async fn fan_out_turn_all_failed_emits_error_and_persists_nothing() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let sid = create_orch_session(
+            &pool,
+            serde_json::json!({
+                "mode": "fan_out",
+                "candidates": ["c0/m0", "c1/m1"],
+                "synthesizer": "synth/ms",
+            }),
+        )
+        .await;
+
+        let mut coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        // Both candidates error; the synthesizer is never reached.
+        coord.register_provider("c0", Arc::new(ErroringProvider));
+        coord.register_provider("c1", Arc::new(ErroringProvider));
+        coord.register_provider(
+            "synth",
+            Arc::new(private_code_providers::testkit::ScriptedProvider::one_shot_text("unused")),
+        );
+
+        let mut rx = coord.get_or_create_session(&sid).await.unwrap();
+        coord.run_turn(&sid, "do it", "steer").await.unwrap();
+
+        let done = wait_for_completed_or_error(&mut rx).await;
+        assert!(
+            matches!(done, Some(ProtocolEvent::Error { .. })),
+            "all-failed fan-out must surface a durable Error, got {done:?}"
+        );
+
+        let msgs = db::get_messages(&pool, &sid).await.unwrap();
+        let assistants = msgs
+            .iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .filter(|m| m.role == Role::Assistant)
+            .count();
+        assert_eq!(
+            assistants, 0,
+            "no assistant message persisted on total failure"
+        );
+
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// Role-based pipeline (no synthesizer): each stage runs in order feeding the
+    /// next; the FINAL stage is the durable answer (only-final-persists), while the
+    /// intermediate stage streams as an ephemeral `CandidateDelta`.
+    #[tokio::test]
+    async fn role_based_turn_persists_only_the_final_stage() {
+        use private_code_providers::testkit::ScriptedProvider;
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let sid = create_orch_session(
+            &pool,
+            serde_json::json!({
+                "mode": "role_based",
+                "roles": { "architect": "arch/m", "implementer": "impl/m" },
+                "role_order": ["architect", "implementer"],
+            }),
+        )
+        .await;
+
+        let architect = Arc::new(ScriptedProvider::one_shot_text("THE DESIGN"));
+        let implementer = Arc::new(ScriptedProvider::one_shot_text("THE CODE"));
+
+        let mut coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        coord.register_provider("arch", architect.clone());
+        coord.register_provider("impl", implementer.clone());
+
+        let mut rx = coord.get_or_create_session(&sid).await.unwrap();
+        // Collect events so we can assert the intermediate stage streamed as a candidate.
+        coord
+            .run_turn(&sid, "build a feature", "steer")
+            .await
+            .unwrap();
+
+        let mut saw_candidate_delta = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut completed = false;
+        while tokio::time::Instant::now() < deadline && !completed {
+            match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                Ok(Ok(ProtocolEvent::CandidateDelta {
+                    candidate_index: 0, ..
+                })) => {
+                    saw_candidate_delta = true;
+                }
+                Ok(Ok(ProtocolEvent::MessageCompleted { .. })) => completed = true,
+                Ok(Ok(_)) => {}
+                Ok(Err(broadcast::error::RecvError::Lagged(_))) => {}
+                Ok(Err(_)) => break,
+                Err(_) => {}
+            }
+        }
+        assert!(
+            completed,
+            "role pipeline must complete with a MessageCompleted"
+        );
+        assert!(
+            saw_candidate_delta,
+            "the intermediate (architect) stage streams as an ephemeral candidate"
+        );
+
+        // The implementer (final stage) ran with the architect's output in context.
+        let impl_calls = implementer.calls();
+        assert_eq!(impl_calls.len(), 1);
+        let impl_input = impl_calls[0]
+            .messages
+            .iter()
+            .flat_map(|m| m.content.iter())
+            .filter_map(|c| match c {
+                ContentBlock::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            impl_input.contains("THE DESIGN"),
+            "final stage must see the prior stage's output"
+        );
+
+        // Only the final stage persisted.
+        let msgs = db::get_messages(&pool, &sid).await.unwrap();
+        let assistants: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| serde_json::from_str::<ChatMessage>(&m.data).ok())
+            .filter(|m| m.role == Role::Assistant)
+            .flat_map(|m| m.content)
+            .filter_map(|c| match c {
+                ContentBlock::Text { text } => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            assistants,
+            vec!["THE CODE".to_string()],
+            "only the final role stage persists as the durable answer"
+        );
+
+        coord.shutdown(Duration::from_secs(5)).await;
     }
 }

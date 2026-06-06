@@ -29,6 +29,32 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 
 Dependency order: C0 → C1 → {C2,C3,C4} → C5,C6 → {C7,C8,C9} → C10 → {C11,C12,C13} → {C14,C15} → C16
 
+## Phase 4: Moat & Differentiators (in progress)
+
+| Cluster | Title | Status |
+|---|---|---|
+| P4-C1 | codeintel crate: tree-sitter Rust SymbolExtractor + lazy LanguageRegistry | ✅ done |
+| P4-C2 | FTS5 `symbols` index + bm25 search (migration + core layer) | ✅ done |
+| P4-C3 | workspace file walker (ignore crate) + size limit | ✅ done |
+| P4-C4 | RepoMap generator + code/repomap ContextSource + retrieval | ✅ done |
+| P4-C5 | nucleo fuzzy search + background (rayon) indexing | ✅ done |
+| P4-C6 | incremental re-index via notify-debouncer-full watcher | ✅ done |
+| P4-C7 | widen code-intel to 9 languages (parallel fan-out) | ✅ done |
+| P4-C8 | multi-model orchestration: config + parallel fan-out engine | ✅ done |
+| P4-C9 | orchestration: synthesis pass + role-based routing + live turn integration | ✅ done |
+| P4-C10 | GUI: comparison/merge + checkpoint history | ⏳ headless ceiling |
+| P4-C11 | Phase-4 verification + benches + adversarial review | ⏳ pending |
+
+### C8/C9 multi-model orchestration — honesty log
+
+- **CRITICAL invariant (carried from C8).** The three `Candidate{Started,Delta,Completed}` events are EPHEMERAL and excluded from `is_durable_event`. A fan-out turn emits N×hundreds of `CandidateDelta`s; if durable they would evict the real durable events (`MessageCompleted`/`Error`/`ToolPermissionRequired`) from the 1000-cap `sess.history` in a single turn, re-breaking the Phase-3 lag-recovery / cold-reconnect fix. Locked by `candidate_events_are_ephemeral_only_synthesis_persists` (function-level) AND the live end-to-end `fan_out_turn_persists_one_synthesis_and_runs_distinct_models` (asserts one assistant row, zero candidate rows in `session_message`, zero `Candidate*` in `sess.history`).
+- **Honest provider resolution (advisor-caught).** Fan-out resolves candidate/synthesizer providers ONLY from the registered id→provider map; an unregistered provider fails THAT candidate (`CandidateCompleted{error}`) and proceed-on-partial-failure excludes it — it never silently falls back to the default model (which would run the wrong model and mislabel it in the `CandidateStarted{model_id}` stream). The coordinator also registers the session's own selected provider under its `provider_id` so a candidate naming the session's provider resolves. The single-model path keeps its silent default fallback (correct there).
+- **Ceiling — no tool loop in fan-out/synthesis.** Candidates and the synthesizer run with `tools: &[]` (matches plan 4.9/4.10). A multi-model turn produces an answer, not tool-executing agent work. Real limitation for a coding agent; the single-model path is the tool-using path.
+- **Ceiling — no proactive compaction in orchestrated turns.** The fan-out/role path skips the context-window estimate + compaction the single-model loop does. A very long conversation could overflow a candidate's window; unhandled in C9.
+- **Decision — synthesis system prompt.** The synthesizer runs under `DEFAULT_SYNTHESIS_SYSTEM_PROMPT` (a meta "merge these answers" instruction), NOT the session's agent baseline. Deliberate (synthesis is a meta task); documented so it's not mistaken for a bug.
+- **Decision — role-based final deliverable.** Sequential pipeline with EXPLICIT `role_order` (relying on `BTreeMap` key order is a documented fallback, flagged as a latent bug). Each stage sees the original prompt + prior stage outputs and streams as ephemeral `Candidate{index=stage}`. With no `synthesizer`, the FINAL stage is the durable answer (only-final-persists); with a `synthesizer`, every stage is intermediate and the synthesis produces the durable answer. Cancel mid-synthesis/final persists NOTHING (a partial synthesis is not a real answer — cleaner than the single-model path's persist-partial).
+- **Live BYOK ceiling.** Verified with `ScriptedProvider`s via `register_provider` (3 candidates + 1 synthesizer, role pipelines, all-failed → durable `Error`). Production runs only Anthropic (default) + NVIDIA (named); a true 3-distinct-vendor fan-out needs additional BYOK keys + registered providers (human/runtime config), not code.
+
 ## Phase-1 adversarial review (done)
 Workflow `phase1-adversarial-review` (13 agents) confirmed 6 real bugs in C1–C5; all fixed:
 1. **(critical)** compaction summary prepended as a leading inline `role:"system"` → Anthropic 400 (can't be messages[0]; rejected on non-opus). Fixed: anthropic.rs now gates inline system on opus+valid-position and otherwise wraps as a `<system-update>` user message (reference-grounded `lower_messages`).
