@@ -42,3 +42,11 @@ criterion.workspace = true
 name = "symbol_search"
 harness = false
 
+[[bench]]
+name = "reindex"
+harness = false
+
+[[bench]]
+name = "repomap_gen"
+harness = false
+

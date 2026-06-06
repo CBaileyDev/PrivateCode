@@ -66,7 +66,14 @@ Dependency order: C0 → C1 → {C2,C3,C4} → C5,C6 → {C7,C8,C9} → C10 → 
 
 ## Phase-4 adversarial review (C11 boundary gate)
 
-Workflow `p4-adversarial-review` (17 agents: 5 review dimensions → independent skeptic per finding → triage synthesis) confirmed **10 distinct findings** after adversarial verification (severities are the post-attack verdicts; one bug was reported by two dimensions). **No critical, data-loss, or security defects.** All 10 fixed in C11; each fix carries a regression test. Verification targets per plan 4.14 are met by existing benches/tests (symbol search ~9.8ms over 200k via `benches/symbol_search`; fan-out parallel-dispatch + synthesis by the C9 coordinator tests; revert round-trip by `session_ops_compact_and_revert_unrevert_round_trip`).
+Workflow `p4-adversarial-review` (17 agents: 5 review dimensions → independent skeptic per finding → triage synthesis) confirmed **10 distinct findings** after adversarial verification (severities are the post-attack verdicts; one bug was reported by two dimensions). **No critical, data-loss, or security defects.** All 10 fixed in C11; each fix carries a regression test.
+
+**Plan 4.14 verification — measured (criterion, release, dev machine), not asserted:**
+- Symbol search over 200k symbols < 50ms → **~9.8ms** (`benches/symbol_search`). ✅
+- Incremental re-index of one file < 100ms → **~3.1ms** (`benches/reindex`, full read+parse+extract+FTS5 delete-then-insert). ✅
+- Repo-map generation for a 10k-file project < 2s → **~133ms** (`benches/repomap_gen`, full DB-read + rank + render). ✅
+- Multi-model fan-out: parallel dispatch + all candidates complete + synthesis → the C9 coordinator E2E (`fan_out_turn_persists_one_synthesis_and_runs_distinct_models`, with a `BarrierProvider` concurrency proof in `orchestration` unit tests). ✅
+- Checkpoint revert clean rollback → `session_ops_compact_and_revert_unrevert_round_trip`. ✅
 
 - **H1 (the one user-reachable bug) — malformed `orchestration` config silently demoted to a single-model turn.** `run_session_turn` parsed the block with `.ok().unwrap_or_default()`, swallowing any deserialize error → default `Single` → ordinary turn, no diagnostic, billed as one model. FIX: a present-but-unparseable block now emits the same loud non-retryable `orchestration_config_invalid` Error as the `validate()` path; added `#[serde(deny_unknown_fields)]` so a typo'd field name (e.g. `synthezizer`) is rejected too. Tests: `mode_accepts_kebab_alias_and_rejects_unknown_variant_or_field`, `malformed_orchestration_config_errors_not_silently_single_model`.
 - **L1 — doc/code mode-casing mismatch.** Docs use `"fan-out"`/`"role-based"` (kebab); the enum is snake_case. FIX: `#[serde(alias = "fan-out"/"role-based")]` so the documented form works alongside the canonical one.
@@ -77,6 +84,8 @@ Workflow `p4-adversarial-review` (17 agents: 5 review dimensions → independent
 - **M5 — `ComparisonView` global keydown hijacked the composer.** The window listener stole arrow keys and clobbered the clipboard on `m`/Enter while typing (panes persist after a turn). FIX: an editable-target guard (`INPUT`/`TEXTAREA`/contenteditable) early-returns. Verified by typecheck/build (interaction is the headless ceiling).
 - **L3 — repomap could overflow the token budget ~50-80×.** The first (richest) file block was emitted unconditionally with no intra-block cap. FIX: every block (including the first) is bounded to the remaining budget with per-file symbol truncation. Test `single_large_file_does_not_overflow_the_budget`.
 - **L4 — `index_workspace` aborted the whole walk on one `index_file` error.** FIX: per-file persistence errors are now logged and skipped (best-effort), matching the read/parse skip-and-continue.
+
+**Follow-ups logged (advisor, not fixed in C11):** (1) **`Error` events have no visible UI surface** — `messages.ts`'s `error` case only `console.error`s + clears the spinner. So H1's now-loud `orchestration_config_invalid` (and every other `Error`) clears the spinner and shows the user *nothing*. The engine fix is correct; surfacing errors in the GUI is a separate, broader UI task (all `Error` events share this gap). (2) **`deny_unknown_fields` is a forward-compat tradeoff** — an unknown field in the `orchestration` block now hard-fails the turn rather than being ignored. Intended strictness for a local single-binary tool (no cross-version config exchange), noted so it's a deliberate call.
 
 ## Phase-1 adversarial review (done)
 Workflow `phase1-adversarial-review` (13 agents) confirmed 6 real bugs in C1–C5; all fixed:
