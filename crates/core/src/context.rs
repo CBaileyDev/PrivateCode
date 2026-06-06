@@ -254,6 +254,71 @@ pub enum Reconcile {
     ReplacementBlocked,
 }
 
+// 4. code/repomap (Phase 4) — a structural overview from the symbol index,
+// injected so its updates ride the same context-epoch machinery as the rest.
+pub struct RepoMapSource {
+    pool: SqlitePool,
+    token_budget: usize,
+}
+
+impl RepoMapSource {
+    pub fn new(pool: SqlitePool, token_budget: usize) -> Self {
+        Self { pool, token_budget }
+    }
+}
+
+#[async_trait]
+impl ContextSource for RepoMapSource {
+    fn key(&self) -> &str {
+        "code/repomap"
+    }
+
+    async fn load(&self, _workspace_path: &Path, _active_dir: &Path) -> SourceLoad {
+        // The index stores workspace-relative paths, so no root is needed here.
+        match crate::repomap::generate(&self.pool, self.token_budget).await {
+            Ok(map) => SourceLoad::Loaded(serde_json::Value::String(map)),
+            Err(e) => {
+                tracing::warn!("code/repomap: failed to generate from index: {e}");
+                SourceLoad::Unavailable
+            }
+        }
+    }
+
+    fn compare(&self, previous: &serde_json::Value, current: &serde_json::Value) -> SourceCompare {
+        if previous == current {
+            SourceCompare::Unchanged
+        } else {
+            SourceCompare::Updated
+        }
+    }
+
+    fn encode(&self, value: &serde_json::Value) -> serde_json::Value {
+        value.clone()
+    }
+
+    fn render_baseline(&self, current: &serde_json::Value) -> String {
+        let map = current.as_str().unwrap_or_default();
+        if map.trim().is_empty() {
+            String::new()
+        } else {
+            format!("Repository structure (symbols):\n{map}")
+        }
+    }
+
+    fn render_update(&self, _previous: &serde_json::Value, current: &serde_json::Value) -> String {
+        let map = current.as_str().unwrap_or_default();
+        if map.trim().is_empty() {
+            "The repository structure index is now empty.".to_string()
+        } else {
+            format!("Repository structure updated:\n{map}")
+        }
+    }
+
+    fn render_removal(&self, _previous: &serde_json::Value) -> Option<String> {
+        None
+    }
+}
+
 pub struct SystemContextRegistry {
     sources: Vec<Box<dyn ContextSource>>,
 }
@@ -273,6 +338,12 @@ impl Default for SystemContextRegistry {
 impl SystemContextRegistry {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Append an extra context source (e.g. [`RepoMapSource`]) beyond the
+    /// built-in date/environment/instructions set.
+    pub fn register(&mut self, source: Box<dyn ContextSource>) {
+        self.sources.push(source);
     }
 
     pub async fn reconcile(
@@ -464,6 +535,70 @@ mod tests {
         connect_db, create_project, create_session, insert_context_epoch, run_migrations,
     };
     use uuid::Uuid;
+
+    /// The full Phase-4 vertical slice: index a workspace (walk→extract→FTS5),
+    /// register the `code/repomap` source, and confirm the rendered structure
+    /// lands in the epoch baseline via the same reconcile machinery as the
+    /// built-in sources.
+    #[tokio::test]
+    async fn repomap_source_injects_structure_into_the_baseline() {
+        use crate::indexer::index_workspace;
+        use tempfile::TempDir;
+
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+
+        let ws = TempDir::new().unwrap();
+        let root = ws.path();
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/config.rs"),
+            "pub struct AppConfig {}\nimpl AppConfig { pub fn load() {} }\n",
+        )
+        .unwrap();
+
+        let project_id = Uuid::new_v4().to_string();
+        let session_id = Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", root.to_string_lossy().as_ref())
+            .await
+            .unwrap();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            root.to_string_lossy().as_ref(),
+            root.to_string_lossy().as_ref(),
+            "s",
+            "build",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        index_workspace(&pool, root).await.unwrap();
+
+        let mut registry = SystemContextRegistry::new();
+        registry.register(Box::new(RepoMapSource::new(
+            pool.clone(),
+            crate::repomap::DEFAULT_REPOMAP_TOKEN_BUDGET,
+        )));
+
+        let baseline = match registry
+            .reconcile(&pool, &session_id, root, root)
+            .await
+            .unwrap()
+        {
+            Reconcile::ReplacementReady { baseline, .. } => baseline,
+            other => panic!("expected ReplacementReady, got {other:?}"),
+        };
+        assert!(
+            baseline.contains("Repository structure (symbols):"),
+            "repo map must be in the baseline:\n{baseline}"
+        );
+        assert!(baseline.contains("src/config.rs"));
+        assert!(baseline.contains("struct AppConfig"));
+        assert!(baseline.contains("fn load()"));
+    }
 
     #[tokio::test]
     async fn test_context_reconciliation() {

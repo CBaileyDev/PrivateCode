@@ -1,8 +1,11 @@
 pub mod checkpoint;
+pub mod code_context;
 pub mod config;
 pub mod context;
 pub mod coordinator;
 pub mod db;
+pub mod indexer;
 pub mod orchestrator;
 pub mod permissions;
+pub mod repomap;
 pub mod symbols;

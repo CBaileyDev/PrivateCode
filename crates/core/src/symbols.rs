@@ -116,6 +116,49 @@ pub async fn rebuild_fts(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// All indexed symbols, ordered by `(filepath, start_line)` — the natural order
+/// for the structural repo map (parents precede their methods within a file).
+pub async fn all_symbols(pool: &SqlitePool) -> Result<Vec<Symbol>, sqlx::Error> {
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            String,
+            String,
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            String,
+            Option<String>,
+        ),
+    >(
+        "SELECT symbol_uid, filepath, name, kind, start_line, start_column, end_line, end_column, \
+                signature, parent_scope \
+         FROM symbols ORDER BY filepath, start_line",
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(
+            |(symbol_uid, filepath, name, kind, sl, sc, el, ec, signature, parent_scope)| Symbol {
+                symbol_uid,
+                filepath,
+                name,
+                kind,
+                start_line: sl as u32,
+                start_column: sc as u32,
+                end_line: el as u32,
+                end_column: ec as u32,
+                signature,
+                parent_scope,
+            },
+        )
+        .collect())
+}
+
 /// Turn an arbitrary query string into a safe FTS5 prefix query: split on
 /// non-alphanumerics and emit `term*` per token (AND-joined). Stripping to
 /// alphanumerics means no token can contain an FTS5 operator/quote, so the
