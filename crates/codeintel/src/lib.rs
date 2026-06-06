@@ -13,10 +13,12 @@
 mod extract;
 mod registry;
 mod symbol;
+mod walk;
 
 pub use extract::SymbolExtractor;
 pub use registry::{LangDef, LanguageRegistry};
 pub use symbol::Symbol;
+pub use walk::{DEFAULT_MAX_FILE_SIZE, EntryType, WalkEntry, WalkOptions, walk};
 
 #[cfg(test)]
 mod spikes {

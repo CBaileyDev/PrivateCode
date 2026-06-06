@@ -4077,7 +4077,9 @@ dependencies = [
 name = "private-code-codeintel"
 version = "0.1.0"
 dependencies = [
+ "ignore",
  "serde",
+ "tempfile",
  "tracing",
  "tree-sitter",
  "tree-sitter-rust",
