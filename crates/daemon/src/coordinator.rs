@@ -156,20 +156,29 @@ impl SessionCoordinator {
         &self,
         session_id: &str,
     ) -> Result<broadcast::Receiver<ProtocolEvent>, Box<dyn std::error::Error>> {
-        let mut sessions = self.sessions.lock().await;
-        if let Some(sess) = sessions.get_mut(session_id) {
-            sess.last_activity = std::time::Instant::now();
-            return Ok(sess.event_tx.subscribe());
+        // Fast path: the session is already live. Touch activity and subscribe.
+        {
+            let mut sessions = self.sessions.lock().await;
+            if let Some(sess) = sessions.get_mut(session_id) {
+                sess.last_activity = std::time::Instant::now();
+                return Ok(sess.event_tx.subscribe());
+            }
         }
 
-        // Fetch session row from db to make sure it exists
+        // Slow path with the sessions Mutex RELEASED — never hold it across the DB
+        // await below (that would block event routing and every other session's
+        // operations). Verify the session exists in the DB.
         let session_row = match db::get_session(&self.pool, session_id).await? {
             Some(row) => row,
             None => return Err(format!("Session {} not found in database", session_id).into()),
         };
 
-        let (permission_prompt_tx, mut permission_prompt_rx) = mpsc::channel(100);
-        let (event_tx, mut event_rx) = mpsc::channel(4096);
+        // Build the channels, orchestrator, and ActiveSession speculatively. This is
+        // all synchronous — no await, and CRUCIALLY no task spawn yet. If we lose the
+        // double-check below we simply drop this; because nothing was spawned there
+        // is nothing to tear down.
+        let (permission_prompt_tx, permission_prompt_rx) = mpsc::channel(100);
+        let (event_tx, event_rx) = mpsc::channel(4096);
 
         let orchestrator = Arc::new(Orchestrator::new(
             self.pool.clone(),
@@ -206,7 +215,19 @@ impl SessionCoordinator {
             last_activity: std::time::Instant::now(),
         };
 
-        // Spawn event routing task (ends on session_cancel or when the sender closes).
+        // Re-acquire the lock and double-check: another caller may have created the
+        // session while our DB await ran. If so, return the winner's subscription
+        // and drop our un-spawned build (its channels just close).
+        let mut sessions = self.sessions.lock().await;
+        if let Some(sess) = sessions.get_mut(session_id) {
+            sess.last_activity = std::time::Instant::now();
+            return Ok(sess.event_tx.subscribe());
+        }
+
+        // We won the race. Spawn the router tasks NOW (synchronous spawns — safe
+        // under the lock since there is no await between lock and spawn), then
+        // insert and hand back the subscription.
+        let mut event_rx = event_rx;
         let session_id_str = session_id.to_string();
         let sessions_clone = self.sessions.clone();
         let b_tx_clone = b_tx.clone();
@@ -247,6 +268,7 @@ impl SessionCoordinator {
         });
 
         // Spawn permission routing task (ends on session_cancel or sender close).
+        let mut permission_prompt_rx = permission_prompt_rx;
         let session_id_str2 = session_id.to_string();
         let sessions_clone2 = self.sessions.clone();
         let perm_cancel = session_cancel.clone();
@@ -1005,6 +1027,82 @@ mod tests {
             !pending.iter().any(|i| i.prompt == "first"),
             "the active turn's input was promoted before it parked"
         );
+        coord.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// `get_or_create_session` releases the sessions Mutex across its DB await, so
+    /// concurrent callers for the SAME id race to create it. The relock +
+    /// double-check must collapse them to exactly ONE live session (no duplicate
+    /// insert, no orphan router tasks), and every caller must get a working
+    /// subscription to that one session's broadcast.
+    #[tokio::test]
+    async fn concurrent_get_or_create_collapses_to_one_session() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(&pool, &sid, &project_id, ws_str, ws_str, "t", "build", &cfg)
+            .await
+            .unwrap();
+
+        let coord = Arc::new(SessionCoordinator::new(
+            pool,
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        ));
+
+        // Fire many concurrent get_or_create for the same id.
+        let mut handles = Vec::new();
+        for _ in 0..16 {
+            let c = coord.clone();
+            let s = sid.clone();
+            // Map the (non-Send) Box<dyn Error> to String so the JoinHandle is Send.
+            handles.push(tokio::spawn(async move {
+                c.get_or_create_session(&s).await.map_err(|e| e.to_string())
+            }));
+        }
+        let mut receivers = Vec::new();
+        for h in handles {
+            receivers.push(h.await.unwrap().expect("get_or_create must succeed"));
+        }
+
+        // Exactly one live session exists despite the race.
+        {
+            let map = coord.sessions.lock().await;
+            assert_eq!(map.len(), 1, "the race must collapse to a single session");
+        }
+
+        // Every subscription is wired to that one session: a single turn's durable
+        // MessageCompleted reaches all 16 receivers.
+        coord.run_turn(&sid, "hi", "queue").await.unwrap();
+        for mut rx in receivers {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            let mut got = false;
+            while tokio::time::Instant::now() < deadline {
+                match tokio::time::timeout(Duration::from_millis(500), rx.recv()).await {
+                    Ok(Ok(ProtocolEvent::MessageCompleted { .. })) => {
+                        got = true;
+                        break;
+                    }
+                    Ok(Ok(_)) => continue,
+                    Ok(Err(_)) => break,
+                    Err(_) => continue,
+                }
+            }
+            assert!(
+                got,
+                "each racing subscriber must receive the shared turn's completion"
+            );
+        }
+
         coord.shutdown(Duration::from_secs(5)).await;
     }
 }
