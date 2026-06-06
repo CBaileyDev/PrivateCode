@@ -1,6 +1,9 @@
 pub mod anthropic;
 pub mod provider;
 
+#[cfg(feature = "testkit")]
+pub mod testkit;
+
 pub use anthropic::AnthropicProvider;
 pub use provider::{ModelProvider, ProviderError, ProviderEvent, resolve_api_key};
 

@@ -9,7 +9,7 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | Cluster | Title | Status |
 |---|---|---|
 | C0 | Repo hygiene + CI + supply-chain foundation | ✅ done |
-| C1 | Provider parser extraction + base_url DI + testkit | ⬜ pending |
+| C1 | Provider parser extraction + base_url DI + testkit | ✅ done |
 | C2 | SSE-byte replay harness + edit/patch property tests | ⬜ pending |
 | C3 | Phase-1 orchestrator correctness bugs | ⬜ pending |
 | C4 | Git-backed E2E turn + reconcile-arms + compaction impl | ⬜ pending |

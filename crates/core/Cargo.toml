@@ -29,4 +29,8 @@ ignore.workspace = true
 tempfile.workspace = true
 futures-util.workspace = true
 
+[dev-dependencies]
+# Re-declare the providers crate with the testkit feature so core's tests can
+# use ScriptedProvider / SSE replay (off in normal lib builds).
+private-code-providers = { workspace = true, features = ["testkit"] }
 

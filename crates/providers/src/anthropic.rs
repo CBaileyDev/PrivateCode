@@ -5,17 +5,27 @@ use private_code_protocol::event::UsageStats;
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role};
 use serde::Serialize;
 use std::collections::HashMap;
+use std::sync::OnceLock;
+
+/// Default Anthropic API base. Overridable per-instance (tests / proxies) via
+/// [`AnthropicProvider::with_base_url`] or the `PRIVATE_CODE_ANTHROPIC_BASE_URL`
+/// environment variable.
+const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: std::sync::OnceLock<String>,
+    api_key: OnceLock<String>,
+    base_url: String,
 }
 
 impl Default for AnthropicProvider {
     fn default() -> Self {
+        let base_url = std::env::var("PRIVATE_CODE_ANTHROPIC_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Self {
             client: reqwest::Client::new(),
-            api_key: std::sync::OnceLock::new(),
+            api_key: OnceLock::new(),
+            base_url,
         }
     }
 }
@@ -23,6 +33,17 @@ impl Default for AnthropicProvider {
 impl AnthropicProvider {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Construct a provider pointed at a specific base URL (e.g. a local mock
+    /// server in tests, or a corporate proxy). The path `/v1/messages` is
+    /// appended to this base.
+    pub fn with_base_url(base_url: impl Into<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            api_key: OnceLock::new(),
+            base_url: base_url.into(),
+        }
     }
 
     /// Resolve the Anthropic API key once and cache it (keyring → env fallback),
@@ -55,6 +76,175 @@ struct AnthropicRequest {
     tools: Option<Vec<serde_json::Value>>,
 }
 
+/// Mutable decode state for the Anthropic `/v1/messages` SSE stream. One per
+/// turn. Carries the in-flight tool-call accumulators, running token counters,
+/// the captured stop_reason, and the per-model price table so cost can be
+/// computed at `message_stop`.
+pub struct SseState {
+    /// content-block index -> (tool_use id, name, accumulated input JSON).
+    active_tool_uses: HashMap<usize, (String, String, String)>,
+    input_tokens: i64,
+    cache_read_tokens: i64,
+    cache_write_tokens: i64,
+    output_tokens: i64,
+    reasoning_tokens: i64,
+    finish_reason: Option<String>,
+    price_in: f64,
+    price_out: f64,
+    price_cr: f64,
+    price_cw: f64,
+}
+
+impl SseState {
+    /// Initialize decode state, seeding the price table from the model id.
+    pub fn new(model_id: &str) -> Self {
+        let (price_in, price_out, price_cr, price_cw) = price_per_mtok(model_id);
+        Self {
+            active_tool_uses: HashMap::new(),
+            input_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
+            output_tokens: 0,
+            reasoning_tokens: 0,
+            finish_reason: None,
+            price_in,
+            price_out,
+            price_cr,
+            price_cw,
+        }
+    }
+}
+
+/// Decode a single Anthropic SSE event (already parsed to JSON), advancing
+/// `state` and optionally yielding a [`ProviderEvent`]. This is the single
+/// source of truth for the wire state machine: the live `stream_chat` and the
+/// offline replay harness (`testkit::parse_sse_to_events`) both call it, so the
+/// tool-index map, input_json accumulation, usage/cost math and stop_reason are
+/// exercised identically online and offline.
+pub fn parse_anthropic_event(
+    val: &serde_json::Value,
+    state: &mut SseState,
+) -> Result<Option<ProviderEvent>, ProviderError> {
+    let typ = val["type"].as_str().unwrap_or_default();
+
+    match typ {
+        "message_start" => {
+            if let Some(usage) = val["message"]["usage"].as_object() {
+                state.input_tokens += usage
+                    .get("input_tokens")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0);
+                state.cache_read_tokens += usage
+                    .get("cache_read_input_tokens")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0);
+                state.cache_write_tokens += usage
+                    .get("cache_creation_input_tokens")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0);
+            }
+            Ok(None)
+        }
+        "content_block_start" => {
+            let index = val["index"].as_u64().unwrap_or(0) as usize;
+            let block_type = val["content_block"]["type"].as_str().unwrap_or_default();
+            if block_type == "tool_use" {
+                let id = val["content_block"]["id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let name = val["content_block"]["name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                state
+                    .active_tool_uses
+                    .insert(index, (id.clone(), name.clone(), String::new()));
+                Ok(Some(ProviderEvent::ToolUseStart { id, name }))
+            } else {
+                Ok(None)
+            }
+        }
+        "content_block_delta" => {
+            let index = val["index"].as_u64().unwrap_or(0) as usize;
+            let delta_type = val["delta"]["type"].as_str().unwrap_or_default();
+            if delta_type == "text_delta" {
+                let text = val["delta"]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(Some(ProviderEvent::TextDelta(text)))
+            } else if delta_type == "thinking_delta" {
+                let thinking = val["delta"]["thinking"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                Ok(Some(ProviderEvent::ReasoningDelta(thinking)))
+            } else if delta_type == "input_json_delta" {
+                let partial = val["delta"]["partial_json"].as_str().unwrap_or_default();
+                if let Some((id, _, acc)) = state.active_tool_uses.get_mut(&index) {
+                    acc.push_str(partial);
+                    Ok(Some(ProviderEvent::ToolUseDelta {
+                        id: id.clone(),
+                        input_delta: partial.to_string(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(None)
+            }
+        }
+        "content_block_stop" => {
+            let index = val["index"].as_u64().unwrap_or(0) as usize;
+            if let Some((id, name, acc)) = state.active_tool_uses.remove(&index) {
+                let parsed_input: serde_json::Value =
+                    serde_json::from_str(&acc).unwrap_or_else(|_| serde_json::json!({}));
+                Ok(Some(ProviderEvent::ToolUseComplete {
+                    id,
+                    name,
+                    input: parsed_input,
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+        "message_delta" => {
+            if let Some(usage) = val["usage"].as_object() {
+                state.output_tokens += usage
+                    .get("output_tokens")
+                    .and_then(|t| t.as_i64())
+                    .unwrap_or(0);
+            }
+            if let Some(reason) = val["delta"]["stop_reason"].as_str() {
+                state.finish_reason = Some(reason.to_string());
+            }
+            Ok(None)
+        }
+        "message_stop" => {
+            let cost = (state.input_tokens as f64 * state.price_in
+                + state.cache_read_tokens as f64 * state.price_cr
+                + state.cache_write_tokens as f64 * state.price_cw
+                + state.output_tokens as f64 * state.price_out)
+                / 1_000_000.0;
+
+            let stats = UsageStats {
+                input_tokens: state.input_tokens,
+                output_tokens: state.output_tokens,
+                cache_read_tokens: state.cache_read_tokens,
+                cache_write_tokens: state.cache_write_tokens,
+                reasoning_tokens: state.reasoning_tokens,
+                cost,
+            };
+            Ok(Some(ProviderEvent::MessageStop {
+                usage: stats,
+                finish_reason: state.finish_reason.clone(),
+            }))
+        }
+        _ => Ok(None),
+    }
+}
+
 use async_trait::async_trait;
 
 #[async_trait]
@@ -68,7 +258,6 @@ impl ModelProvider for AnthropicProvider {
         tools: &[serde_json::Value],
     ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
         let api_key = self.resolve_key()?;
-        let (price_in, price_out, price_cr, price_cw) = price_per_mtok(model_id);
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "x-api-key",
@@ -183,9 +372,10 @@ impl ModelProvider for AnthropicProvider {
             },
         };
 
+        let url = format!("{}/v1/messages", self.base_url.trim_end_matches('/'));
         let response = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(&url)
             .headers(headers)
             .json(&request_payload)
             .send()
@@ -206,14 +396,7 @@ impl ModelProvider for AnthropicProvider {
         }
 
         let stream = response.bytes_stream().eventsource();
-
-        // State variables for stream parsing
-        let mut active_tool_uses: HashMap<usize, (String, String, String)> = HashMap::new(); // index -> (id, name, accumulated_json)
-        let mut input_tokens = 0;
-        let mut cache_read_tokens = 0;
-        let mut cache_write_tokens = 0;
-        let mut output_tokens = 0;
-        let mut finish_reason: Option<String> = None;
+        let mut state = SseState::new(model_id);
 
         let parsed_stream = stream
             .map(move |event_res| {
@@ -221,125 +404,8 @@ impl ModelProvider for AnthropicProvider {
                     Ok(e) => e,
                     Err(err) => return Err(ProviderError::Other(err.to_string())),
                 };
-
                 let val: serde_json::Value = serde_json::from_str(&event.data)?;
-                let typ = val["type"].as_str().unwrap_or_default();
-
-                match typ {
-                    "message_start" => {
-                        if let Some(usage) = val["message"]["usage"].as_object() {
-                            input_tokens += usage
-                                .get("input_tokens")
-                                .and_then(|t| t.as_i64())
-                                .unwrap_or(0);
-                            cache_read_tokens += usage
-                                .get("cache_read_input_tokens")
-                                .and_then(|t| t.as_i64())
-                                .unwrap_or(0);
-                            cache_write_tokens += usage
-                                .get("cache_creation_input_tokens")
-                                .and_then(|t| t.as_i64())
-                                .unwrap_or(0);
-                        }
-                        Ok(None)
-                    }
-                    "content_block_start" => {
-                        let index = val["index"].as_u64().unwrap_or(0) as usize;
-                        let block_type = val["content_block"]["type"].as_str().unwrap_or_default();
-                        if block_type == "tool_use" {
-                            let id = val["content_block"]["id"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
-                            let name = val["content_block"]["name"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
-                            active_tool_uses
-                                .insert(index, (id.clone(), name.clone(), String::new()));
-                            Ok(Some(ProviderEvent::ToolUseStart { id, name }))
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    "content_block_delta" => {
-                        let index = val["index"].as_u64().unwrap_or(0) as usize;
-                        let delta_type = val["delta"]["type"].as_str().unwrap_or_default();
-                        if delta_type == "text_delta" {
-                            let text = val["delta"]["text"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
-                            Ok(Some(ProviderEvent::TextDelta(text)))
-                        } else if delta_type == "thinking_delta" {
-                            let thinking = val["delta"]["thinking"]
-                                .as_str()
-                                .unwrap_or_default()
-                                .to_string();
-                            Ok(Some(ProviderEvent::ReasoningDelta(thinking)))
-                        } else if delta_type == "input_json_delta" {
-                            let partial = val["delta"]["partial_json"].as_str().unwrap_or_default();
-                            if let Some((id, _, acc)) = active_tool_uses.get_mut(&index) {
-                                acc.push_str(partial);
-                                Ok(Some(ProviderEvent::ToolUseDelta {
-                                    id: id.clone(),
-                                    input_delta: partial.to_string(),
-                                }))
-                            } else {
-                                Ok(None)
-                            }
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    "content_block_stop" => {
-                        let index = val["index"].as_u64().unwrap_or(0) as usize;
-                        if let Some((id, name, acc)) = active_tool_uses.remove(&index) {
-                            let parsed_input: serde_json::Value = serde_json::from_str(&acc)
-                                .unwrap_or_else(|_| serde_json::json!({}));
-                            Ok(Some(ProviderEvent::ToolUseComplete {
-                                id,
-                                name,
-                                input: parsed_input,
-                            }))
-                        } else {
-                            Ok(None)
-                        }
-                    }
-                    "message_delta" => {
-                        if let Some(usage) = val["usage"].as_object() {
-                            output_tokens += usage
-                                .get("output_tokens")
-                                .and_then(|t| t.as_i64())
-                                .unwrap_or(0);
-                        }
-                        if let Some(reason) = val["delta"]["stop_reason"].as_str() {
-                            finish_reason = Some(reason.to_string());
-                        }
-                        Ok(None)
-                    }
-                    "message_stop" => {
-                        let cost = (input_tokens as f64 * price_in
-                            + cache_read_tokens as f64 * price_cr
-                            + cache_write_tokens as f64 * price_cw
-                            + output_tokens as f64 * price_out)
-                            / 1_000_000.0;
-
-                        let stats = UsageStats {
-                            input_tokens,
-                            output_tokens,
-                            cache_read_tokens,
-                            cache_write_tokens,
-                            reasoning_tokens: 0,
-                            cost,
-                        };
-                        Ok(Some(ProviderEvent::MessageStop {
-                            usage: stats,
-                            finish_reason: finish_reason.clone(),
-                        }))
-                    }
-                    _ => Ok(None),
-                }
+                parse_anthropic_event(&val, &mut state)
             })
             .filter_map(|x| async {
                 match x {
