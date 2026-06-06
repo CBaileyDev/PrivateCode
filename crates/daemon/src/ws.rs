@@ -1,4 +1,3 @@
-use crate::coordinator::SessionCoordinator;
 use axum::{
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
@@ -6,6 +5,7 @@ use axum::{
     },
     response::IntoResponse,
 };
+use private_code_core::coordinator::SessionCoordinator;
 use private_code_core::db;
 use private_code_protocol::event::ProtocolEvent;
 use serde::{Deserialize, Serialize};
@@ -106,7 +106,8 @@ async fn handle_socket(socket: WebSocket, query: WsQuery, coord: Arc<SessionCoor
     let mut replay_watermark = after_seq;
     if let Ok(history) = get_session_history(&coord, &query.session_id, after_seq).await {
         for event in history {
-            replay_watermark = replay_watermark.max(crate::coordinator::event_seq(&event));
+            replay_watermark =
+                replay_watermark.max(private_code_core::coordinator::event_seq(&event));
             if let Ok(msg_str) = serde_json::to_string(&event) {
                 if ws_tx.send(Message::Text(msg_str)).await.is_err() {
                     return;
@@ -136,7 +137,7 @@ async fn handle_socket(socket: WebSocket, query: WsQuery, coord: Arc<SessionCoor
             match event_rx.recv().await {
                 Ok(event) => {
                     // Dedup: skip any durable event already delivered via replay.
-                    if !crate::coordinator::should_forward(&event, replay_watermark) {
+                    if !private_code_core::coordinator::should_forward(&event, replay_watermark) {
                         continue;
                     }
                     if let Ok(msg_str) = serde_json::to_string(&event) {

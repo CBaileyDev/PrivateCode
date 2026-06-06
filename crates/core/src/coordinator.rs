@@ -1,6 +1,6 @@
-use private_code_core::db;
-use private_code_core::orchestrator::Orchestrator;
-use private_code_core::permissions::{PermissionPrompt, PermissionReply};
+use crate::db;
+use crate::orchestrator::Orchestrator;
+use crate::permissions::{PermissionPrompt, PermissionReply};
 use private_code_protocol::event::{ProtocolEvent, UsageStats};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use std::time::Duration;
 /// Max number of inputs that may be queued behind an active turn before
 /// `run_turn` rejects further admissions (session.md inbox backlog limit).
 const MAX_BACKLOG: usize = 32;
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
@@ -127,10 +127,10 @@ impl SessionCoordinator {
         let provider_id = serde_json::from_str::<serde_json::Value>(model_config)
             .ok()
             .and_then(|v| v["provider_id"].as_str().map(str::to_string));
-        if let Some(id) = provider_id {
-            if let Some(p) = self.providers.get(&id) {
-                return p.clone();
-            }
+        if let Some(id) = provider_id
+            && let Some(p) = self.providers.get(&id)
+        {
+            return p.clone();
         }
         self.provider.clone()
     }
@@ -486,21 +486,21 @@ impl SessionCoordinator {
         let mut sessions = self.sessions.lock().await;
         if let Some(sess) = sessions.get_mut(session_id) {
             sess.last_activity = std::time::Instant::now();
-            if let Some((prompt, _)) = &sess.pending_permission {
-                if prompt.permission_id == permission_id {
-                    let (_, resp_tx) = sess.pending_permission.take().unwrap();
-                    // "always" also persists a saved rule (handled by the caller);
-                    // here both allow variants grant. Anything else is a denial,
-                    // which may carry feedback for the model.
-                    let decision = match reply {
-                        "always" | "once" => PermissionReply::Allow,
-                        _ => PermissionReply::Deny {
-                            feedback: feedback.map(str::to_string),
-                        },
-                    };
-                    let _ = resp_tx.send(decision);
-                    return Ok(());
-                }
+            if let Some((prompt, _)) = &sess.pending_permission
+                && prompt.permission_id == permission_id
+            {
+                let (_, resp_tx) = sess.pending_permission.take().unwrap();
+                // "always" also persists a saved rule (handled by the caller);
+                // here both allow variants grant. Anything else is a denial,
+                // which may carry feedback for the model.
+                let decision = match reply {
+                    "always" | "once" => PermissionReply::Allow,
+                    _ => PermissionReply::Deny {
+                        feedback: feedback.map(str::to_string),
+                    },
+                };
+                let _ = resp_tx.send(decision);
+                return Ok(());
             }
         }
         Err("No pending permission prompt matches the requested permission ID".into())
@@ -534,8 +534,8 @@ impl SessionCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{connect_db, create_project, create_session, run_migrations};
     use futures_util::stream::{BoxStream, StreamExt};
-    use private_code_core::db::{connect_db, create_project, create_session, run_migrations};
     use private_code_protocol::message::{ChatMessage, ContentBlock, Role};
     use private_code_providers::provider::{ModelProvider, ProviderError, ProviderEvent};
     use std::time::Duration;

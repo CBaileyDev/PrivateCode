@@ -1,5 +1,4 @@
 pub mod auth;
-pub mod coordinator;
 pub mod routes;
 pub mod ws;
 
@@ -8,7 +7,7 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use coordinator::SessionCoordinator;
+use private_code_core::coordinator::SessionCoordinator;
 use private_code_providers::anthropic::AnthropicProvider;
 use private_code_providers::ModelProvider;
 use private_code_tools::{

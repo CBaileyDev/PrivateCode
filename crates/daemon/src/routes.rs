@@ -1,4 +1,3 @@
-use crate::coordinator::SessionCoordinator;
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -7,6 +6,7 @@ use axum::{
 };
 use futures_util::stream::Stream;
 use private_code_core::checkpoint::{GitSnapshotEngine, Snapshot, TreeHash};
+use private_code_core::coordinator::SessionCoordinator;
 use private_code_core::db::{self, CheckpointRow, MessageRow, ProjectRow, SessionRow};
 use private_code_protocol::event::ProtocolEvent;
 use private_code_protocol::message::ChatMessage;
