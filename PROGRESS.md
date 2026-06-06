@@ -13,7 +13,7 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | C2 | SSE-byte replay harness + edit/patch property tests | ✅ done |
 | C3 | Phase-1 orchestrator correctness bugs | ✅ done |
 | C4 | Git-backed E2E turn + reconcile-arms + compaction impl | ✅ done |
-| C5 | Permission-park + tool.run cancellability (CRITICAL prereq) | ⬜ pending |
+| C5 | Permission-park + tool.run cancellability (CRITICAL prereq) | ✅ done |
 | C6 | Daemon serve refactor (build_router/serve_daemon/DI) | ⬜ pending |
 | C7 | Daemon graceful shutdown + WS round-trip test | ⬜ pending |
 | C8 | Daemon eviction reaper + steer/queue + ToolRequested | ⬜ pending |

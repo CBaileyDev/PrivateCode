@@ -850,14 +850,30 @@ impl Orchestrator {
                         {
                             false
                         } else {
-                            match resp_rx.await {
-                                Ok(PermissionDecision::Allow) => true,
-                                Ok(PermissionDecision::Deny) => false,
-                                _ => false,
+                            // The permission wait MUST be cancellable: a session
+                            // abort (or graceful-shutdown drain) during a pending
+                            // Ask would otherwise park the turn here forever. On
+                            // cancel, treat as Deny and stop the turn.
+                            tokio::select! {
+                                biased;
+                                _ = cancel.cancelled() => {
+                                    cancelled = true;
+                                    false
+                                }
+                                d = resp_rx => match d {
+                                    Ok(PermissionDecision::Allow) => true,
+                                    Ok(PermissionDecision::Deny) => false,
+                                    _ => false,
+                                },
                             }
                         }
                     }
                 };
+
+                // If cancelled while waiting for permission, stop the turn cleanly.
+                if cancelled {
+                    break;
+                }
 
                 if !granted {
                     tool_results.push(ContentBlock::ToolResult {
@@ -912,7 +928,19 @@ impl Orchestrator {
                 };
 
                 info!("Executing tool {} with args {}", tool_name, arguments);
-                let execute_res = tool.run(&mut tool_ctx, arguments.clone()).await;
+                // Tool execution is cancellable too: a long bash/web_fetch must
+                // not block an abort/shutdown. On cancel, record an aborted result
+                // and stop the turn after persisting it.
+                let execute_res = tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {
+                        cancelled = true;
+                        Err(private_code_tools::tool::ToolError::Other(
+                            "tool execution aborted".to_string(),
+                        ))
+                    }
+                    r = tool.run(&mut tool_ctx, arguments.clone()) => r,
+                };
 
                 let (result_content, is_err) = match execute_res {
                     Ok(val) => (ToolResultContent::Json(val), false),
@@ -956,6 +984,11 @@ impl Orchestrator {
                     content: result_content,
                     is_error: is_err,
                 });
+
+                // Cancelled during this tool — persist what we have and stop.
+                if cancelled {
+                    break;
+                }
             }
 
             // Persist the tool results as a single user message
@@ -1742,5 +1775,117 @@ mod tests {
                 .any(|m| m.type_ == "system" && m.data.contains("v2 different")),
             "an Updated turn must append a system delta message carrying the new instructions"
         );
+    }
+
+    /// A tool whose permission_class ("write_file") maps to Ask under the build
+    /// agent, so it parks the turn on the permission prompt.
+    struct AskTool;
+
+    #[async_trait::async_trait]
+    impl Tool for AskTool {
+        fn name(&self) -> &str {
+            "write_file"
+        }
+        fn description(&self) -> &str {
+            "ask tool"
+        }
+        fn schema(&self) -> serde_json::Value {
+            serde_json::json!({"name":"write_file","input_schema":{"type":"object"}})
+        }
+        fn mutates(&self) -> bool {
+            false
+        }
+        fn permission_class(&self) -> &str {
+            "write_file"
+        }
+        async fn run(
+            &self,
+            _ctx: &mut ToolContext<'_>,
+            _args: serde_json::Value,
+        ) -> Result<serde_json::Value, ToolError> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+    }
+
+    #[tokio::test]
+    async fn test_abort_during_pending_permission_terminates() {
+        let ws = TempDir::new().unwrap();
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let pid = Uuid::new_v4().to_string();
+        create_project(&pool, &pid, "t", ws.path().to_str().unwrap())
+            .await
+            .unwrap();
+        let sid = Uuid::new_v4().to_string();
+        let model_config =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        create_session(
+            &pool,
+            &sid,
+            &pid,
+            ws.path().to_str().unwrap(),
+            ws.path().to_str().unwrap(),
+            "t",
+            "build",
+            &model_config,
+        )
+        .await
+        .unwrap();
+
+        let provider = Arc::new(ScriptedProvider {
+            turns: StdMutex::new(VecDeque::from(vec![vec![
+                ProviderEvent::ToolUseStart {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                },
+                ProviderEvent::ToolUseComplete {
+                    id: "t1".into(),
+                    name: "write_file".into(),
+                    input: serde_json::json!({}),
+                },
+                ProviderEvent::MessageStop {
+                    usage: UsageStats::default(),
+                    finish_reason: Some("tool_use".into()),
+                },
+            ]])),
+        });
+
+        let mut reg = ToolRegistry::new();
+        reg.register(Box::new(AskTool));
+
+        // Keep the permission receiver ALIVE but never reply — the turn parks on
+        // the permission wait until cancellation.
+        let (ptx, _prx) = mpsc::channel(10);
+        let (etx, mut erx) = mpsc::channel(4096);
+        tokio::spawn(async move { while erx.recv().await.is_some() {} });
+
+        let orch = Arc::new(Orchestrator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            provider,
+            Arc::new(reg),
+            ptx,
+            etx,
+        ));
+        let input_id = orch.admit_input(&sid, "hi", "steer").await.unwrap();
+
+        let token = CancellationToken::new();
+        let token2 = token.clone();
+        let orch2 = orch.clone();
+        let sid2 = sid.clone();
+        let handle = tokio::spawn(async move {
+            let _ = orch2.run_session_turn(&sid2, &input_id, token).await;
+        });
+
+        // Let the turn reach the permission wait, then abort.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        token2.cancel();
+
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        assert!(
+            res.is_ok(),
+            "abort during a pending permission must terminate the turn (no hang)"
+        );
+        drop(_prx);
     }
 }
