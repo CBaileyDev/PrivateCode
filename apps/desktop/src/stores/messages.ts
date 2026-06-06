@@ -47,6 +47,16 @@ const [messageStore, setMessageStore] = createStore<MessageState>({
   streamingToolCalls: new Map(),
 });
 
+// The session whose conversation is currently DISPLAYED. Set synchronously by
+// the session store on every switch (before any await). Every store write that
+// could resolve late (a `loadMessages` fetch) or arrive from a background
+// session (a stray channel event) is gated on this id, so a previous session's
+// turn can never clobber or bleed into the view you're looking at.
+let displayedSessionId: string | null = null;
+function setDisplayedSession(id: string | null) {
+  displayedSessionId = id;
+}
+
 /** Load messages from the backend for a given session. */
 async function loadMessages(sessionId: string) {
   try {
@@ -54,34 +64,67 @@ async function loadMessages(sessionId: string) {
     const rawMessages = (await invoke("get_messages", { sessionId })) as any[];
 
     const parsed: ParsedMessage[] = rawMessages.map((m) => {
-      let chat: ChatMessage;
+      // Compaction markers are not ChatMessages — render a divider, never the
+      // raw `{compacted_through_seq,summary}` JSON.
+      if (m.type === "compaction") {
+        return {
+          id: m.id,
+          role: "system" as const,
+          blocks: [{ type: "text" as const, text: "— history compacted —" }],
+          isStreaming: false,
+          createdAt: m.created_at,
+        };
+      }
+
+      let chat: ChatMessage | null = null;
       try {
         chat = JSON.parse(m.data);
       } catch {
-        chat = {
-          id: m.id,
-          role: "system",
-          content: [{ type: "text", text: m.data }],
-          created_at: m.created_at,
-        };
+        chat = null;
       }
+      const role =
+        chat?.role === "user" || chat?.role === "assistant" || chat?.role === "system"
+          ? chat.role
+          : "system";
+      // NEVER pass `undefined` blocks to the renderer (it would crash iterating
+      // them): fall back to the raw row data as a single text block.
+      const blocks = Array.isArray(chat?.content)
+        ? chat!.content
+        : [{ type: "text" as const, text: typeof m.data === "string" ? m.data : "" }];
       return {
-        id: chat.id,
-        role: chat.role,
-        blocks: chat.content,
+        id: chat?.id ?? m.id,
+        role,
+        blocks,
         isStreaming: false,
-        createdAt: chat.created_at,
+        createdAt: chat?.created_at ?? m.created_at,
       };
     });
 
+    // Drop the result if the user switched away while this fetch was in flight.
+    if (sessionId !== displayedSessionId) return;
     setMessageStore("messages", parsed);
   } catch (e) {
     console.error("Failed to load messages:", e);
   }
 }
 
+/** Reset the live streaming buffers WITHOUT clearing the message list. Used on
+ * completion, on an error event, and on abort so the input never gets stuck in
+ * the "AI is responding…" / abort-only state when no completion arrives. */
+function resetStreaming() {
+  setMessageStore("isStreaming", false);
+  setMessageStore("streamingText", "");
+  setMessageStore("streamingReasoning", "");
+  setMessageStore("streamingToolCalls", new Map());
+}
+
 /** Handle incoming ProtocolEvent from the Tauri Channel. */
 function handleProtocolEvent(event: any) {
+  // Cross-session bleed guard: ignore events for any session that is not the
+  // one currently displayed (a background session's still-streaming turn must
+  // not corrupt the view, the usage panel, or pop a permission dialog here).
+  if (event.session_id && event.session_id !== displayedSessionId) return;
+
   switch (event.type) {
     case "message_delta": {
       setMessageStore("isStreaming", true);
@@ -109,10 +152,7 @@ function handleProtocolEvent(event: any) {
       // truth) — this makes attach/replay correct and avoids divergence between
       // what's shown and what's stored. (Also handles replay, where the stream
       // buffers are empty and the old "build-from-buffers" path showed nothing.)
-      setMessageStore("isStreaming", false);
-      setMessageStore("streamingText", "");
-      setMessageStore("streamingReasoning", "");
-      setMessageStore("streamingToolCalls", new Map());
+      resetStreaming();
       if (event.session_id) void loadMessages(event.session_id);
       break;
     }
@@ -148,6 +188,9 @@ function handleProtocolEvent(event: any) {
 
     case "error": {
       console.error(`Session error [${event.code}]: ${event.message}`);
+      // An error ends the turn without a `message_completed`; clear the live
+      // buffers so the input doesn't stay locked in the abort-only state.
+      resetStreaming();
       break;
     }
   }
@@ -181,4 +224,6 @@ export {
   handleProtocolEvent,
   addUserMessage,
   clearMessages,
+  resetStreaming,
+  setDisplayedSession,
 };

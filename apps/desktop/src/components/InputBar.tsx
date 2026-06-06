@@ -4,7 +4,7 @@
  */
 import { createSignal, Show, onMount, onCleanup } from "solid-js";
 import { sessionStore } from "../stores/session";
-import { addUserMessage, messageStore } from "../stores/messages";
+import { addUserMessage, messageStore, resetStreaming } from "../stores/messages";
 
 export default function InputBar() {
   let textareaRef: HTMLTextAreaElement | undefined;
@@ -131,6 +131,9 @@ export default function InputBar() {
       await invoke("abort_session", {
         sessionId: sessionStore.activeSession.id,
       });
+      // Abort cancels the turn without necessarily emitting a completion event,
+      // so clear the streaming lock here rather than waiting for one.
+      resetStreaming();
     } catch (e) {
       console.error("Abort failed:", e);
     }

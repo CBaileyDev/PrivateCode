@@ -5,6 +5,7 @@
  */
 import { createMemo, For, Show } from "solid-js";
 import CodeBlock from "./CodeBlock";
+import { renderInline } from "../lib/sanitize";
 
 interface Props {
   text: string;
@@ -107,24 +108,6 @@ function parseMarkdown(text: string): RenderedBlock[] {
 
   flushParagraph();
   return blocks;
-}
-
-/** Render inline markdown (bold, italic, code, links) */
-function renderInline(text: string): string {
-  return text
-    // Bold **text** or __text__
-    .replace(/\*\*(.+?)\*\*/g, '<strong class="md-bold">$1</strong>')
-    .replace(/__(.+?)__/g, '<strong class="md-bold">$1</strong>')
-    // Italic *text* or _text_
-    .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em class="md-italic">$1</em>')
-    .replace(/(?<!_)_(?!_)(.+?)(?<!_)_(?!_)/g, '<em class="md-italic">$1</em>')
-    // Inline code `code`
-    .replace(/`([^`]+)`/g, '<code class="code-inline">$1</code>')
-    // Links [text](url)
-    .replace(
-      /\[([^\]]+)\]\(([^)]+)\)/g,
-      '<a class="md-link" href="$2" target="_blank" rel="noopener">$1</a>'
-    );
 }
 
 export default function MarkdownRenderer(props: Props) {
