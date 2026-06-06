@@ -47,5 +47,6 @@ axum = { version = "0.7", features = ["ws", "macros"] }
 tower-http = { version = "0.5", features = ["cors", "trace", "fs"] }
 tokio-tungstenite = "0.21"
 http = "1"
+criterion = "0.5"
 
 

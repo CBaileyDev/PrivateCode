@@ -25,3 +25,8 @@ globset.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 proptest = "1"
+criterion.workspace = true
+
+[[bench]]
+name = "parse_patch"
+harness = false

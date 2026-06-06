@@ -3,13 +3,20 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use private_code_core::coordinator::SessionCoordinator;
 use private_code_core::db;
-use private_code_protocol::event::{DeltaPayload, ProtocolEvent};
+use private_code_protocol::event::{DeltaPayload, ProtocolEvent, UsageStats};
+use private_code_protocol::message::ChatMessage;
+use private_code_providers::{ModelProvider, ProviderError, ProviderEvent};
+use private_code_tools::ToolRegistry;
 use private_code_tui::run_tui;
 use ratatui::{Terminal, backend::CrosstermBackend};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use futures_util::stream::BoxStream;
 use futures_util::{SinkExt, StreamExt};
 
 #[derive(Parser, Debug)]
@@ -65,6 +72,15 @@ enum Commands {
         #[arg(short, long, default_value_t = 48123)]
         port: u16,
     },
+    /// Run an in-process engine smoke test (no network, in-memory DB) over the
+    /// shared coordinator and report per-turn loop latency. Exits non-zero on any
+    /// failure or hang. A regression signal for the engine loop — NOT a benchmark
+    /// (the provider is scripted with zero model latency).
+    Selftest {
+        /// Number of turns to drive through the coordinator
+        #[arg(short, long, default_value_t = 3)]
+        turns: u32,
+    },
 }
 
 async fn is_daemon_running(port: u16) -> bool {
@@ -108,6 +124,13 @@ async fn ensure_daemon(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Cli::parse();
+
+    // `selftest` is a self-contained engine smoke test: it must NOT touch on-disk
+    // state (no global data dir, no on-disk DB, no project/session rows in the real
+    // database), so intercept it before the normal workspace/DB bootstrap below.
+    if let Some(Commands::Selftest { turns }) = &args.command {
+        return run_selftest(*turns).await;
+    }
 
     // 1. Establish workspace and global directories
     let workspace_path = std::fs::canonicalize(Path::new(&args.workspace))
@@ -277,7 +300,167 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        // Intercepted before the DB bootstrap above (it must not touch on-disk
+        // state), so the normal command dispatch never sees it.
+        Commands::Selftest { .. } => unreachable!("selftest is handled before DB bootstrap"),
     }
+
+    Ok(())
+}
+
+/// A scripted, zero-latency provider for `selftest`: every turn streams one short
+/// text delta then stops with `end_turn`. It makes NO network call, so selftest
+/// exercises `run_turn` → orchestrator → event routing → `MessageCompleted` end
+/// to end without a live API key. Because model latency is stubbed to zero, the
+/// reported timings measure the engine loop only — this is a smoke/regression
+/// signal, NOT a latency benchmark.
+struct SelftestProvider;
+
+#[async_trait::async_trait]
+impl ModelProvider for SelftestProvider {
+    async fn stream_chat(
+        &self,
+        _model_id: &str,
+        _system_prompt: Option<&str>,
+        _max_tokens: u32,
+        _messages: &[ChatMessage],
+        _tools: &[serde_json::Value],
+    ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError> {
+        let events = vec![
+            Ok(ProviderEvent::TextDelta("selftest ok".into())),
+            Ok(ProviderEvent::MessageStop {
+                usage: UsageStats::default(),
+                finish_reason: Some("end_turn".into()),
+            }),
+        ];
+        Ok(futures_util::stream::iter(events).boxed())
+    }
+
+    fn count_tokens(&self, _model_id: &str, text: &str) -> usize {
+        (text.chars().count() / 4).max(1)
+    }
+}
+
+/// Await the next `MessageCompleted` on the broadcast, treating an `Error` event
+/// or a closed channel as failure. A lagged receiver simply continues (a token
+/// burst can outrun a slow reader; selftest reads promptly, so this is
+/// belt-and-braces rather than a real risk).
+async fn wait_for_completed(
+    rx: &mut tokio::sync::broadcast::Receiver<ProtocolEvent>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        match rx.recv().await {
+            Ok(ProtocolEvent::MessageCompleted { .. }) => return Ok(()),
+            Ok(ProtocolEvent::Error { message, .. }) => {
+                return Err(format!("turn emitted an error event: {message}").into());
+            }
+            Ok(_) => continue,
+            Err(RecvError::Lagged(_)) => continue,
+            Err(RecvError::Closed) => {
+                return Err("event channel closed before the turn completed".into());
+            }
+        }
+    }
+}
+
+/// Drive `turns` turns through an in-process [`SessionCoordinator`] backed by an
+/// in-memory DB, throwaway workspace, and the scripted [`SelftestProvider`], then
+/// report per-turn loop latency. Every turn must complete (hard failure on error
+/// or hang); the timings are informational only — there is deliberately NO timing
+/// ceiling, because a fixed millisecond budget is environment-dependent and would
+/// make CI flaky. A hang is caught by a wrapping per-turn timeout instead.
+async fn run_selftest(turns: u32) -> Result<(), Box<dyn std::error::Error>> {
+    let turns = turns.max(1);
+    eprintln!(
+        "engine selftest: driving {turns} turn(s) through the in-process coordinator \
+         (in-memory DB, scripted zero-latency provider)…"
+    );
+
+    // Isolated, auto-cleaned temp dirs so selftest leaves NO on-disk state behind:
+    // an in-memory SQLite DB, a throwaway workspace, and a throwaway snapshot store
+    // (the orchestrator git-checkpoints the workspace into the data dir each turn).
+    let workspace = tempfile::tempdir()?;
+    let data_dir = tempfile::tempdir()?;
+    let ws_str = workspace.path().to_string_lossy().to_string();
+
+    let pool = db::connect_db("sqlite::memory:").await?;
+    db::run_migrations(&pool).await?;
+
+    let project_id = Uuid::new_v4().to_string();
+    db::create_project(&pool, &project_id, "selftest", &ws_str).await?;
+    let session_id = Uuid::new_v4().to_string();
+    let model_config =
+        serde_json::json!({"provider_id": "anthropic", "model_id": "claude-opus-4-8"}).to_string();
+    db::create_session(
+        &pool,
+        &session_id,
+        &project_id,
+        &ws_str,
+        &ws_str,
+        "selftest",
+        "build",
+        &model_config,
+    )
+    .await?;
+
+    let coord = SessionCoordinator::new(
+        pool,
+        data_dir.path().to_path_buf(),
+        Arc::new(SelftestProvider),
+        Arc::new(ToolRegistry::new()),
+    );
+
+    // A turn that never completes is a hard failure (deadlock / lost wakeup),
+    // caught by this wrapping timeout — NOT a latency budget.
+    const TURN_TIMEOUT: Duration = Duration::from_secs(20);
+
+    let mut durations: Vec<Duration> = Vec::with_capacity(turns as usize);
+    for i in 0..turns {
+        // Subscribe fresh before each turn so no buffered prior-turn event is
+        // mistaken for this turn's completion.
+        let mut rx = coord.get_or_create_session(&session_id).await?;
+        let start = Instant::now();
+        coord
+            .run_turn(&session_id, &format!("selftest turn {i}"), "steer")
+            .await?;
+        match tokio::time::timeout(TURN_TIMEOUT, wait_for_completed(&mut rx)).await {
+            Ok(Ok(())) => durations.push(start.elapsed()),
+            Ok(Err(e)) => {
+                coord.shutdown(Duration::from_secs(5)).await;
+                return Err(format!("selftest turn {i} failed: {e}").into());
+            }
+            Err(_) => {
+                coord.shutdown(Duration::from_secs(5)).await;
+                return Err(format!(
+                    "selftest turn {i} hung: no MessageCompleted within {TURN_TIMEOUT:?}"
+                )
+                .into());
+            }
+        }
+    }
+
+    coord.shutdown(Duration::from_secs(5)).await;
+
+    // Correctness: exactly one completed turn per requested turn.
+    if durations.len() != turns as usize {
+        return Err(format!(
+            "selftest expected {turns} completed turns, got {}",
+            durations.len()
+        )
+        .into());
+    }
+
+    // Informational metrics ONLY (no pass/fail threshold — latency is stubbed).
+    let total: Duration = durations.iter().sum();
+    let avg = total / durations.len() as u32;
+    let min = durations.iter().min().copied().unwrap_or_default();
+    let max = durations.iter().max().copied().unwrap_or_default();
+    println!(
+        "selftest PASSED: {} turn(s) completed | avg {avg:?} | min {min:?} | max {max:?} \
+         (engine-loop only; model latency stubbed to zero)",
+        durations.len()
+    );
 
     Ok(())
 }

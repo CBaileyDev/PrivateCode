@@ -25,7 +25,7 @@ Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced 
 | C13 | Wire model/agent dropdowns + slash commands | ✅ done |
 | C14 | MessageList virtualization (virtua) + real Shiki-in-worker | ✅ done |
 | C15 | Frontend store test suite (vitest + mockIPC) | ✅ done |
-| C16 | Perf instrumentation (--selftest + criterion + perf.yml) | ⬜ pending |
+| C16 | Perf instrumentation (--selftest + criterion + perf.yml) | ✅ done |
 
 Dependency order: C0 → C1 → {C2,C3,C4} → C5,C6 → {C7,C8,C9} → C10 → {C11,C12,C13} → {C14,C15} → C16
 
@@ -93,6 +93,14 @@ Closes the C12/C13/C14 deferred-test checklists. Pure-logic tests stay node-env;
 - `permissions.test.ts` (3, jsdom) — deny-feedback forwarded on reject, null on allow, whitespace-only ignored.
 - Infra: `jsdom` dev-dep; an in-memory `localStorage` polyfill in `session.test.ts` (this vitest/jsdom build doesn't expose a functional one). A benign node-25 `--localstorage-file` warning is emitted by jsdom; ignorable.
 - **Still GUI-only (not unit-testable headless):** virtua scroll/measurement + Shiki/line-number RENDERING + the `block_on` shutdown hook. These remain on the human-launch list.
+
+## C16 done (perf instrumentation — selftest + criterion + perf.yml)
+Final cluster. Adds an engine smoke test, two microbenches, and a perf CI workflow. All green: fmt + clippy `-D warnings` (`--all-targets` now compiles the benches) + 92 nextest pass (the 4 `#[ignore]`d live-network smoke tests stay skipped) + frontend typecheck/build/28-vitest.
+- **`private-code selftest [--turns N]`** (cli/src/main.rs) — intercepted right after `Cli::parse()`, *before* any on-disk bootstrap, so it touches NO real state: in-memory SQLite (`sqlite::memory:`), auto-cleaned `tempfile` workspace + snapshot-store dirs, an inline zero-latency `SelftestProvider` (one `TextDelta` + `MessageStop` per turn), and `ToolRegistry::new()`. Drives N turns through the SHARED `SessionCoordinator` (same `run_turn` → orchestrator → event-router → broadcast path as daemon + desktop), subscribing fresh per turn and awaiting `MessageCompleted`.
+- **Smoke/regression signal, NOT a benchmark (advisor refinement #1):** model latency is stubbed to zero, so the printed per-turn avg/min/max measure the engine loop only. **No timing ceiling (refinement #2):** correctness fails hard (every turn must complete; an `Error` event or a closed channel is a failure; `durations.len() == turns`), and a *hang* is caught by a wrapping `tokio::time::timeout(20s)` per turn — never a per-turn millisecond budget (which would be runner-dependent and flaky). Exits non-zero on any failure/hang (verified exit 0 on success).
+- **Criterion microbenches** (`crates/providers/benches/parse_anthropic.rs`, `crates/tools/benches/parse_patch.rs`), `harness = false`, criterion as a workspace dev-dep (0.5.1). Each targets a real hot path: the SSE wire parser over a representative turn (text + a tool_use block with accumulated `input_json` + `message_stop` cost math, fresh `SseState("claude-opus-4-8")` per iter so the price table is seeded — refinement #4) and `apply_patch` over an Add/Update(+move,@@,±)/Delete patch. Verified compiling AND running one iteration via `-- --quick` (refinement #3: `--no-run` alone wouldn't catch a panic in the measured closure) — ~0.9µs/turn parse, ~1.3µs/patch.
+- **`.github/workflows/perf.yml`** mirrors ci.yml (same triggers push/PR→[main,dev], `concurrency` cancel-in-progress, `Swatinem/rust-cache`) but Linux-only, no matrix, and needs neither Node nor webkit: every cargo call is crate-scoped (`-p private-code-cli`, `-p private-code-providers`, `-p private-code-tools`) so the Tauri shell (which would need the frontend dist + webkit) is never built. Runs `selftest --turns 20 --release` then both benches `-- --quick`, all `--locked`.
+- **Folded in (C15 CI hole):** ci.yml's `frontend` job had a stale TODO — the vitest suite landed in C15 but CI never ran it. Replaced the comment with `npm run test` so a frontend-store regression now fails CI.
 
 ## Carry-forward notes
 - **Deferred (Lagged-while-connected recovery):** the WS forward loop `continue`s on `broadcast::RecvError::Lagged`, relying on the client reconciling durable state from the DB. That holds for messages/checkpoints/usage but not for `Error` (in-memory only) — a client that lags past the 16384 buffer mid-turn could miss an error with no reconnect. Real but low-probability and a riskier hot-path change; the right fix is the forward loop re-syncing in-memory durable history on Lagged (track last-forwarded seq, replay history beyond it). Not bundled with the Error-seq fix.

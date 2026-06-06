@@ -112,10 +112,10 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
 
-      - name: Install + type-check + build
+      - name: Install + type-check + build + test
         working-directory: apps/desktop
         run: |
           npm ci
           npm run typecheck
           npm run build
-          # `npm run test` (vitest) is added here once the store test suite lands (cluster C15).
+          npm run test

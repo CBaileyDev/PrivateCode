@@ -26,4 +26,9 @@ testkit = []
 [dev-dependencies]
 private-code-providers = { path = ".", features = ["testkit"] }
 tokio = { workspace = true }
+criterion.workspace = true
+
+[[bench]]
+name = "parse_anthropic"
+harness = false
 

@@ -1,0 +1,51 @@
+name: Perf
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+    branches: [main, dev]
+
+# Cancel superseded runs on the same ref (mirrors ci.yml).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Engine smoke test + microbenchmarks. Linux-only, no matrix: this is a
+  # regression signal, not a cross-platform gate. It needs neither Node nor
+  # webkit — the CLI and bench crates don't depend on the Tauri shell, so we
+  # scope every cargo invocation to the relevant crates and never build
+  # apps/desktop/src-tauri (which would require the frontend dist + webkit).
+  perf:
+    name: perf (engine selftest + benches)
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Drives N turns through the in-process coordinator with a scripted,
+      # zero-latency provider (no network, in-memory DB). Hard-fails on any
+      # errored or hung turn; the reported timings are informational only —
+      # there is deliberately NO millisecond budget (it would be flaky across
+      # runners). Built in release so the loop numbers are representative.
+      - name: Engine selftest
+        run: cargo run --release --locked -p private-code-cli -- selftest --turns 20
+
+      # `--quick` runs each Criterion benchmark for a single iteration: it proves
+      # the benches still compile AND execute (a `--no-run` build would not catch
+      # a panic in the measured closure). Scoped per crate so the Tauri shell is
+      # never compiled.
+      - name: Bench — Anthropic SSE parser
+        run: cargo bench --locked -p private-code-providers --bench parse_anthropic -- --quick
+
+      - name: Bench — apply_patch parser
+        run: cargo bench --locked -p private-code-tools --bench parse_patch -- --quick
