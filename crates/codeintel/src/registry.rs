@@ -61,25 +61,75 @@ fn extension(path: &str) -> Option<String> {
     }
 }
 
-/// Map an extension to a stable language id. Extended in C7.
+/// Map a file extension to a stable language id. `.h` is treated as C (a bare
+/// header parses fine under the C grammar; C++-specific headers conventionally
+/// use .hpp/.hh).
 fn ext_to_lang(ext: &str) -> Option<&'static str> {
-    match ext {
-        "rs" => Some("rust"),
-        _ => None,
-    }
+    Some(match ext {
+        "rs" => "rust",
+        "ts" | "mts" | "cts" => "typescript",
+        "js" | "mjs" | "cjs" | "jsx" => "javascript",
+        "py" | "pyi" => "python",
+        "go" => "go",
+        "c" | "h" => "c",
+        "cpp" | "cc" | "cxx" | "hpp" | "hh" | "hxx" => "cpp",
+        "java" => "java",
+        "rb" => "ruby",
+        "php" | "phtml" => "php",
+        _ => return None,
+    })
 }
 
-/// Construct a language's grammar + compiled query. Extended in C7.
+/// Construct a language's grammar + compiled query. Each grammar crate exposes a
+/// `LANGUAGE` (or language-specific) const; the `.scm` queries are bundled at
+/// compile time via `include_str!`.
 fn build_lang(lang_id: &'static str) -> Result<LangDef, tree_sitter::QueryError> {
-    match lang_id {
-        "rust" => {
-            let language: Language = tree_sitter_rust::LANGUAGE.into();
-            let query = Query::new(&language, include_str!("../queries/rust.scm"))?;
-            Ok(LangDef { language, query })
-        }
+    let (language, query_src): (Language, &str) = match lang_id {
+        "rust" => (
+            tree_sitter_rust::LANGUAGE.into(),
+            include_str!("../queries/rust.scm"),
+        ),
+        "typescript" => (
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            include_str!("../queries/typescript.scm"),
+        ),
+        "javascript" => (
+            tree_sitter_javascript::LANGUAGE.into(),
+            include_str!("../queries/javascript.scm"),
+        ),
+        "python" => (
+            tree_sitter_python::LANGUAGE.into(),
+            include_str!("../queries/python.scm"),
+        ),
+        "go" => (
+            tree_sitter_go::LANGUAGE.into(),
+            include_str!("../queries/go.scm"),
+        ),
+        "c" => (
+            tree_sitter_c::LANGUAGE.into(),
+            include_str!("../queries/c.scm"),
+        ),
+        "cpp" => (
+            tree_sitter_cpp::LANGUAGE.into(),
+            include_str!("../queries/cpp.scm"),
+        ),
+        "java" => (
+            tree_sitter_java::LANGUAGE.into(),
+            include_str!("../queries/java.scm"),
+        ),
+        "ruby" => (
+            tree_sitter_ruby::LANGUAGE.into(),
+            include_str!("../queries/ruby.scm"),
+        ),
+        "php" => (
+            tree_sitter_php::LANGUAGE_PHP.into(),
+            include_str!("../queries/php.scm"),
+        ),
         // Unreachable: ext_to_lang only yields ids handled here.
         other => unreachable!("ext_to_lang produced unhandled language id '{other}'"),
-    }
+    };
+    let query = Query::new(&language, query_src)?;
+    Ok(LangDef { language, query })
 }
 
 #[cfg(test)]

@@ -219,3 +219,101 @@ impl Cache<String> {
         assert_eq!(f.end_line, 3);
     }
 }
+
+#[cfg(test)]
+mod lang_tests {
+    use super::SymbolExtractor;
+
+    /// Assert every name in `expected` is extracted from `src` (parsed as `path`).
+    fn assert_extracts(path: &str, src: &str, expected: &[&str]) {
+        let syms = SymbolExtractor::new().extract(path, src);
+        for name in expected {
+            assert!(
+                syms.iter().any(|s| &s.name == name),
+                "{path}: expected symbol '{name}' not extracted; got {:?}",
+                syms.iter().map(|s| (&s.name, &s.kind)).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn typescript() {
+        assert_extracts(
+            "a.ts",
+            "export interface Shape { area(): number; }\nexport class Circle implements Shape {\n  area(): number { return 3.14; }\n}\nexport function makeCircle(r: number): Circle { return new Circle(); }\nexport enum Color { Red, Green }\nexport type ID = string;\nconst PI = 3.14;",
+            &["Shape", "Circle", "area", "makeCircle", "Color", "ID", "PI"],
+        );
+    }
+
+    #[test]
+    fn javascript() {
+        assert_extracts(
+            "a.js",
+            "class Foo {\n  bar() { return 1; }\n}\nfunction baz() {}\nconst QUX = 42;\n",
+            &["Foo", "bar", "baz", "QUX"],
+        );
+    }
+
+    #[test]
+    fn python() {
+        assert_extracts(
+            "a.py",
+            "class Greeter:\n    def greet(self, name):\n        return name\ndef shout(msg):\n    return msg.upper()",
+            &["Greeter", "greet", "shout"],
+        );
+    }
+
+    #[test]
+    fn go() {
+        assert_extracts(
+            "a.go",
+            "package main\n\ntype Shape interface { Area() float64 }\ntype Point struct { X, Y int }\nconst MaxSize = 100\nfunc Add(a, b int) int { return a + b }\nfunc (p Point) Scale(f int) { p.X *= f }",
+            &["Shape", "Point", "MaxSize", "Add", "Scale"],
+        );
+    }
+
+    #[test]
+    fn c() {
+        assert_extracts(
+            "a.c",
+            "typedef int Meters;\nstruct Point { int x; int y; };\nenum Color { RED, GREEN };\n#define MAX 100\nint add(int a, int b) { return a + b; }",
+            &["Meters", "Point", "Color", "MAX", "add"],
+        );
+    }
+
+    #[test]
+    fn cpp() {
+        assert_extracts(
+            "a.cpp",
+            "namespace geo {\nstruct Point { int dist(); };\nenum Color { Red, Green };\nint add(int a, int b) { return a + b; }\n}",
+            &["geo", "Point", "dist", "Color", "add"],
+        );
+    }
+
+    #[test]
+    fn java() {
+        assert_extracts(
+            "A.java",
+            "public class Foo {\n  static final int MAX = 10;\n  public int bar() { return MAX; }\n}",
+            &["Foo", "MAX", "bar"],
+        );
+    }
+
+    #[test]
+    fn ruby() {
+        assert_extracts(
+            "a.rb",
+            "class Greeter\n  VERSION = \"1\"\n  def hello(name)\n    \"hi\"\n  end\nend",
+            &["Greeter", "VERSION", "hello"],
+        );
+    }
+
+    #[test]
+    fn php() {
+        assert_extracts(
+            "a.php",
+            "<?php\nfunction greet($n) { return $n; }\nclass Foo {\n  const BAR = 1;\n  public function baz() {}\n}",
+            &["greet", "Foo", "BAR", "baz"],
+        );
+    }
+}
