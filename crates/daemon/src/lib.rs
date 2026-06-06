@@ -130,6 +130,12 @@ pub async fn start_daemon_with(
         provider,
         tool_registry,
     ));
+    // Evict idle sessions every 60s after 30 minutes of inactivity (frees live
+    // state only — DB rows persist and sessions rebuild on next access).
+    coordinator.start_reaper(
+        std::time::Duration::from_secs(30 * 60),
+        std::time::Duration::from_secs(60),
+    );
     // Map the (non-Send) Box<dyn Error> to a String immediately so this future
     // stays Send while we hold the result across the drain awaits below.
     let serve_result = serve_daemon(coordinator.clone(), token, listener, shutdown)

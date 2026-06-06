@@ -18,6 +18,11 @@ pub struct ActiveSession {
     pub pending_permission: Option<(PermissionPrompt, oneshot::Sender<PermissionDecision>)>,
     pub current_usage: UsageStats,
     pub active_turn_cancel: Option<CancellationToken>,
+    /// Cancels this session's router tasks so eviction tears them down
+    /// deterministically (rather than relying on sender-drop alone).
+    pub session_cancel: CancellationToken,
+    /// Last time this session saw activity; the reaper evicts idle sessions.
+    pub last_activity: std::time::Instant,
 }
 
 pub struct SessionCoordinator {
@@ -26,9 +31,12 @@ pub struct SessionCoordinator {
     pub global_data_dir: PathBuf,
     pub provider: Arc<dyn private_code_providers::ModelProvider>,
     pub tool_registry: Arc<private_code_tools::ToolRegistry>,
-    /// Tracks every spawned task (event/permission routers + turn drains) so a
-    /// graceful shutdown can wait for them to finish under a bounded timeout.
+    /// Tracks every spawned task (event/permission routers + turn drains + reaper)
+    /// so a graceful shutdown can wait for them to finish under a bounded timeout.
     pub tracker: TaskTracker,
+    /// Cancelled on shutdown to stop the reaper loop (which otherwise sleeps
+    /// forever and would block tracker.wait()).
+    pub shutdown_token: CancellationToken,
 }
 
 fn is_durable_event(event: &ProtocolEvent) -> bool {
@@ -63,7 +71,43 @@ impl SessionCoordinator {
             provider,
             tool_registry,
             tracker: TaskTracker::new(),
+            shutdown_token: CancellationToken::new(),
         }
+    }
+
+    /// Spawn the idle-session reaper. Every `interval`, it evicts sessions that
+    /// have no active turn, no pending permission, and have been idle longer than
+    /// `idle_ttl`. Eviction frees in-memory live state only — DB rows are
+    /// untouched and the session transparently rebuilds on next access. The loop
+    /// stops when `shutdown_token` is cancelled.
+    pub fn start_reaper(&self, idle_ttl: Duration, interval: Duration) {
+        let sessions = self.sessions.clone();
+        let shutdown = self.shutdown_token.clone();
+        self.tracker.spawn(async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(interval) => {}
+                }
+                let mut map = sessions.lock().await;
+                let evict: Vec<String> = map
+                    .iter()
+                    .filter(|(_, s)| {
+                        s.active_turn_cancel.is_none()
+                            && s.pending_permission.is_none()
+                            && s.last_activity.elapsed() > idle_ttl
+                    })
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in evict {
+                    if let Some(sess) = map.remove(&id) {
+                        // Tear down the router tasks deterministically.
+                        sess.session_cancel.cancel();
+                    }
+                }
+            }
+        });
     }
 
     /// Graceful drain: cancel every in-flight turn (now interruptible even when
@@ -72,13 +116,17 @@ impl SessionCoordinator {
     /// Tasks are abort-safe (a partial assistant message is already persisted),
     /// so exceeding the timeout is acceptable — we proceed regardless.
     pub async fn shutdown(&self, timeout: Duration) {
+        // Stop the reaper loop (it sleeps forever otherwise).
+        self.shutdown_token.cancel();
         {
             let mut sessions = self.sessions.lock().await;
             for (_id, sess) in sessions.iter_mut() {
                 if let Some(cancel) = sess.active_turn_cancel.take() {
                     cancel.cancel();
                 }
-                // Drop any parked permission oneshot so a waiting turn unblocks.
+                // Tear down the router tasks and drop any parked permission oneshot
+                // so a waiting turn unblocks.
+                sess.session_cancel.cancel();
                 sess.pending_permission = None;
             }
             // Drop the ActiveSessions: their orchestrator/event senders close once
@@ -95,7 +143,8 @@ impl SessionCoordinator {
         session_id: &str,
     ) -> Result<broadcast::Receiver<ProtocolEvent>, Box<dyn std::error::Error>> {
         let mut sessions = self.sessions.lock().await;
-        if let Some(sess) = sessions.get(session_id) {
+        if let Some(sess) = sessions.get_mut(session_id) {
+            sess.last_activity = std::time::Instant::now();
             return Ok(sess.event_tx.subscribe());
         }
 
@@ -121,6 +170,7 @@ impl SessionCoordinator {
         // events before a slow client's forwarder drains them. Lagged receivers are
         // handled gracefully (they continue) and clients reconcile from the DB.
         let (b_tx, b_rx) = broadcast::channel(16384);
+        let session_cancel = CancellationToken::new();
 
         let active_sess = ActiveSession {
             session_id: session_id.to_string(),
@@ -137,14 +187,25 @@ impl SessionCoordinator {
                 cost: session_row.cost,
             },
             active_turn_cancel: None,
+            session_cancel: session_cancel.clone(),
+            last_activity: std::time::Instant::now(),
         };
 
-        // Spawn event routing task
+        // Spawn event routing task (ends on session_cancel or when the sender closes).
         let session_id_str = session_id.to_string();
         let sessions_clone = self.sessions.clone();
         let b_tx_clone = b_tx.clone();
+        let event_cancel = session_cancel.clone();
         self.tracker.spawn(async move {
-            while let Some(event) = event_rx.recv().await {
+            loop {
+                let event = tokio::select! {
+                    biased;
+                    _ = event_cancel.cancelled() => break,
+                    ev = event_rx.recv() => match ev {
+                        Some(e) => e,
+                        None => break,
+                    },
+                };
                 let mut s_map = sessions_clone.lock().await;
                 if let Some(sess) = s_map.get_mut(&session_id_str) {
                     if is_durable_event(&event) {
@@ -170,11 +231,21 @@ impl SessionCoordinator {
             }
         });
 
-        // Spawn permission routing task
+        // Spawn permission routing task (ends on session_cancel or sender close).
         let session_id_str2 = session_id.to_string();
         let sessions_clone2 = self.sessions.clone();
+        let perm_cancel = session_cancel.clone();
         self.tracker.spawn(async move {
-            while let Some((prompt, resp_tx)) = permission_prompt_rx.recv().await {
+            loop {
+                let item = tokio::select! {
+                    biased;
+                    _ = perm_cancel.cancelled() => break,
+                    p = permission_prompt_rx.recv() => match p {
+                        Some(x) => x,
+                        None => break,
+                    },
+                };
+                let (prompt, resp_tx) = item;
                 let mut s_map = sessions_clone2.lock().await;
                 if let Some(sess) = s_map.get_mut(&session_id_str2) {
                     sess.pending_permission = Some((prompt, resp_tx));
@@ -205,6 +276,7 @@ impl SessionCoordinator {
             if sess.active_turn_cancel.is_some() {
                 return Err("A turn is already running for this session".into());
             }
+            sess.last_activity = std::time::Instant::now();
             let cancel_token = CancellationToken::new();
             sess.active_turn_cancel = Some(cancel_token.clone());
             (sess.orchestrator.clone(), cancel_token)
@@ -245,6 +317,7 @@ impl SessionCoordinator {
     pub async fn abort_turn(&self, session_id: &str) -> Result<(), Box<dyn std::error::Error>> {
         let mut sessions = self.sessions.lock().await;
         if let Some(sess) = sessions.get_mut(session_id) {
+            sess.last_activity = std::time::Instant::now();
             if let Some(cancel) = sess.active_turn_cancel.take() {
                 cancel.cancel();
                 return Ok(());
@@ -261,6 +334,7 @@ impl SessionCoordinator {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let mut sessions = self.sessions.lock().await;
         if let Some(sess) = sessions.get_mut(session_id) {
+            sess.last_activity = std::time::Instant::now();
             if let Some((prompt, _)) = &sess.pending_permission {
                 if prompt.permission_id == permission_id {
                     let (_, resp_tx) = sess.pending_permission.take().unwrap();
@@ -500,5 +574,57 @@ mod tests {
             "shutdown must drain a permission-parked turn promptly (took {:?})",
             start.elapsed()
         );
+    }
+
+    /// The reaper evicts an idle session but leaves a session with an active turn.
+    #[tokio::test]
+    async fn reaper_evicts_idle_sessions_but_not_active_ones() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let ws = TempDir::new().unwrap();
+        let ws_str = ws.path().to_str().unwrap();
+        let project_id = uuid::Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "t", ws_str)
+            .await
+            .unwrap();
+        let cfg =
+            serde_json::json!({"provider_id":"anthropic","model_id":"claude-opus-4-8"}).to_string();
+        let idle_sid = uuid::Uuid::new_v4().to_string();
+        let busy_sid = uuid::Uuid::new_v4().to_string();
+        for sid in [&idle_sid, &busy_sid] {
+            create_session(&pool, sid, &project_id, ws_str, ws_str, "t", "build", &cfg)
+                .await
+                .unwrap();
+        }
+
+        let coord = SessionCoordinator::new(
+            pool,
+            std::env::temp_dir(),
+            Arc::new(OneShotTextProvider),
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        coord.start_reaper(Duration::from_millis(100), Duration::from_millis(30));
+
+        let _rx1 = coord.get_or_create_session(&idle_sid).await.unwrap();
+        let _rx2 = coord.get_or_create_session(&busy_sid).await.unwrap();
+        // Mark busy_sid as having an active turn so the reaper must skip it.
+        {
+            let mut map = coord.sessions.lock().await;
+            map.get_mut(&busy_sid).unwrap().active_turn_cancel = Some(CancellationToken::new());
+        }
+
+        // Past the idle TTL + several reaper ticks.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        {
+            let map = coord.sessions.lock().await;
+            assert!(!map.contains_key(&idle_sid), "idle session must be evicted");
+            assert!(
+                map.contains_key(&busy_sid),
+                "a session with an active turn must NOT be evicted"
+            );
+        }
+
+        coord.shutdown(Duration::from_secs(5)).await;
     }
 }
