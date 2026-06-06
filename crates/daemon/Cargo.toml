@@ -1,0 +1,31 @@
+[package]
+name = "private-code-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+private-code-core = { workspace = true }
+private-code-protocol = { workspace = true }
+private-code-providers = { workspace = true }
+private-code-tools = { workspace = true }
+
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+axum = { workspace = true }
+tower-http = { workspace = true }
+futures-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+url = { workspace = true }
+git2 = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+async-trait = { workspace = true }
+

@@ -1,0 +1,30 @@
+[package]
+name = "private-code-cli"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+private-code-core.workspace = true
+private-code-protocol.workspace = true
+private-code-tui.workspace = true
+private-code-providers.workspace = true
+private-code-tools.workspace = true
+private-code-daemon = { path = "../crates/daemon" }
+tokio.workspace = true
+clap.workspace = true
+color-eyre.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+crossterm.workspace = true
+ratatui.workspace = true
+sqlx.workspace = true
+reqwest.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+http.workspace = true
+
+
+

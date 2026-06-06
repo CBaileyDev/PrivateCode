@@ -1,0 +1,34 @@
+# ---- Rust ----
+/target
+**/target
+**/*.rs.bk
+*.pdb
+
+# ---- Vendored reference (read-only OpenCode source; 101M, not ours to redistribute) ----
+/Reference
+
+# ---- Node / frontend ----
+**/node_modules
+apps/desktop/dist
+apps/desktop/.vite
+
+# ---- Tauri generated ----
+apps/desktop/src-tauri/gen
+
+# ---- Local data / secrets (never commit) ----
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+.env
+.env.*
+*.pem
+*.key
+
+# ---- OS / editor ----
+.DS_Store
+**/.DS_Store
+*.swp
+.idea/
+.vscode/

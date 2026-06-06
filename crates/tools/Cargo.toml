@@ -1,0 +1,25 @@
+[package]
+name = "private-code-tools"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+private-code-protocol.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ignore.workspace = true
+regex = "1.10" # Let's add directly or workspace if defined. Since it's not in workspace, let's specify version. Actually, let's specify version directly or we can add it to workspace. We'll specify it here.
+similar.workspace = true
+async-trait.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+url.workspace = true
+ipnetwork.workspace = true
+dns-lookup.workspace = true
+uuid.workspace = true
+globset.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
