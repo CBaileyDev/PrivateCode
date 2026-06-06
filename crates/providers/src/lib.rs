@@ -1,10 +1,12 @@
 pub mod anthropic;
+pub mod openai;
 pub mod provider;
 
 #[cfg(feature = "testkit")]
 pub mod testkit;
 
 pub use anthropic::{AnthropicProvider, context_window};
+pub use openai::{NVIDIA_BASE_URL, OpenAiCompatProvider};
 pub use provider::{ModelProvider, ProviderError, ProviderEvent, resolve_api_key};
 
 #[cfg(test)]

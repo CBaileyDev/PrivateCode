@@ -42,7 +42,13 @@ pub struct SessionCoordinator {
     pub sessions: Arc<Mutex<HashMap<String, ActiveSession>>>,
     pub pool: sqlx::SqlitePool,
     pub global_data_dir: PathBuf,
+    /// The default provider, used when a session's `provider_id` is not in
+    /// `providers` below.
     pub provider: Arc<dyn private_code_providers::ModelProvider>,
+    /// Named providers selected per-session by `model_config.provider_id`
+    /// (e.g. "anthropic" → default, "nvidia" → OpenAI-compatible). Empty by
+    /// default; the production daemon registers the extra ones it serves.
+    pub providers: HashMap<String, Arc<dyn private_code_providers::ModelProvider>>,
     pub tool_registry: Arc<private_code_tools::ToolRegistry>,
     /// Tracks every spawned task (event/permission routers + turn drains + reaper)
     /// so a graceful shutdown can wait for them to finish under a bounded timeout.
@@ -82,10 +88,39 @@ impl SessionCoordinator {
             pool,
             global_data_dir,
             provider,
+            providers: HashMap::new(),
             tool_registry,
             tracker: TaskTracker::new(),
             shutdown_token: CancellationToken::new(),
         }
+    }
+
+    /// Register a named provider, selected per-session when a session's
+    /// `model_config.provider_id` equals `id`. Call before wrapping in `Arc`.
+    pub fn register_provider(
+        &mut self,
+        id: impl Into<String>,
+        provider: Arc<dyn private_code_providers::ModelProvider>,
+    ) {
+        self.providers.insert(id.into(), provider);
+    }
+
+    /// Pick the provider for a session from its `model_config` JSON: the registered
+    /// provider whose key matches `provider_id`, else the default. Unknown or
+    /// unparseable configs fall back to the default rather than failing the turn.
+    fn select_provider(
+        &self,
+        model_config: &str,
+    ) -> Arc<dyn private_code_providers::ModelProvider> {
+        let provider_id = serde_json::from_str::<serde_json::Value>(model_config)
+            .ok()
+            .and_then(|v| v["provider_id"].as_str().map(str::to_string));
+        if let Some(id) = provider_id {
+            if let Some(p) = self.providers.get(&id) {
+                return p.clone();
+            }
+        }
+        self.provider.clone()
     }
 
     /// Spawn the idle-session reaper. Every `interval`, it evicts sessions that
@@ -180,10 +215,12 @@ impl SessionCoordinator {
         let (permission_prompt_tx, permission_prompt_rx) = mpsc::channel(100);
         let (event_tx, event_rx) = mpsc::channel(4096);
 
+        // Route to the session's configured provider (default if unregistered).
+        let provider = self.select_provider(&session_row.model_config);
         let orchestrator = Arc::new(Orchestrator::new(
             self.pool.clone(),
             self.global_data_dir.clone(),
-            self.provider.clone(),
+            provider,
             self.tool_registry.clone(),
             permission_prompt_tx,
             event_tx,
@@ -1104,5 +1141,58 @@ mod tests {
         }
 
         coord.shutdown(Duration::from_secs(5)).await;
+    }
+
+    /// A provider whose `count_tokens` returns a fixed sentinel, so a test can
+    /// tell which provider `select_provider` returned.
+    struct SentinelProvider(usize);
+    #[async_trait::async_trait]
+    impl ModelProvider for SentinelProvider {
+        async fn stream_chat(
+            &self,
+            _m: &str,
+            _s: Option<&str>,
+            _mt: u32,
+            _msgs: &[ChatMessage],
+            _t: &[serde_json::Value],
+        ) -> Result<BoxStream<'static, Result<ProviderEvent, ProviderError>>, ProviderError>
+        {
+            Ok(futures_util::stream::empty().boxed())
+        }
+        fn count_tokens(&self, _m: &str, _t: &str) -> usize {
+            self.0
+        }
+    }
+
+    /// `select_provider` routes by `model_config.provider_id`: a registered name
+    /// wins, anything else (incl. unparseable) falls back to the default.
+    #[tokio::test]
+    async fn select_provider_routes_by_provider_id() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let mut coord = SessionCoordinator::new(
+            pool,
+            std::env::temp_dir(),
+            Arc::new(SentinelProvider(1)), // default
+            Arc::new(private_code_tools::ToolRegistry::new()),
+        );
+        coord.register_provider("nvidia", Arc::new(SentinelProvider(2)));
+
+        // A registered provider_id selects that provider.
+        assert_eq!(
+            coord
+                .select_provider(r#"{"provider_id":"nvidia","model_id":"meta/llama"}"#)
+                .count_tokens("m", "x"),
+            2
+        );
+        // An unregistered provider_id falls back to the default.
+        assert_eq!(
+            coord
+                .select_provider(r#"{"provider_id":"anthropic","model_id":"claude-opus-4-8"}"#)
+                .count_tokens("m", "x"),
+            1
+        );
+        // Unparseable config falls back to the default rather than failing.
+        assert_eq!(coord.select_provider("not json").count_tokens("m", "x"), 1);
     }
 }

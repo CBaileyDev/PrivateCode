@@ -118,18 +118,20 @@ pub async fn start_daemon_with(
     pool: sqlx::SqlitePool,
     global_data_dir: PathBuf,
     provider: Arc<dyn ModelProvider>,
+    extra_providers: Vec<(String, Arc<dyn ModelProvider>)>,
     tool_registry: Arc<ToolRegistry>,
     listener: TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // NEVER log the token value — daemon logs are not a secret store (security.md T4).
     let token = auth::get_or_create_token(&global_data_dir)?;
-    let coordinator = Arc::new(SessionCoordinator::new(
-        pool.clone(),
-        global_data_dir,
-        provider,
-        tool_registry,
-    ));
+    let mut coordinator_inner =
+        SessionCoordinator::new(pool.clone(), global_data_dir, provider, tool_registry);
+    // Register additional providers selected per-session by `model_config.provider_id`.
+    for (id, p) in extra_providers {
+        coordinator_inner.register_provider(id, p);
+    }
+    let coordinator = Arc::new(coordinator_inner);
     // Evict idle sessions every 60s after 30 minutes of inactivity (frees live
     // state only — DB rows persist and sessions rebuild on next access).
     coordinator.start_reaper(
@@ -164,6 +166,13 @@ pub async fn start_daemon(
 
     let tool_registry = Arc::new(default_tool_registry());
     let provider: Arc<dyn ModelProvider> = Arc::new(AnthropicProvider::new());
+    // Additional providers selected per-session by `model_config.provider_id`.
+    // NVIDIA's OpenAI-compatible gateway (key: NVIDIA_API_KEY or keyring
+    // "private-code/nvidia"); the key is resolved lazily on first use.
+    let extra_providers: Vec<(String, Arc<dyn ModelProvider>)> = vec![(
+        "nvidia".to_string(),
+        Arc::new(private_code_providers::OpenAiCompatProvider::nvidia()),
+    )];
 
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     let listener = TcpListener::bind(addr).await?;
@@ -184,6 +193,7 @@ pub async fn start_daemon(
         pool,
         global_data_dir,
         provider,
+        extra_providers,
         tool_registry,
         listener,
         shutdown,
@@ -297,7 +307,7 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             // Discard the non-Send Box<dyn Error> result; we only assert the task ends.
-            let _ = start_daemon_with(pool, dir, provider, registry, listener, sd).await;
+            let _ = start_daemon_with(pool, dir, provider, vec![], registry, listener, sd).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;

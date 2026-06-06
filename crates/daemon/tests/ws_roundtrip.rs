@@ -95,8 +95,16 @@ async fn ws_round_trip_prompt_permission_output_completed_and_replay() {
     let sd = shutdown.clone();
     let dir = data_dir.path().to_path_buf();
     let server = tokio::spawn(async move {
-        let _ = private_code_daemon::start_daemon_with(pool, dir, provider, registry, listener, sd)
-            .await;
+        let _ = private_code_daemon::start_daemon_with(
+            pool,
+            dir,
+            provider,
+            vec![],
+            registry,
+            listener,
+            sd,
+        )
+        .await;
     });
 
     let url = format!(
