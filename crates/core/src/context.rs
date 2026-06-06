@@ -554,4 +554,155 @@ mod tests {
         std::fs::remove_file(&agents_path).ok();
         std::fs::remove_dir_all(&workspace_path).ok();
     }
+
+    use std::sync::{Arc, Mutex};
+
+    /// A test-only source with interior-mutable flags so one registry can be
+    /// driven through every reconcile state across successive calls — including
+    /// the two arms unreachable with the built-in sources (ReplacementBlocked via
+    /// Unavailable, and Incompatible-forced ReplacementReady).
+    struct ToggleSource {
+        state: Arc<Mutex<ToggleState>>,
+    }
+    struct ToggleState {
+        available: bool,
+        value: serde_json::Value,
+        force_incompatible: bool,
+    }
+
+    #[async_trait]
+    impl ContextSource for ToggleSource {
+        fn key(&self) -> &str {
+            "test/toggle"
+        }
+        async fn load(&self, _ws: &Path, _active: &Path) -> SourceLoad {
+            let s = self.state.lock().unwrap();
+            if s.available {
+                SourceLoad::Loaded(s.value.clone())
+            } else {
+                SourceLoad::Unavailable
+            }
+        }
+        fn compare(
+            &self,
+            previous: &serde_json::Value,
+            current: &serde_json::Value,
+        ) -> SourceCompare {
+            if self.state.lock().unwrap().force_incompatible {
+                SourceCompare::Incompatible
+            } else if previous == current {
+                SourceCompare::Unchanged
+            } else {
+                SourceCompare::Updated
+            }
+        }
+        fn encode(&self, value: &serde_json::Value) -> serde_json::Value {
+            value.clone()
+        }
+        fn render_baseline(&self, current: &serde_json::Value) -> String {
+            format!("toggle baseline: {current}")
+        }
+        fn render_update(
+            &self,
+            _previous: &serde_json::Value,
+            current: &serde_json::Value,
+        ) -> String {
+            format!("toggle updated: {current}")
+        }
+        fn render_removal(&self, _previous: &serde_json::Value) -> Option<String> {
+            Some("toggle removed".to_string())
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_produces_all_four_arms() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let pid = Uuid::new_v4().to_string();
+        let sid = Uuid::new_v4().to_string();
+        let ws = tempfile::tempdir().unwrap();
+        let wp = ws.path();
+        create_project(&pool, &pid, "t", wp.to_str().unwrap())
+            .await
+            .unwrap();
+        create_session(
+            &pool,
+            &sid,
+            &pid,
+            wp.to_str().unwrap(),
+            wp.to_str().unwrap(),
+            "t",
+            "build",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(Mutex::new(ToggleState {
+            available: true,
+            value: serde_json::json!("v1"),
+            force_incompatible: false,
+        }));
+        let reg = SystemContextRegistry {
+            sources: vec![Box::new(ToggleSource {
+                state: state.clone(),
+            })],
+        };
+
+        // T1: no epoch yet -> ReplacementReady; persist it.
+        let r1 = reg.reconcile(&pool, &sid, wp, wp).await.unwrap();
+        let (baseline, snapshot) = match r1 {
+            Reconcile::ReplacementReady { baseline, snapshot } => (baseline, snapshot),
+            other => panic!("T1 expected ReplacementReady, got {other:?}"),
+        };
+        let mut tx = pool.begin().await.unwrap();
+        let snap_json = serde_json::to_string(&snapshot).unwrap();
+        insert_context_epoch(&mut tx, &sid, "build", &baseline, &snap_json, 1)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+
+        // T2: source becomes Unavailable -> ReplacementBlocked.
+        state.lock().unwrap().available = false;
+        let r2 = reg.reconcile(&pool, &sid, wp, wp).await.unwrap();
+        assert!(
+            matches!(r2, Reconcile::ReplacementBlocked),
+            "T2 expected ReplacementBlocked, got {r2:?}"
+        );
+
+        // T3: available again but compare() forced Incompatible -> ReplacementReady.
+        {
+            let mut s = state.lock().unwrap();
+            s.available = true;
+            s.force_incompatible = true;
+        }
+        let r3 = reg.reconcile(&pool, &sid, wp, wp).await.unwrap();
+        assert!(
+            matches!(r3, Reconcile::ReplacementReady { .. }),
+            "T3 expected ReplacementReady (incompatible), got {r3:?}"
+        );
+
+        // T4: compatible value change -> Updated.
+        {
+            let mut s = state.lock().unwrap();
+            s.force_incompatible = false;
+            s.value = serde_json::json!("v2");
+        }
+        let r4 = reg.reconcile(&pool, &sid, wp, wp).await.unwrap();
+        assert!(
+            matches!(r4, Reconcile::Updated { .. }),
+            "T4 expected Updated, got {r4:?}"
+        );
+
+        // T5: back to the stored value, no incompatibility -> Unchanged.
+        {
+            let mut s = state.lock().unwrap();
+            s.value = serde_json::json!("v1");
+        }
+        let r5 = reg.reconcile(&pool, &sid, wp, wp).await.unwrap();
+        assert!(
+            matches!(r5, Reconcile::Unchanged),
+            "T5 expected Unchanged, got {r5:?}"
+        );
+    }
 }

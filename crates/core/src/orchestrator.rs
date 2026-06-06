@@ -1419,4 +1419,64 @@ mod tests {
             "the loop must stop at max_turns=2 from config"
         );
     }
+
+    #[tokio::test]
+    async fn test_agents_md_change_appends_system_delta_and_bumps_revision() {
+        let ws = TempDir::new().unwrap();
+        std::fs::write(ws.path().join("AGENTS.md"), "v1 instructions").unwrap();
+
+        let provider = Arc::new(ScriptedProvider {
+            turns: StdMutex::new(VecDeque::from(vec![
+                vec![
+                    ProviderEvent::TextDelta("ok1".into()),
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("end_turn".into()),
+                    },
+                ],
+                vec![
+                    ProviderEvent::TextDelta("ok2".into()),
+                    ProviderEvent::MessageStop {
+                        usage: UsageStats::default(),
+                        finish_reason: Some("end_turn".into()),
+                    },
+                ],
+            ])),
+        });
+
+        let (orch, sid, pool) = make_orch(provider, ws.path()).await;
+
+        // Turn 1: establishes the epoch (baseline embeds AGENTS.md v1).
+        let i1 = orch.admit_input(&sid, "first", "steer").await.unwrap();
+        orch.run_session_turn(&sid, &i1, CancellationToken::new())
+            .await
+            .unwrap();
+        let epoch1 = get_context_epoch(&pool, &sid).await.unwrap().unwrap();
+        let baseline1 = epoch1.baseline.clone();
+        let rev1 = epoch1.revision;
+
+        // Change AGENTS.md between turns.
+        std::fs::write(ws.path().join("AGENTS.md"), "v2 different instructions").unwrap();
+
+        // Turn 2: reconcile yields Updated -> a system delta message + revision bump,
+        // while the cached baseline stays byte-identical (prompt cache stays warm).
+        let i2 = orch.admit_input(&sid, "second", "steer").await.unwrap();
+        orch.run_session_turn(&sid, &i2, CancellationToken::new())
+            .await
+            .unwrap();
+
+        let epoch2 = get_context_epoch(&pool, &sid).await.unwrap().unwrap();
+        assert_eq!(epoch2.revision, rev1 + 1, "revision must bump on Updated");
+        assert_eq!(
+            epoch2.baseline, baseline1,
+            "baseline must stay byte-identical so the prompt cache is preserved"
+        );
+
+        let msgs = get_messages(&pool, &sid).await.unwrap();
+        assert!(
+            msgs.iter()
+                .any(|m| m.type_ == "system" && m.data.contains("v2 different")),
+            "an Updated turn must append a system delta message carrying the new instructions"
+        );
+    }
 }
