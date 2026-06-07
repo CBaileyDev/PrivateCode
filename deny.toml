@@ -56,8 +56,8 @@ ignore = [
 [licenses]
 version = 2
 confidence-threshold = 0.9
-# Our own workspace crates are `publish = false` and carry no license field;
-# skip them rather than forcing a license choice on internal binaries/libs.
+# Our own workspace crates are `publish = false`; they carry the project's
+# Apache-2.0 license (allowed below) and are skipped here as private crates.
 private = { ignore = true }
 allow = [
     "MIT",
