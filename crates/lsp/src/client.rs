@@ -286,22 +286,27 @@ fn severity_label(sev: u8) -> &'static str {
 async fn read_message<R: AsyncReadExt + Unpin>(
     reader: &mut BufReader<R>,
 ) -> Result<Option<Value>, LspError> {
+    // Capture `Content-Length` AS WE READ each header line — the buffer is
+    // cleared every iteration, so the value must be parsed before the blank-line
+    // separator scan, not after (the old code read the value off the already-
+    // cleared buffer and always failed with "missing Content-Length").
+    let mut content_len: Option<usize> = None;
     let mut header = String::new();
     loop {
         header.clear();
-        reader.read_line(&mut header).await?;
-        if header.is_empty() {
-            return Ok(None);
+        let n = reader.read_line(&mut header).await?;
+        if n == 0 {
+            return Ok(None); // EOF between frames
         }
-        if header == "\r\n" {
-            break;
+        let line = header.trim_end_matches(['\r', '\n']);
+        if line.is_empty() {
+            break; // blank line: end of headers
+        }
+        if let Some(v) = line.strip_prefix("Content-Length:") {
+            content_len = v.trim().parse().ok();
         }
     }
-    let len: usize = header
-        .lines()
-        .find_map(|l| l.strip_prefix("Content-Length:"))
-        .and_then(|v| v.trim().parse().ok())
-        .ok_or_else(|| LspError::Other("missing Content-Length".into()))?;
+    let len = content_len.ok_or_else(|| LspError::Other("missing Content-Length".into()))?;
 
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
@@ -337,5 +342,64 @@ mod tests {
         }]);
         assert!(s.contains("ERROR"));
         assert!(s.contains("expected `;`"));
+    }
+
+    /// A valid `Content-Length` framed JSON-RPC message must parse. The old
+    /// `read_message` cleared the header buffer every loop iteration, wiping the
+    /// `Content-Length:` line before the parse — so even a perfectly valid frame
+    /// returned `Err("missing Content-Length")` and killed the reader task on the
+    /// FIRST frame (publishDiagnostics never reached the diagnostics map).
+    #[tokio::test]
+    async fn read_message_parses_a_valid_content_length_frame() {
+        let body = r#"{"jsonrpc":"2.0","method":"textDocument/publishDiagnostics","params":{"uri":"file:///x.rs","diagnostics":[]}}"#;
+        let frame = format!("Content-Length: {}\r\n\r\n{}", body.len(), body);
+        let mut reader = BufReader::new(frame.as_bytes());
+        let msg = read_message(&mut reader)
+            .await
+            .expect("read_message must not error on a valid frame")
+            .expect("a valid frame yields Some(message)");
+        assert_eq!(
+            msg["method"].as_str(),
+            Some("textDocument/publishDiagnostics")
+        );
+    }
+
+    /// The `Content-Length` header must be captured even when another header
+    /// (e.g. `Content-Type`) precedes it — the bug was specifically losing the
+    /// value across the blank-line scan.
+    #[tokio::test]
+    async fn read_message_captures_content_length_after_other_headers() {
+        let body = r#"{"id":7,"result":{"ok":true}}"#;
+        let frame = format!(
+            "Content-Type: application/vscode-jsonrpc; charset=utf-8\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut reader = BufReader::new(frame.as_bytes());
+        let msg = read_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg["id"].as_i64(), Some(7));
+        assert_eq!(msg["result"]["ok"].as_bool(), Some(true));
+    }
+
+    /// Two framed messages back-to-back both decode (the reader-task loop calls
+    /// `read_message` repeatedly on the same stream).
+    #[tokio::test]
+    async fn read_message_decodes_consecutive_frames() {
+        let b1 = r#"{"id":1}"#;
+        let b2 = r#"{"id":2}"#;
+        let frames = format!(
+            "Content-Length: {}\r\n\r\n{}Content-Length: {}\r\n\r\n{}",
+            b1.len(),
+            b1,
+            b2.len(),
+            b2
+        );
+        let mut reader = BufReader::new(frames.as_bytes());
+        let m1 = read_message(&mut reader).await.unwrap().unwrap();
+        let m2 = read_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(m1["id"].as_i64(), Some(1));
+        assert_eq!(m2["id"].as_i64(), Some(2));
+        // EOF after the last frame yields None.
+        assert!(read_message(&mut reader).await.unwrap().is_none());
     }
 }
