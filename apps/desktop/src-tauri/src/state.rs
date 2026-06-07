@@ -60,3 +60,37 @@ pub async fn build_coordinator(
     coord.register_provider("lmstudio", Arc::new(OpenAiCompatProvider::lmstudio()));
     coord
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use private_code_core::db::{connect_db, run_migrations};
+    use tempfile::TempDir;
+
+    /// Headless boot check of the heaviest startup step: build_coordinator runs to
+    /// completion (config load, ecosystem bootstrap over a temp workspace,
+    /// provider registration, provider detection) without panicking, and every
+    /// known provider is registered so a key added in Settings at runtime works.
+    #[tokio::test]
+    async fn build_coordinator_boots_and_registers_all_providers() {
+        let pool = connect_db("sqlite::memory:").await.unwrap();
+        run_migrations(&pool).await.unwrap();
+        let dir = TempDir::new().unwrap();
+        let coord = build_coordinator(pool, dir.path().to_path_buf(), dir.path()).await;
+        for id in [
+            "anthropic",
+            "openai",
+            "google",
+            "nvidia",
+            "deepseek",
+            "groq",
+            "ollama",
+            "lmstudio",
+        ] {
+            assert!(
+                coord.providers.contains_key(id),
+                "provider {id} must be registered at startup"
+            );
+        }
+    }
+}
