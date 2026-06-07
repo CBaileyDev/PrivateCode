@@ -1,7 +1,7 @@
 //! Private Code Desktop — in-process engine construction.
 
 use private_code_core::config::AppConfig;
-use private_code_core::coordinator::SessionCoordinator;
+use private_code_core::coordinator::{shared_ecosystem, shared_tool_registry, SessionCoordinator};
 use private_code_core::ecosystem::Ecosystem;
 use private_code_providers::{
     AnthropicProvider, GoogleProvider, ModelProvider, OpenAiCompatProvider,
@@ -33,10 +33,15 @@ pub async fn build_coordinator(
     workspace: &Path,
 ) -> SessionCoordinator {
     let config = AppConfig::load(&global_data_dir, workspace);
-    let mut tool_registry = default_tool_registry();
-    let ecosystem = Arc::new(
-        Ecosystem::bootstrap(workspace, &global_data_dir, &config, &mut tool_registry).await,
-    );
+    let tool_registry = shared_tool_registry(default_tool_registry());
+    let ecosystem_slot = shared_ecosystem(None);
+    {
+        let mut guard = tool_registry.write().await;
+        let ecosystem =
+            Ecosystem::bootstrap(workspace, &global_data_dir, &config, &mut guard).await;
+        drop(guard);
+        *ecosystem_slot.write().await = Some(Arc::new(ecosystem));
+    }
     // Anthropic is the default provider; the rest are registered by name. ALL
     // known providers are registered unconditionally — they resolve their
     // credential lazily on first use, so a key the user pastes into Settings at
@@ -47,9 +52,9 @@ pub async fn build_coordinator(
         pool,
         global_data_dir,
         provider.clone(),
-        Arc::new(tool_registry),
-    )
-    .with_ecosystem(ecosystem);
+        tool_registry,
+        ecosystem_slot,
+    );
     coord.register_provider("anthropic", provider);
     coord.register_provider("openai", Arc::new(OpenAiCompatProvider::openai()));
     coord.register_provider("google", Arc::new(GoogleProvider::new()));

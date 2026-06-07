@@ -110,5 +110,29 @@
       "cache_read_cost_per_mtok": 0.0,
       "cache_write_cost_per_mtok": 0.0
     }
+  },
+  "deepseek": {
+    "deepseek-chat": {
+      "display_name": "DeepSeek Chat",
+      "context_window": 65536,
+      "max_output": 8192,
+      "capabilities": ["tools"],
+      "input_cost_per_mtok": 0.27,
+      "output_cost_per_mtok": 1.1,
+      "cache_read_cost_per_mtok": 0.07,
+      "cache_write_cost_per_mtok": 0.0
+    }
+  },
+  "groq": {
+    "llama-3.3-70b-versatile": {
+      "display_name": "Llama 3.3 70B (Groq)",
+      "context_window": 131072,
+      "max_output": 32768,
+      "capabilities": ["tools"],
+      "input_cost_per_mtok": 0.59,
+      "output_cost_per_mtok": 0.79,
+      "cache_read_cost_per_mtok": 0.0,
+      "cache_write_cost_per_mtok": 0.0
+    }
   }
 }

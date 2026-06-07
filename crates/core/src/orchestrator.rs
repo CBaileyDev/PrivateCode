@@ -1,8 +1,8 @@
 use crate::checkpoint::{GitSnapshotEngine, Snapshot};
 use crate::config::{AppConfig, DEFAULT_MODEL_ID};
 use crate::context::{Reconcile, SystemContextRegistry};
+use crate::coordinator::{SharedEcosystem, SharedToolRegistry};
 use crate::db::{self};
-use crate::ecosystem::Ecosystem;
 use crate::orchestration::{self, OrchestrationMode};
 use crate::permissions::{
     self, PermissionDecision, PermissionPrompt, PermissionReply, PermissionRule,
@@ -10,7 +10,7 @@ use crate::permissions::{
 use private_code_protocol::event::{DeltaPayload, ProtocolEvent, UsageStats};
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role, ToolResultContent};
 use private_code_providers::provider::{ModelProvider, ProviderError, ProviderEvent};
-use private_code_tools::tool::{ToolContext, ToolRegistry};
+use private_code_tools::tool::ToolContext;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,8 +32,8 @@ pub struct Orchestrator {
     /// fail honestly rather than silently running the default and mislabeling it.
     pub providers: HashMap<String, Arc<dyn ModelProvider>>,
     pub context_registry: SystemContextRegistry,
-    pub tool_registry: Arc<ToolRegistry>,
-    pub ecosystem: Option<Arc<Ecosystem>>,
+    pub tool_registry: SharedToolRegistry,
+    pub ecosystem: SharedEcosystem,
     pub permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionReply>)>,
     pub event_tx: mpsc::Sender<ProtocolEvent>,
 }
@@ -164,7 +164,8 @@ impl Orchestrator {
         pool: SqlitePool,
         global_data_dir: PathBuf,
         provider: Arc<dyn ModelProvider>,
-        tool_registry: Arc<ToolRegistry>,
+        tool_registry: SharedToolRegistry,
+        ecosystem: SharedEcosystem,
         permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionReply>)>,
         event_tx: mpsc::Sender<ProtocolEvent>,
     ) -> Self {
@@ -175,22 +176,10 @@ impl Orchestrator {
             providers: HashMap::new(),
             context_registry: SystemContextRegistry::new(),
             tool_registry,
-            ecosystem: None,
+            ecosystem,
             permission_prompt_tx,
             event_tx,
         }
-    }
-
-    pub fn with_ecosystem(mut self, ecosystem: Arc<Ecosystem>) -> Self {
-        self.ecosystem = Some(ecosystem);
-        self
-    }
-
-    pub fn maybe_ecosystem(mut self, ecosystem: Option<Arc<Ecosystem>>) -> Self {
-        if let Some(e) = ecosystem {
-            self.ecosystem = Some(e);
-        }
-        self
     }
 
     /// Attach the id→provider map used for multi-model orchestration. Builder so
@@ -588,7 +577,7 @@ impl Orchestrator {
             let mut chat_msgs = Self::assemble_chat_messages(&db_msgs)?;
 
             // Expose schemas
-            let tool_schemas = self.tool_registry.list_schemas();
+            let tool_schemas = self.tool_registry.read().await.list_schemas();
 
             // Proactive compaction: if the estimated request exceeds the context
             // window (minus the output reservation + buffer), fold older turns into
@@ -1019,20 +1008,15 @@ impl Orchestrator {
                         .ok();
                 }
 
-                let tool_opt = self.tool_registry.get(tool_name);
-                let tool = match tool_opt {
-                    Some(t) => t,
-                    None => {
-                        tool_results.push(ContentBlock::ToolResult {
-                            tool_use_id: call_id.clone(),
-                            content: ToolResultContent::Text(format!(
-                                "Tool {} not found",
-                                tool_name
-                            )),
-                            is_error: true,
-                        });
-                        continue;
-                    }
+                let registry_guard = self.tool_registry.read().await;
+                let Some(tool) = registry_guard.get(tool_name) else {
+                    drop(registry_guard);
+                    tool_results.push(ContentBlock::ToolResult {
+                        tool_use_id: call_id.clone(),
+                        content: ToolResultContent::Text(format!("Tool {} not found", tool_name)),
+                        is_error: true,
+                    });
+                    continue;
                 };
 
                 // Formulate permission action/resource
@@ -1227,9 +1211,10 @@ impl Orchestrator {
                 };
 
                 // Append LSP diagnostics after mutating file writes (Phase 5.1).
-                if !is_err
+                if !cancelled
+                    && !is_err
                     && tool.mutates()
-                    && let Some(eco) = &self.ecosystem
+                    && let Some(eco) = self.ecosystem.read().await.as_ref()
                     && let Some(rel) = arguments["path"].as_str()
                 {
                     let file_path = workspace_path.join(rel);
@@ -1253,8 +1238,8 @@ impl Orchestrator {
                     }
                 }
 
-                // If tool mutates, take a Post-Step checkpoint
-                if tool.mutates() {
+                // If tool mutates, take a Post-Step checkpoint (skip on error/cancel).
+                if !cancelled && !is_err && tool.mutates() {
                     let post_step_hash = checkpoint_engine.track().await?;
                     if let Some(ref hash) = post_step_hash {
                         let mut tx = self.pool.begin().await?;
@@ -2009,12 +1994,14 @@ impl Orchestrator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coordinator::{shared_ecosystem, shared_tool_registry};
     use crate::db::{
         connect_db, create_project, create_session, get_context_epoch, get_messages, run_migrations,
     };
     use futures_util::stream::{BoxStream, StreamExt};
     use private_code_protocol::message::ChatMessage;
     use private_code_providers::provider::{ModelProvider, ProviderError, ProviderEvent};
+    use private_code_tools::ToolRegistry;
     use private_code_tools::tool::{Tool, ToolContext, ToolError};
     use sqlx::SqlitePool;
     use std::collections::VecDeque;
@@ -2143,7 +2130,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             provider,
-            Arc::new(reg),
+            shared_tool_registry(reg),
+            shared_ecosystem(None),
             ptx,
             etx,
         );
@@ -2861,7 +2849,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             provider,
-            Arc::new(reg),
+            shared_tool_registry(reg),
+            shared_ecosystem(None),
             ptx,
             etx,
         ));
@@ -2977,7 +2966,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             provider,
-            Arc::new(reg),
+            shared_tool_registry(reg),
+            shared_ecosystem(None),
             ptx,
             etx,
         ));
@@ -3103,7 +3093,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(ImmediateErrorProvider),
-            Arc::new(ToolRegistry::new()),
+            shared_tool_registry(ToolRegistry::new()),
+            shared_ecosystem(None),
             ptx,
             etx,
         ));

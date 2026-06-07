@@ -6,6 +6,7 @@
 
 use async_trait::async_trait;
 use private_code_core::checkpoint::{GitSnapshotEngine, Snapshot, TreeHash};
+use private_code_core::coordinator::{shared_ecosystem, shared_tool_registry};
 use private_code_core::db;
 use private_code_core::orchestrator::Orchestrator;
 use private_code_core::permissions::{PermissionPrompt, PermissionReply};
@@ -161,7 +162,8 @@ async fn git_backed_turn_persists_messages_events_and_checkpoints() {
         pool.clone(),
         data_path.clone(),
         provider,
-        Arc::new(reg),
+        shared_tool_registry(reg),
+        shared_ecosystem(None),
         ptx,
         etx,
     );

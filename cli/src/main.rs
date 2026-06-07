@@ -111,12 +111,14 @@ enum AuthCommands {
 }
 
 async fn is_daemon_running(port: u16) -> bool {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap_or_else(|_| reqwest::Client::new());
     let url = format!("http://127.0.0.1:{}/provider", port);
-    match client.get(&url).send().await {
-        Ok(_) => true,
-        Err(e) => !e.is_connect(),
-    }
+    // Any HTTP response means the daemon is listening; timeouts/DNS/TLS errors
+    // are treated as "not running" so `ensure_daemon` can spawn a fresh one.
+    client.get(&url).send().await.is_ok()
 }
 
 async fn ensure_daemon(
@@ -462,11 +464,13 @@ async fn run_selftest(turns: u32) -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
+    use private_code_core::coordinator::{shared_ecosystem, shared_tool_registry};
     let coord = SessionCoordinator::new(
         pool,
         data_dir.path().to_path_buf(),
         Arc::new(SelftestProvider),
-        Arc::new(ToolRegistry::new()),
+        shared_tool_registry(ToolRegistry::new()),
+        shared_ecosystem(None),
     );
 
     // A turn that never completes is a hard failure (deadlock / lost wakeup),

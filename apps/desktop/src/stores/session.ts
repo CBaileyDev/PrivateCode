@@ -13,6 +13,7 @@ import { clearCandidates } from "./candidates";
 import { clearCheckpoints } from "./checkpoints";
 import { showToast } from "./toast";
 import { loadProviderStatus, connectedModels, providerStore } from "./providers";
+import { setModelInfo } from "./usage";
 
 // Monotonic subscription generation. Each `setActiveSession` mints a new value;
 // only the LATEST subscription's channel applies events. This subsumes the
@@ -130,6 +131,7 @@ async function loadSessions() {
 /** Set the active session and subscribe to its event stream. */
 async function setActiveSession(session: SessionInfo) {
   setSessionStore("activeSession", session);
+  syncUsageModelFromConfig(session.model_config);
   // Record the displayed session SYNCHRONOUSLY (before any await) and mint a new
   // subscription generation so any in-flight load / older channel is superseded.
   setDisplayedSession(session.id);
@@ -354,6 +356,15 @@ function providerIdOf(cfg: string): string | null {
   }
 }
 
+function syncUsageModelFromConfig(modelConfig: string) {
+  try {
+    const cfg = JSON.parse(modelConfig || "{}");
+    setModelInfo(cfg.model_id ?? "claude-opus-4-8", cfg.provider_id ?? "anthropic");
+  } catch {
+    /* keep prior usage panel values */
+  }
+}
+
 async function setActiveModel(modelConfig: string): Promise<boolean> {
   const s = sessionStore.activeSession;
   if (!s) return true;
@@ -365,6 +376,7 @@ async function setActiveModel(modelConfig: string): Promise<boolean> {
       modelConfig,
     })) as boolean;
     patchSessionConfig(s.id, { model_config: modelConfig });
+    syncUsageModelFromConfig(modelConfig);
     pendingModelChange = live ? null : { sessionId: s.id, config: modelConfig };
     // A LIVE provider change evicts + rebuilds the session in the coordinator,
     // which tears down our event subscription. Re-attach so streaming keeps

@@ -7,6 +7,7 @@
 
 use async_trait::async_trait;
 use futures_util::stream::{BoxStream, StreamExt};
+use private_code_core::coordinator::{shared_ecosystem, shared_tool_registry};
 use private_code_core::db;
 use private_code_core::orchestrator::Orchestrator;
 use private_code_core::permissions::{PermissionPrompt, PermissionReply};
@@ -68,7 +69,8 @@ async fn setup(provider: Arc<dyn ModelProvider>, project_config_json: &str) -> H
         pool.clone(),
         data.path().to_path_buf(),
         provider,
-        Arc::new(ToolRegistry::new()),
+        shared_tool_registry(ToolRegistry::new()),
+        shared_ecosystem(None),
         ptx,
         etx,
     );

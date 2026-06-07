@@ -132,18 +132,30 @@ impl LspClient {
         };
 
         let root_uri = path_to_uri(root);
-        client
-            .request(
+        const INIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+        match tokio::time::timeout(
+            INIT_TIMEOUT,
+            client.request(
                 "initialize",
                 serde_json::json!({
                     "processId": std::process::id(),
                     "rootUri": root_uri,
                     "capabilities": {},
                 }),
-            )
-            .await?;
-        client.notify("initialized", serde_json::json!({})).await?;
-        Ok(client)
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => {
+                client.notify("initialized", serde_json::json!({})).await?;
+                Ok(client)
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(LspError::Other(format!(
+                "initialize timed out after {}s",
+                INIT_TIMEOUT.as_secs()
+            ))),
+        }
     }
 
     pub async fn did_open(
