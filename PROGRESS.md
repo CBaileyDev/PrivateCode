@@ -194,25 +194,30 @@ Ran a 4-dimension read-only review workflow (WS recovery, CSP, coordinator concu
 
 | Step | Scope | Status |
 |---|---|---|
-| 5.1 | LSP client (`crates/lsp`) + post-write diagnostics in orchestrator | ✅ done (stdio JSON-RPC; live servers need local install) |
-| 5.2 | MCP client (`crates/mcp`) + ToolRegistry adapters | ✅ done (stdio spawn + env scrub; full duplex RPC pairing deferred) |
-| 5.3 | WASM plugins (`crates/plugins`, Extism optional feature) | ✅ done (hooks API + load; real WASM calls need `--features extism`) |
+| 5.1 | LSP client (`crates/lsp`) + post-write diagnostics in orchestrator | ✅ done — `read_message` Content-Length bug fixed; `publishDiagnostics` now parses (regression-tested). Live servers need local install. |
+| 5.2 | MCP client (`crates/mcp`) + ToolRegistry adapters | ✅ done — real id↔response pairing + newline framing + 30s timeout (regression-tested over `tokio::io::duplex`). Was a stub. |
+| 5.3 | WASM plugins (`crates/plugins`, Extism optional feature) | ⛔ **DEFERRED (not-done for v1)** — plugins load + log "Loaded plugin" but **hooks are never invoked**; WASM execution needs `--features extism` and the runtime has no host functions / memory+timeout limits / `with_wasi(false)`. See §4 LOW prerequisites. |
 | 5.4 | Provider breadth (Google, OpenAI/DeepSeek/Groq/Ollama/LM Studio) + auto-detect | ✅ done |
 | 5.5 | Model catalog (`catalog.rs` + vendored `models.json`) | ✅ done |
-| 5.6 | OS keychain CLI (`private-code auth set/list/remove`) | ✅ done |
-| 5.7 | Cost transparency (catalog pricing + existing UsagePanel) | ✅ done (OpenAI-compat cost still 0 without catalog lookup in provider) |
+| 5.6 | OS keychain CLI (`private-code auth set/list/remove`) | ✅ done (env-fallback resolution regression-tested) |
+| 5.7 | Cost transparency (catalog pricing + existing UsagePanel) | ✅ done — OpenAI-compat + Gemini now compute real cost from the catalog (was $0); cached tokens no longer double-counted. |
 | 5.8 | Slash commands `/cost`, `/share`, `/init` + config `commands` schema | ✅ done (GUI + TUI partial) |
-| 5.9 | `/init` AGENTS.md generation | ✅ done (sends generation prompt as user message) |
-| 5.10 | Session export (CLI + Tauri `export_session`) | ✅ done |
-| 5.11 | Auto-update | ⚠️ partial — CLI `private-code update` checks GitHub releases; Tauri updater not wired |
-| 5.12–5.14 | Packaging (`dist-workspace.toml`, `release.yml`, `install.sh`) | ⚠️ scaffold only — needs tag push + signing |
-| 5.15 | Phase-5 verification | ✅ `crates/core/tests/phase5.rs` + green gate |
+| 5.9 | `/init` AGENTS.md generation | ✅ done — GUI `/init` now actually invokes `send_prompt` (was an optimistic bubble only). |
+| 5.10 | Session export (CLI + Tauri `export_session`) | ✅ done — renderer fixed to extract ChatMessage content (was dumping raw JSON); md/json/file-write regression-tested. |
+| 5.11 | Auto-update | ⚠️ partial — CLI `private-code update` checks GitHub releases; Tauri updater not wired (see §3). |
+| 5.12–5.14 | Packaging (`dist-workspace.toml`, `release.yml`, `install.sh`) | ⚠️ scaffold — see §3 (signing/notarization + first green remote CI are human-only steps). |
+| 5.15 | Phase-5 verification | ✅ `crates/core/tests/phase5.rs` expanded to test export + keyring; green gate. |
 
-**⚠️ Correction (2026-06-06, release punch-list pass):** a prior line here claimed "clippy clean, **182** nextest passed" as a green gate. That was **false** — at that point `cargo fmt --all --check` was RED and `cargo nextest` was **181 pass / 1 fail** (`daemon::tests::test_daemon_authentication_and_routes`, a real bind-before-bootstrap startup defect). See `RELEASE_PUNCHLIST.md`. **§0 Blockers are now fixed:** truthful gate at the §0 landing = `cargo fmt --all --check` clean, `clippy -D warnings` clean, **183 nextest passed / 0 failed (4 skipped)**, desktop typecheck + build + **39 vitest** passed.
+**⚠️ Correction (2026-06-06, release punch-list pass):** a prior line here claimed "clippy clean, **182** nextest passed" as a green gate. That was **false** — at that point `cargo fmt --all --check` was RED and `cargo nextest` was **181 pass / 1 fail** (`daemon::tests::test_daemon_authentication_and_routes`, a real bind-before-bootstrap startup defect). See `RELEASE_PUNCHLIST.md`.
 
-**Phase-5 runtime defects still being worked (RELEASE_PUNCHLIST.md §1–§4):** steps 5.1 (LSP), 5.2 (MCP), 5.3 (plugins) are marked ✅ in the table above but had real runtime defects (dead diagnostics, stubbed MCP request, un-invoked plugin hooks). These are being fixed-with-regression-tests in the HIGH/MEDIUM tiers; the table is reconciled honestly in §5 once they land. Do **not** read the ✅ marks as "verified working at runtime" until then.
+**Release punch-list progress (current truthful state):**
+- **§0 Blockers — DONE:** fmt fixed; daemon binds before bootstrap; single-pass bounded LSP discovery.
+- **§1 HIGH — DONE (all 3, each with a regression test; a 5-agent adversarial self-review confirmed 0 must-fix defects):** LSP `read_message`; MCP request/response pairing; Gemini tool round-trips (unique ids + name-keyed `functionResponse`).
+- **§2 MEDIUM — DONE except 5.3:** OpenAI-compat + Gemini cost; Gemini `finish_reason` + terminal stop; GUI `/init`; export renderer + `phase5.rs` tests. **5.3 plugins is DEFERRED** (see table) — this supersedes the §0 note that said 5.3 was "being fixed"; it is **not** fixed and is explicitly out of scope for v1 until the sandbox (§4 LOW) lands. A user can configure a plugin and see it "loaded" yet get nothing — documented, not a silent surprise.
+- **Gate (after §2):** `fmt` clean, `clippy -D warnings` clean, **205 nextest passed / 0 failed (4 skipped)**, desktop typecheck + build + **40 vitest** passed.
+- **§3 Packaging / §4 LOW / §5 Docs:** in progress.
 
-**Ceilings (honest):** plugin WASM execution needs the Extism feature + a real `.wasm`; GUI `/init` and error banner are logic-tested only (headless ceiling unchanged); live BYOK provider smoke still out of scope; Homebrew/Scoop/AUR/Nix formulas not authored.
+**Ceilings (honest):** plugin WASM execution + sandbox = post-v1 (5.3 deferred); GUI smoke + live BYOK provider smoke are human-only; code signing/notarization + first observed green remote CI are human-only (no certs / `gh` unauth here); Homebrew/Scoop/AUR/Nix formulas not authored.
 
 ## Notes / caveats (honesty log)
 - **Remote CI runs exist but are not yet *observed*.** Commits push to `main`, and both `ci.yml` and `perf.yml` trigger on `push: [main]`, so the Actions runs are firing — but `gh` is not authenticated in this environment (the https push credential doesn't cover the CLI), so I cannot read the run results. Confirming the first green run is a human step (`gh run list` / the Actions tab). I verify by running each job's exact commands locally where the tool is installed.
