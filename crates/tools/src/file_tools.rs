@@ -33,11 +33,19 @@ pub fn validate_path(workspace_path: &Path, user_path: &str) -> Result<PathBuf, 
         let canonical_ancestor = ancestor.canonicalize().map_err(|e| {
             ToolError::PathOutOfBounds(format!("Failed to canonicalize ancestor: {}", e))
         })?;
-        if let Ok(rel) = resolved.strip_prefix(&ancestor) {
+        let joined = if let Ok(rel) = resolved.strip_prefix(&ancestor) {
             canonical_ancestor.join(rel)
         } else {
             canonical_ancestor
-        }
+        };
+        // The not-yet-existing tail can still contain `..`/`.` components that
+        // `canonicalize` could not resolve (the path doesn't exist yet). Fold them
+        // lexically before the boundary check below. Without this, a path such as
+        // `newdir/../../outside/x.txt` keeps its `..`, *literally* starts with the
+        // workspace prefix, passes `starts_with`, and the kernel then resolves the
+        // `..` at write time (after `create_dir_all`) to land OUTSIDE the
+        // workspace — a sandbox escape allowing arbitrary-file write.
+        normalize_lexical(&joined)
     };
 
     let canonical_workspace = workspace_path.canonicalize().map_err(|e| {
@@ -53,6 +61,26 @@ pub fn validate_path(workspace_path: &Path, user_path: &str) -> Result<PathBuf, 
             workspace_path.display()
         )))
     }
+}
+
+/// Lexically resolve `.` and `..` path components without touching the
+/// filesystem. Used for paths that don't exist yet, where `Path::canonicalize`
+/// cannot be called; the existing-ancestor prefix is already canonical, so
+/// folding the remaining tail here yields a fully-normalized absolute path safe
+/// to bounds-check. `..` never pops past the root component.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
 }
 
 // 1. ReadFile Tool
@@ -1102,6 +1130,78 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(range_res.as_str().unwrap(), "line 2");
+    }
+
+    #[tokio::test]
+    async fn test_validate_path_rejects_traversal_escape() {
+        // Workspace and a sibling "outside" dir that must remain unreachable.
+        let root = tempdir().unwrap();
+        let ws = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // Escapes via `..` into a NOT-yet-existing tail must be rejected, not
+        // silently re-based inside the workspace prefix.
+        for evil in [
+            "../outside/pwned.txt",
+            "newdir/../../outside/pwned.txt",
+            "a/b/c/../../../../outside/pwned.txt",
+        ] {
+            let res = validate_path(&ws, evil);
+            assert!(
+                matches!(res, Err(ToolError::PathOutOfBounds(_))),
+                "expected {evil:?} to be rejected, got {res:?}"
+            );
+        }
+
+        // The absolute-path form of the same escape is rejected too.
+        let abs_evil = ws.join("zzz/../../outside/pwned.txt");
+        assert!(matches!(
+            validate_path(&ws, &abs_evil.to_string_lossy()),
+            Err(ToolError::PathOutOfBounds(_))
+        ));
+
+        // A `..` that stays inside the workspace is still allowed (and normalized).
+        let ok = validate_path(&ws, "sub/../keep.txt").expect("in-workspace .. is fine");
+        assert!(ok.starts_with(ws.canonicalize().unwrap()));
+        assert!(!ok.to_string_lossy().contains(".."));
+    }
+
+    #[tokio::test]
+    async fn test_write_tool_cannot_escape_workspace() {
+        // End-to-end: the WriteFileTool must not create a file outside the root.
+        let root = tempdir().unwrap();
+        let ws = root.path().join("workspace");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let mut cache = HashMap::new();
+        let mut ctx = ToolContext {
+            workspace_path: &ws,
+            active_dir: &ws,
+            file_read_cache: &mut cache,
+            global_data_dir: &ws,
+            max_lines: 100,
+            max_bytes: 1000,
+        };
+
+        let write = WriteFileTool;
+        let res = write
+            .run(
+                &mut ctx,
+                json!({
+                    "path": "newdir/../../outside/pwned.txt",
+                    "content": "escaped"
+                }),
+            )
+            .await;
+        assert!(res.is_err(), "write outside workspace must fail: {res:?}");
+        assert!(
+            !outside.join("pwned.txt").exists(),
+            "file was written outside the workspace — sandbox escape"
+        );
     }
 
     #[tokio::test]

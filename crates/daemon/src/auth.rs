@@ -100,7 +100,7 @@ pub async fn auth_middleware(
     if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(bearer_token) = auth_str.strip_prefix("Bearer ") {
-                if bearer_token.trim() == token {
+                if constant_time_eq(bearer_token.trim().as_bytes(), token.as_bytes()) {
                     authed = true;
                 }
             }
@@ -113,7 +113,9 @@ pub async fn auth_middleware(
         if let Some(query) = uri.query() {
             let params = url::form_urlencoded::parse(query.as_bytes());
             for (key, val) in params {
-                if (key == "token" || key == "access_token") && val == token {
+                if (key == "token" || key == "access_token")
+                    && constant_time_eq(val.as_bytes(), token.as_bytes())
+                {
                     authed = true;
                     break;
                 }
@@ -128,9 +130,34 @@ pub async fn auth_middleware(
     Ok(next.run(req).await)
 }
 
+/// Best-effort constant-time byte comparison for the auth token: it does not
+/// short-circuit on the first differing byte, so it doesn't leak the token via
+/// response-timing. The length check is not secret (the token is a fixed-length
+/// UUID). Avoids a crypto dependency for what is a loopback-only, defence-in-depth
+/// hardening over `==`.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_matches_value_equality() {
+        assert!(constant_time_eq(b"hunter2", b"hunter2"));
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"hunter2", b"hunter3"));
+        assert!(!constant_time_eq(b"short", b"longer-token"));
+        assert!(!constant_time_eq(b"token", b""));
+    }
 
     #[test]
     fn loopback_host_is_exact_match() {

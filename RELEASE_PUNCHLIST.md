@@ -4,6 +4,102 @@
 >
 > **How to use (Claude Code):** work top-down — **Blockers → HIGH → MEDIUM → packaging → LOW**. Every item is a checkbox with the exact `file:line`, the problem, and the fix. After each cluster, run the **Gate** at the bottom and only commit when it is truthfully green. Use the project conventions in `AIChatContext.md` (commit trailer, per-cluster gate→commit→push to `main`). Do **not** mark a step "done" in `PROGRESS.md` unless the gate passes.
 
+## 🔴→🟢 RELEASE AUDIT (2026-06-07, independent re-review)
+
+A fresh release-readiness pass (4 parallel subsystem reviews + a full local gate + a
+look at the **remote CI history**) found the project was **not** releasable as claimed:
+**CI had never been green — 0 of 30 runs passed** (16 failures, 14 superseded). The
+latest `main` run failed on the **`quality (windows-latest)`** job. The blocker and the
+most serious bugs are now fixed; the rest is itemized below.
+
+### Fixed in this pass (gate verified green locally; regression-tested)
+- **[CI BLOCKER] Windows build broke the whole gate.** `tauri-build` requires
+  `apps/desktop/src-tauri/icons/icon.ico` on Windows (and `icon.icns` for macOS
+  bundles); both were **missing**, so the desktop crate's build script exited 1, failing
+  the Windows `clippy`/`nextest` steps and reddening every CI run. The same gap blocked
+  the macOS/Windows desktop bundles in `release.yml` (documented there as a "human
+  ceiling"). **Fix:** generated `icon.ico` + `icon.icns` from `icon.png` via
+  `tauri icon`; wired both into `tauri.conf.json` `bundle.icon`.
+- **[CRITICAL — sandbox escape] Path traversal in `validate_path`**
+  (`crates/tools/src/file_tools.rs`). For a not-yet-existing target, the `..` tail was
+  re-attached without normalization, so `newdir/../../outside/x.txt` passed the
+  `starts_with(workspace)` check and the kernel resolved the `..` at write time to land
+  **outside the workspace**. Reachable in the default `build` agent (write/patch tools) →
+  arbitrary-file write. **Fix:** lexical `.`/`..` normalization before the boundary
+  check, + 2 regression tests (unit + end-to-end write).
+- **[HIGH — first-run crash] CLI never creates its SQLite DB.** `db::connect_db` lacked
+  `.create_if_missing(true)` and the CLI URL carries no `?mode=rwc`, so a fresh install
+  failed with `SQLITE_CANTOPEN` on the first `tui`/`prompt`/`serve`. Not caught because
+  every test uses `sqlite::memory:`. **Fix:** `.create_if_missing(true)` in `connect_db`
+  (fixes CLI + desktop at the chokepoint), + regression test.
+- **[HIGH — secret leak] Gemini API key in the URL.** `google.rs` sent `?key=<secret>`;
+  reqwest attaches the full URL to transport errors, which are stringified into the
+  user-facing error toast and the tracing log → key leak on any DNS/TLS/timeout error.
+  **Fix:** send `x-goog-api-key` header instead (matches Anthropic/OpenAI header auth).
+- **[HIGH — undo correctness] Revert restores the wrong checkpoint.**
+  `list_checkpoints` ordered by whole-second `created_at` with no tiebreaker; the 3
+  checkpoints written per turn share a second, so "revert to latest" landed on an
+  arbitrary sibling. **Fix:** `ORDER BY created_at DESC, rowid DESC` (monotonic insertion
+  order), + regression test.
+- **[MED — security hardening] Daemon auth token compared with `==`.** Non-constant-time;
+  switched both check paths to a constant-time compare, + test. (Loopback-only,
+  defense-in-depth.)
+
+### Still OPEN — recommended before tagging v1
+**HIGH**
+- **Daemon startup ordering is only half-fixed.** `start_daemon` now `bind`s before
+  bootstrap (so the port opens and the auth test passes), but `Ecosystem::bootstrap` +
+  `detect_providers` still run on the path **before `axum::serve`**. A slow/hanging
+  `rust-analyzer` `initialize` still blocks request *serving* (now a hang instead of a
+  refused connection). Fix: `tokio::spawn` the bootstrap and attach to the coordinator
+  when ready, or make `LspManager::new` lazy + timeout-bounded. (`crates/daemon/src/lib.rs`)
+- **Desktop `subscribe_session` leaks a backend task + broadcast receiver on every session
+  switch / live model change** (`apps/desktop/src-tauri/src/commands.rs` ~515). The bare
+  `tokio::spawn` forwarder never stops when the JS `Channel` is dropped → unbounded task
+  growth. Fix: track and abort the prior forwarder per session.
+
+**MEDIUM**
+- Orchestrator drops `finish_reason` on the single-model loop → UI/telemetry never sees
+  `length`/`MAX_TOKENS`/`safety` truncation (`crates/core/src/orchestrator.rs` ~831,949).
+- DeepSeek / Groq / NVIDIA report **$0 cost** (no catalog pricing rows)
+  (`crates/providers/data/models.json`).
+- Desktop `UsagePanel` "Active Model" is hardcoded to `anthropic/claude-opus-4-8`;
+  `setModelInfo` is never called (`apps/desktop/src/stores/usage.ts`).
+- Desktop `DiffViewer.tsx` is **dead code** and its advertised per-hunk accept/reject does
+  not exist; tool diffs render as plain JSON. Wire it in or delete it + drop the claim.
+- `private-code update` is a **check-only stub** — no download/replace, **no
+  checksum/signature verification**, no request timeout, exits 0 on HTTP failure
+  (`cli/src/main.rs` ~565). Implement a verified updater or rename/scope it as deferred.
+- `is_daemon_running` treats timeout/TLS/DNS errors as "up" → `ensure_daemon` can hand the
+  TUI a dead daemon (`cli/src/main.rs` ~113).
+
+**LOW / hardening**
+- `get_config` no-config default diverges from `AppConfig::default()` (hardcoded
+  `/bin/zsh`) (`crates/daemon/src/routes.rs` ~351).
+- Post-step checkpoint + LSP diagnostics fire even after a tool is cancelled/aborted
+  (`crates/core/src/orchestrator.rs` ~1257).
+- Bash tool hardcodes `/bin/zsh`, ignores the `shell` config (`crates/tools/src/system_tools.rs` ~74).
+- Daemon token accepted via `?token=` query string (log/Referer exposure; loopback-only).
+- Narrow Tauri `shell.open: true` to an `^https?://` regex.
+- Desktop dead components (`ThemeToggle.tsx`, `ConnectionStatus.tsx`), double message
+  fetch on session click, dead usage-store helpers, lingering fan-out panes.
+
+### Still OPEN — release/packaging & process (human / CI)
+- **No `LICENSE` file** at the repo root and no `license` field in any `Cargo.toml` —
+  required before any public/binary distribution (choose MIT / Apache-2.0 / proprietary).
+- **Code signing + notarization** not done (macOS notarization, Windows signing, Tauri
+  updater key are human-provided secrets) — desktop bundles ship **unsigned**.
+- **Package-manager distribution** (Homebrew / Scoop / AUR / Nix) not authored.
+- **Confirm CI is green on the remote** after the icon fix. The Windows job never reached
+  `clippy`/`nextest` (it died in the build script), so a re-run is needed to prove the
+  rest of the Windows gate is also green.
+- **MCP (5.2)** and **Plugins (5.3)** remain deferred/stubbed — keep them honestly marked
+  not-done in `PROGRESS.md`.
+- Two human-only smoke tests still stand: in-webview live BYOK conversation, and the GUI
+  panel walkthrough.
+
+---
+
 ## 🖥️ GUI MADE FUNCTIONAL (2026-06-07)
 
 After the punch-list pass, a live GUI test found the desktop app's interactive flows
