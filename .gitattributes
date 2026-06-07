@@ -1,0 +1,14 @@
+# Force LF line endings on checkout for every OS.
+#
+# Several tests embed byte-exact wire-format fixtures via include_str!
+# (e.g. crates/providers/tests/fixtures/*.sse). On a Windows runner with
+# autocrlf, an LF blob is checked out as CRLF, so include_str! embeds the wrong
+# bytes and the SSE/JSON parsers fail ("trailing characters"). Pinning LF keeps
+# fixtures — and Rust sources, shell scripts, queries, and configs — identical
+# across Linux, macOS, and Windows.
+* text=auto eol=lf
+
+# Binary assets git must never line-ending-convert.
+*.png  binary
+*.ico  binary
+*.icns binary
