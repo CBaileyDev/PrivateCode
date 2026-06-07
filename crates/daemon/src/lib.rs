@@ -8,7 +8,9 @@ use axum::{
     Router,
 };
 use private_code_core::config::AppConfig;
-use private_code_core::coordinator::SessionCoordinator;
+use private_code_core::coordinator::{
+    shared_ecosystem, shared_tool_registry, SessionCoordinator, SharedEcosystem, SharedToolRegistry,
+};
 use private_code_core::ecosystem::Ecosystem;
 use private_code_providers::anthropic::AnthropicProvider;
 use private_code_providers::{detect_providers, ModelProvider};
@@ -121,18 +123,20 @@ pub async fn start_daemon_with(
     global_data_dir: PathBuf,
     provider: Arc<dyn ModelProvider>,
     extra_providers: Vec<(String, Arc<dyn ModelProvider>)>,
-    tool_registry: Arc<ToolRegistry>,
-    ecosystem: Option<Arc<Ecosystem>>,
+    tool_registry: SharedToolRegistry,
+    ecosystem: SharedEcosystem,
     listener: TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // NEVER log the token value — daemon logs are not a secret store (security.md T4).
     let token = auth::get_or_create_token(&global_data_dir)?;
-    let mut coordinator_inner =
-        SessionCoordinator::new(pool.clone(), global_data_dir, provider, tool_registry);
-    if let Some(eco) = ecosystem {
-        coordinator_inner = coordinator_inner.with_ecosystem(eco);
-    }
+    let mut coordinator_inner = SessionCoordinator::new(
+        pool.clone(),
+        global_data_dir,
+        provider,
+        tool_registry,
+        ecosystem,
+    );
     // Register additional providers selected per-session by `model_config.provider_id`.
     for (id, p) in extra_providers {
         coordinator_inner.register_provider(id, p);
@@ -182,17 +186,24 @@ pub async fn start_daemon(
     tracing::info!("Listening on {}", addr);
 
     let config = AppConfig::load(&global_data_dir, std::path::Path::new("."));
-    let mut tool_registry = default_tool_registry();
-    let ecosystem = Arc::new(
-        Ecosystem::bootstrap(
-            std::path::Path::new("."),
-            &global_data_dir,
-            &config,
-            &mut tool_registry,
-        )
-        .await,
-    );
-    let tool_registry = Arc::new(tool_registry);
+    let tool_registry = shared_tool_registry(default_tool_registry());
+    let ecosystem = shared_ecosystem(None);
+
+    // Bootstrap LSP/MCP/plugins in the background so axum can serve immediately.
+    // Core file/bash tools are already registered; MCP tools appear when ready.
+    let tr_bg = tool_registry.clone();
+    let eco_bg = ecosystem.clone();
+    let gd_bg = global_data_dir.clone();
+    let cfg_bg = config.clone();
+    tokio::spawn(async move {
+        let mut guard = tr_bg.write().await;
+        let eco =
+            Ecosystem::bootstrap(std::path::Path::new("."), &gd_bg, &cfg_bg, &mut guard).await;
+        drop(guard);
+        *eco_bg.write().await = Some(Arc::new(eco));
+        tracing::info!("Daemon ecosystem bootstrap complete (LSP/MCP/plugins)");
+    });
+
     let provider: Arc<dyn ModelProvider> = Arc::new(AnthropicProvider::new());
     let mut extra_providers: Vec<(String, Arc<dyn ModelProvider>)> = vec![
         ("anthropic".to_string(), provider.clone()),
@@ -222,7 +233,7 @@ pub async fn start_daemon(
         provider,
         extra_providers,
         tool_registry,
-        Some(ecosystem),
+        ecosystem,
         listener,
         shutdown,
     )
@@ -327,7 +338,8 @@ mod tests {
 
         // DI: a mock provider, no network, on an ephemeral port.
         let provider: Arc<dyn ModelProvider> = Arc::new(ScriptedProvider::one_shot_text("hi"));
-        let registry = Arc::new(ToolRegistry::new());
+        let registry = shared_tool_registry(ToolRegistry::new());
+        let ecosystem = shared_ecosystem(None);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let shutdown = CancellationToken::new();
@@ -335,8 +347,17 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             // Discard the non-Send Box<dyn Error> result; we only assert the task ends.
-            let _ =
-                start_daemon_with(pool, dir, provider, vec![], registry, None, listener, sd).await;
+            let _ = start_daemon_with(
+                pool,
+                dir,
+                provider,
+                vec![],
+                registry,
+                ecosystem,
+                listener,
+                sd,
+            )
+            .await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;

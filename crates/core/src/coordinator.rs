@@ -1,12 +1,15 @@
 use crate::checkpoint::{GitSnapshotEngine, Snapshot, TreeHash};
 use crate::db;
+use crate::ecosystem::Ecosystem;
 use crate::orchestrator::Orchestrator;
 use crate::permissions::{PermissionPrompt, PermissionReply};
 use private_code_protocol::event::{ProtocolEvent, UsageStats};
+use private_code_tools::ToolRegistry;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use tokio::sync::RwLock;
 
 /// Max number of inputs that may be queued behind an active turn before
 /// `run_turn` rejects further admissions (session.md inbox backlog limit).
@@ -14,6 +17,19 @@ const MAX_BACKLOG: usize = 32;
 use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
+
+/// Shared tool registry — MCP tools may register after daemon HTTP is already serving.
+pub type SharedToolRegistry = Arc<RwLock<ToolRegistry>>;
+/// Shared ecosystem slot — LSP/MCP bootstrap may finish after the daemon accepts connections.
+pub type SharedEcosystem = Arc<RwLock<Option<Arc<Ecosystem>>>>;
+
+pub fn shared_tool_registry(registry: ToolRegistry) -> SharedToolRegistry {
+    Arc::new(RwLock::new(registry))
+}
+
+pub fn shared_ecosystem(ecosystem: Option<Arc<Ecosystem>>) -> SharedEcosystem {
+    Arc::new(RwLock::new(ecosystem))
+}
 
 pub struct ActiveSession {
     pub session_id: String,
@@ -50,8 +66,10 @@ pub struct SessionCoordinator {
     /// (e.g. "anthropic" → default, "nvidia" → OpenAI-compatible). Empty by
     /// default; the production daemon registers the extra ones it serves.
     pub providers: HashMap<String, Arc<dyn private_code_providers::ModelProvider>>,
-    pub tool_registry: Arc<private_code_tools::ToolRegistry>,
-    pub ecosystem: Option<Arc<crate::ecosystem::Ecosystem>>,
+    pub tool_registry: SharedToolRegistry,
+    pub ecosystem: SharedEcosystem,
+    /// Cancels stale `subscribe_session` forwarders when the frontend re-subscribes.
+    subscribe_forwarders: StdMutex<HashMap<String, CancellationToken>>,
     /// Tracks every spawned task (event/permission routers + turn drains + reaper)
     /// so a graceful shutdown can wait for them to finish under a bounded timeout.
     pub tracker: TaskTracker,
@@ -127,7 +145,8 @@ impl SessionCoordinator {
         pool: sqlx::SqlitePool,
         global_data_dir: PathBuf,
         provider: Arc<dyn private_code_providers::ModelProvider>,
-        tool_registry: Arc<private_code_tools::ToolRegistry>,
+        tool_registry: SharedToolRegistry,
+        ecosystem: SharedEcosystem,
     ) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -136,15 +155,28 @@ impl SessionCoordinator {
             provider,
             providers: HashMap::new(),
             tool_registry,
-            ecosystem: None,
+            ecosystem,
+            subscribe_forwarders: StdMutex::new(HashMap::new()),
             tracker: TaskTracker::new(),
             shutdown_token: CancellationToken::new(),
         }
     }
 
-    pub fn with_ecosystem(mut self, ecosystem: Arc<crate::ecosystem::Ecosystem>) -> Self {
-        self.ecosystem = Some(ecosystem);
-        self
+    /// Stop any prior desktop/daemon event forwarder for this session (re-subscribe).
+    pub fn cancel_session_subscribe(&self, session_id: &str) {
+        if let Some(token) = self.subscribe_forwarders.lock().unwrap().remove(session_id) {
+            token.cancel();
+        }
+    }
+
+    pub fn arm_session_subscribe(&self, session_id: &str) -> CancellationToken {
+        self.cancel_session_subscribe(session_id);
+        let token = CancellationToken::new();
+        self.subscribe_forwarders
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), token.clone());
+        token
     }
 
     /// Register a named provider, selected per-session when a session's
@@ -292,11 +324,11 @@ impl SessionCoordinator {
                 self.global_data_dir.clone(),
                 provider,
                 self.tool_registry.clone(),
+                self.ecosystem.clone(),
                 permission_prompt_tx,
                 event_tx,
             )
-            .with_providers(orch_providers)
-            .maybe_ecosystem(self.ecosystem.clone()),
+            .with_providers(orch_providers),
         );
 
         // Large enough that a burst of ephemeral token deltas can't evict durable
@@ -958,7 +990,8 @@ mod tests {
             pool,
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
 
         // Subscribe BEFORE running the turn, then run it.
@@ -1075,7 +1108,13 @@ mod tests {
         let mut reg = private_code_tools::ToolRegistry::new();
         reg.register(Box::new(AskTool));
 
-        let coord = SessionCoordinator::new(pool, std::env::temp_dir(), provider, Arc::new(reg));
+        let coord = SessionCoordinator::new(
+            pool,
+            std::env::temp_dir(),
+            provider,
+            shared_tool_registry(reg),
+            shared_ecosystem(None),
+        );
         coord.run_turn(&session_id, "hi", "steer").await.unwrap();
 
         // Let the turn reach the (unanswered) permission wait.
@@ -1115,7 +1154,8 @@ mod tests {
             pool,
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         coord.start_reaper(Duration::from_millis(100), Duration::from_millis(30));
 
@@ -1213,7 +1253,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(GatedProvider::new(gate_rx)),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
 
         // Turn 1 starts and blocks in the provider; the next two are admitted
@@ -1308,7 +1349,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(GatedProvider::new(gate_rx)),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
 
         // Turn 1 starts and blocks; fill the backlog to exactly MAX_BACKLOG.
@@ -1388,8 +1430,13 @@ mod tests {
         ));
         let mut reg = private_code_tools::ToolRegistry::new();
         reg.register(Box::new(AskTool));
-        let coord =
-            SessionCoordinator::new(pool.clone(), std::env::temp_dir(), provider, Arc::new(reg));
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            provider,
+            shared_tool_registry(reg),
+            shared_ecosystem(None),
+        );
 
         coord.run_turn(&sid, "first", "queue").await.unwrap();
         // Let turn 1 reach the (unanswered) permission park.
@@ -1467,7 +1514,8 @@ mod tests {
             pool,
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         ));
 
         // Fire many concurrent get_or_create for the same id.
@@ -1545,7 +1593,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
 
         // Run a turn to completion (wait for the durable MessageCompleted).
@@ -1665,7 +1714,8 @@ mod tests {
             pool,
             std::env::temp_dir(),
             Arc::new(SentinelProvider(1)), // default
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         coord.register_provider("nvidia", Arc::new(SentinelProvider(2)));
 
@@ -1746,7 +1796,8 @@ mod tests {
             pool.clone(),
             data_dir.path().to_path_buf(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
 
         // Snapshot the v1 state and record it as a (non-backup) checkpoint.
@@ -1876,7 +1927,8 @@ mod tests {
             pool,
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
 
         // A non-live session counts as evicted (next access rebuilds fresh).
@@ -1992,7 +2044,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(SentinelProvider(1)),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         coord.register_provider("nvidia", Arc::new(SentinelProvider(2)));
 
@@ -2099,7 +2152,8 @@ mod tests {
             pool,
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
 
         coord.get_or_create_session(&session_id).await.unwrap();
@@ -2148,7 +2202,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
 
         coord.set_agent(&session_id, "plan").await.unwrap();
@@ -2196,7 +2251,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         coord.get_or_create_session(&session_id).await.unwrap();
 
@@ -2425,8 +2481,13 @@ mod tests {
         ));
         let mut reg = private_code_tools::ToolRegistry::new();
         reg.register(Box::new(AskTool));
-        let coord =
-            SessionCoordinator::new(pool.clone(), std::env::temp_dir(), provider, Arc::new(reg));
+        let coord = SessionCoordinator::new(
+            pool.clone(),
+            std::env::temp_dir(),
+            provider,
+            shared_tool_registry(reg),
+            shared_ecosystem(None),
+        );
         coord.run_turn(&perm_sid, "hi", "steer").await.unwrap();
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -2470,7 +2531,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(ErroringProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         coord2.run_turn(&err_sid, "hi", "steer").await.unwrap();
 
@@ -2583,7 +2645,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider), // default, unused here
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         coord.register_provider("c0", c0.clone());
         coord.register_provider("c1", c1.clone());
@@ -2690,7 +2753,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         // Both candidates error; the synthesizer is never reached.
         coord.register_provider("c0", Arc::new(ErroringProvider));
@@ -2748,7 +2812,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         coord.register_provider("arch", architect.clone());
         coord.register_provider("impl", implementer.clone());
@@ -2841,7 +2906,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         let mut rx = coord.get_or_create_session(&sid).await.unwrap();
         coord.run_turn(&sid, "hi", "steer").await.unwrap();
@@ -2892,7 +2958,8 @@ mod tests {
             pool.clone(),
             std::env::temp_dir(),
             Arc::new(OneShotTextProvider),
-            Arc::new(private_code_tools::ToolRegistry::new()),
+            shared_tool_registry(private_code_tools::ToolRegistry::new()),
+            shared_ecosystem(None),
         );
         // Both candidates never resolve, so the turn is parked inside fan_out until
         // the abort fires.

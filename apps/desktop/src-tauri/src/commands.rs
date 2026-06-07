@@ -510,11 +510,15 @@ pub async fn subscribe_session(
     // For lag recovery the task reads the live in-memory history directly (the
     // `sessions` map is a shared Arc) — it must NOT call `get_history`, which
     // would rebuild an evicted session; a `Lagged` implies the session is live.
+    let forward_cancel = coord.arm_session_subscribe(&session_id);
     let sessions = coord.sessions.clone();
     let sid = session_id.clone();
     tokio::spawn(async move {
         use tokio::sync::broadcast::error::RecvError;
         loop {
+            if forward_cancel.is_cancelled() {
+                break;
+            }
             match rx.recv().await {
                 Ok(event) => {
                     // Skip any durable event already delivered (replay or a prior
@@ -644,7 +648,9 @@ pub async fn export_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use private_code_core::coordinator::SessionCoordinator;
+    use private_code_core::coordinator::{
+        shared_ecosystem, shared_tool_registry, SessionCoordinator,
+    };
     use private_code_core::db::{connect_db, run_migrations};
     use private_code_providers::provider::ProviderEvent;
     use private_code_providers::testkit::ScriptedProvider;
@@ -667,8 +673,13 @@ mod tests {
         let pool = connect_db("sqlite::memory:").await.unwrap();
         run_migrations(&pool).await.unwrap();
         let dir = TempDir::new().unwrap();
-        let coord =
-            SessionCoordinator::new(pool, dir.path().to_path_buf(), provider, Arc::new(registry));
+        let coord = SessionCoordinator::new(
+            pool,
+            dir.path().to_path_buf(),
+            provider,
+            shared_tool_registry(registry),
+            shared_ecosystem(None),
+        );
         let app = mock_app();
         app.manage(coord);
         (app, dir)

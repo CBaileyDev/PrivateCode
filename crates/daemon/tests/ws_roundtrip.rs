@@ -86,7 +86,9 @@ async fn ws_round_trip_prompt_permission_output_completed_and_replay() {
     ]));
     let mut reg = ToolRegistry::new();
     reg.register(Box::new(WriteFileTool));
-    let registry = Arc::new(reg);
+    use private_code_core::coordinator::{shared_ecosystem, shared_tool_registry};
+    let registry = shared_tool_registry(reg);
+    let ecosystem = shared_ecosystem(None);
 
     let token = private_code_daemon::auth::get_or_create_token(data_dir.path()).unwrap();
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -101,7 +103,7 @@ async fn ws_round_trip_prompt_permission_output_completed_and_replay() {
             provider,
             vec![],
             registry,
-            None,
+            ecosystem,
             listener,
             sd,
         )

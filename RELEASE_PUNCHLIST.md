@@ -45,18 +45,27 @@ most serious bugs are now fixed; the rest is itemized below.
   switched both check paths to a constant-time compare, + test. (Loopback-only,
   defense-in-depth.)
 
+### Fixed in release-readiness pass (2026-06-07, gate verified)
+- **Daemon startup ordering** — `Ecosystem::bootstrap` (LSP/MCP/plugins) now runs in a
+  background task after `axum::serve` starts; shared `RwLock` slots attach ecosystem/MCP
+  tools when ready (`crates/daemon/src/lib.rs`, `crates/core/src/coordinator.rs`).
+- **Desktop `subscribe_session` task leak** — prior forwarder cancelled per session via
+  `arm_session_subscribe` + `CancellationToken` (`commands.rs`, `coordinator.rs`).
+- **Post-cancel spurious checkpoints** — post-step checkpoint + LSP skipped on error/cancel
+  (`crates/core/src/orchestrator.rs`).
+- **`is_daemon_running` false positives** — timeouts/DNS/TLS no longer treated as "up"
+  (`cli/src/main.rs`).
+- **Usage panel model display** — `setModelInfo` wired from session model config
+  (`apps/desktop/src/stores/session.ts`).
+- **DeepSeek / Groq catalog pricing** — rows added to `models.json`.
+- **LSP initialize hang** — 15s timeout on `initialize` handshake (`crates/lsp/src/client.rs`).
+- **End-user README** — install, build, usage, honest feature matrix (`README.MD`).
+- **`install.sh`** — optional `PRIVATE_CODE_VERSION`, SHA256 verify, custom install dir.
+
 ### Still OPEN — recommended before tagging v1
 **HIGH**
-- **Daemon startup ordering is only half-fixed.** `start_daemon` now `bind`s before
-  bootstrap (so the port opens and the auth test passes), but `Ecosystem::bootstrap` +
-  `detect_providers` still run on the path **before `axum::serve`**. A slow/hanging
-  `rust-analyzer` `initialize` still blocks request *serving* (now a hang instead of a
-  refused connection). Fix: `tokio::spawn` the bootstrap and attach to the coordinator
-  when ready, or make `LspManager::new` lazy + timeout-bounded. (`crates/daemon/src/lib.rs`)
-- **Desktop `subscribe_session` leaks a backend task + broadcast receiver on every session
-  switch / live model change** (`apps/desktop/src-tauri/src/commands.rs` ~515). The bare
-  `tokio::spawn` forwarder never stops when the JS `Channel` is dropped → unbounded task
-  growth. Fix: track and abort the prior forwarder per session.
+- **Remote CI green across all platforms** — confirm Windows/macOS/Linux after merging;
+  first tag-triggered `release.yml` run still unobserved in this environment.
 
 **MEDIUM**
 - Orchestrator drops `finish_reason` on the single-model loop → UI/telemetry never sees
