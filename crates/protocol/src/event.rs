@@ -42,6 +42,8 @@ pub enum ProtocolEvent {
         seq: i64,
         message_id: String,
         usage: UsageStats,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
     },
     ToolRequested {
         session_id: String,

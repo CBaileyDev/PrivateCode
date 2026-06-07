@@ -1681,6 +1681,7 @@ mod tests {
             seq,
             message_id: "m".into(),
             usage: UsageStats::default(),
+            finish_reason: None,
         };
         let delta = ProtocolEvent::MessageDelta {
             session_id: "s".into(),
@@ -2328,6 +2329,7 @@ mod tests {
                 seq: 7,
                 message_id: "m".into(),
                 usage: UsageStats::default(),
+                finish_reason: None,
             },
         ];
 
@@ -2400,6 +2402,7 @@ mod tests {
             seq: 1,
             message_id: "m".into(),
             usage: UsageStats::default(),
+            finish_reason: Some("end_turn".into()),
         };
         assert!(
             is_durable_event(&synth),
