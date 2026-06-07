@@ -6,6 +6,7 @@ import {
   handleProtocolEvent,
   loadMessages,
   messageStore,
+  sendPrompt,
   setDisplayedSession,
 } from "./messages";
 
@@ -134,5 +135,29 @@ describe("loadMessages", () => {
     // ignored so it can't clobber the active view.
     await loadMessages("B");
     expect(messageStore.messages.length).toBe(0);
+  });
+});
+
+// ── sendPrompt: optimistic bubble + send_prompt invoke (powers /init) ───────
+
+describe("sendPrompt", () => {
+  it("adds the user message AND invokes send_prompt with the prompt", async () => {
+    const calls: { cmd: string; args: any }[] = [];
+    mockIPC((cmd, args) => {
+      calls.push({ cmd, args });
+      return null;
+    });
+
+    await sendPrompt("sess-1", "generate AGENTS.md");
+
+    // Optimistic user bubble added.
+    const last = messageStore.messages.at(-1);
+    expect(last?.role).toBe("user");
+    expect(last?.blocks[0].text).toBe("generate AGENTS.md");
+
+    // The engine was actually invoked (the /init regression: it used to skip this).
+    const sp = calls.find((c) => c.cmd === "send_prompt");
+    expect(sp, "send_prompt must be invoked").toBeTruthy();
+    expect(sp?.args).toMatchObject({ sessionId: "sess-1", prompt: "generate AGENTS.md" });
   });
 });

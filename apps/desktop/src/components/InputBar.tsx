@@ -12,10 +12,10 @@ import {
 } from "../stores/session";
 import {
   addSystemMessage,
-  addUserMessage,
   clearMessages,
   messageStore,
   resetStreaming,
+  sendPrompt,
 } from "../stores/messages";
 import { usageStore, formatCost } from "../stores/usage";
 
@@ -91,16 +91,11 @@ export default function InputBar() {
     }
 
     setIsSending(true);
-    addUserMessage(prompt);
     setText("");
     autoResize();
 
     try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      await invoke("send_prompt", {
-        sessionId: sessionStore.activeSession!.id,
-        prompt,
-      });
+      await sendPrompt(sessionStore.activeSession!.id, prompt);
     } catch (e) {
       console.error("Failed to send prompt:", e);
     } finally {
@@ -198,9 +193,17 @@ export default function InputBar() {
         break;
       }
       case "/init": {
-        addUserMessage(
-          "Please analyze this repository and generate an AGENTS.md file at the project root with: project overview, architecture notes, coding conventions, testing instructions, and key file paths."
-        );
+        if (!sessionStore.activeSession) break;
+        try {
+          // Actually RUN the turn (previously this only showed an optimistic
+          // bubble and never invoked send_prompt, so no AGENTS.md was generated).
+          await sendPrompt(
+            sessionStore.activeSession.id,
+            "Please analyze this repository and generate an AGENTS.md file at the project root with: project overview, architecture notes, coding conventions, testing instructions, and key file paths."
+          );
+        } catch (e) {
+          addSystemMessage(`/init failed: ${String(e)}`);
+        }
         break;
       }
       default: {

@@ -234,6 +234,16 @@ function addUserMessage(text: string) {
   setMessageStore("messages", [...messageStore.messages, msg]);
 }
 
+/** Optimistically add the user's prompt to the view and dispatch it to the
+ * engine. Shared by the composer (Enter/Send) and the `/init` slash command — so
+ * `/init` actually runs a turn (it previously only added the optimistic bubble
+ * and never invoked `send_prompt`, generating no AGENTS.md). */
+async function sendPrompt(sessionId: string, prompt: string): Promise<void> {
+  addUserMessage(prompt);
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("send_prompt", { sessionId, prompt });
+}
+
 /** Add a transient local system note (slash-command feedback). NOT persisted —
  * the next DB reconcile (`loadMessages`) replaces it; it is a UI hint only. */
 function addSystemMessage(text: string) {
@@ -262,6 +272,7 @@ export {
   loadMessages,
   handleProtocolEvent,
   addUserMessage,
+  sendPrompt,
   addSystemMessage,
   clearMessages,
   resetStreaming,
