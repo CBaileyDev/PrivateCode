@@ -51,11 +51,12 @@ impl PluginRuntime {
     }
 
     pub fn call_hook(&self, hook: &str, input: &str) -> Result<String, PluginRuntimeError> {
-        // Extism requires the WASM module to export the hook function.
-        // When no WASM is present in tests, return input unchanged.
+        // With the `extism` feature, run the WASM hook; without it (the default and
+        // the v1 build), plugins are a no-op — exactly one cfg block compiles, so
+        // each is the function's tail expression.
         #[cfg(feature = "extism")]
         {
-            return self.call_hook_extism(hook, input);
+            self.call_hook_extism(hook, input)
         }
         #[cfg(not(feature = "extism"))]
         {
@@ -67,9 +68,17 @@ impl PluginRuntime {
     #[cfg(feature = "extism")]
     fn call_hook_extism(&self, hook: &str, input: &str) -> Result<String, PluginRuntimeError> {
         use extism::{Manifest, Plugin, Wasm};
+        use std::time::Duration;
         let wasm = Wasm::file(&self.wasm_path);
-        let manifest = Manifest::new([wasm]);
-        let mut plugin = Plugin::new(&manifest, [], true)
+        // Bound the sandbox per plan 5.3: 64 MiB (1024 × 64 KiB pages) and a 5s
+        // execution timeout, with WASI CLOSED by default (the 3rd `Plugin::new`
+        // arg). NOTE (5.3 deferral): host functions are still NOT registered, so a
+        // plugin cannot reach the filesystem — wiring `with_function` host fns
+        // (workspace-bounded) is the remaining work to un-defer plugins for v1.
+        let manifest = Manifest::new([wasm])
+            .with_memory_max(1024)
+            .with_timeout(Duration::from_secs(5));
+        let mut plugin = Plugin::new(&manifest, [], false)
             .map_err(|e| PluginRuntimeError::Load(e.to_string()))?;
         let out: String = plugin
             .call(hook, input)
