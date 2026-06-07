@@ -4,6 +4,18 @@
 >
 > **How to use (Claude Code):** work top-down — **Blockers → HIGH → MEDIUM → packaging → LOW**. Every item is a checkbox with the exact `file:line`, the problem, and the fix. After each cluster, run the **Gate** at the bottom and only commit when it is truthfully green. Use the project conventions in `AIChatContext.md` (commit trailer, per-cluster gate→commit→push to `main`). Do **not** mark a step "done" in `PROGRESS.md` unless the gate passes.
 
+## 🖥️ GUI MADE FUNCTIONAL (2026-06-07)
+
+After the punch-list pass, a live GUI test found the desktop app's interactive flows
+didn't work (no first-run path). The GUI was overhauled into a working app: native
+folder picker → project/session, in-app BYOK Settings (OS keychain), connected-model
+picker, visible error toasts, working ⌘K palette; providers resolve keys per-turn. A
+6-agent adversarial review's 7 runtime bugs were fixed. Gate: 214 nextest + 54 vitest,
+app binary builds. Full detail + how-to-test at the TOP of `PROGRESS.md`. The remaining
+human step is the live in-webview model conversation (your key).
+
+---
+
 ## ✅ WORKED TO GREEN (2026-06-06) — this punch list has been executed
 
 | Check | At generation | After the punch-list pass |

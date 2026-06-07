@@ -387,7 +387,9 @@ cargo deny check                                   # for dependency-touching clu
 # desktop:
 cd apps/desktop && npm run typecheck && npm run build && npx vitest run   # 40 tests, 7 files
 ```
-Current state (after the Phase-5 release punch-list pass, 2026-06-06): **truthfully green** — fmt + clippy clean, **210 nextest pass / 0 fail (4 skipped)**, `cargo deny` ok, frontend **40 vitest**. Two human-only sign-off steps remain (GUI smoke + live BYOK provider smoke) — see `PROGRESS.md`.
+Current state (after the Phase-5 release punch-list pass, 2026-06-06): **truthfully green** — fmt + clippy clean, **210 nextest pass / 0 fail (4 skipped)**, `cargo deny` ok, frontend **40 vitest**.
+
+**Desktop GUI overhaul (2026-06-07):** the GUI booted but its interactive flows had never been exercised end-to-end and didn't work (no first-run path: couldn't start a session, pick a model, or add an API key). Overhauled to a working app — native folder picker → project+session, in-app BYOK Settings (keychain), connected-provider model picker, visible error toasts, working ⌘K palette. Providers resolve keys per-turn (live add/remove). A 6-agent adversarial review's 7 runtime bugs fixed. Gate after the overhaul: **214 nextest + 54 vitest**, app binary builds, `build_coordinator` boot-tested. Run with `cd apps/desktop && npm run app`. See `PROGRESS.md` (top) for the full how-to-test. The one remaining human step is the **live model conversation** (your API key, in-webview).
 
 ## 3. Architecture & repo layout
 
