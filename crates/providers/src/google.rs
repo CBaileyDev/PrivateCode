@@ -292,15 +292,20 @@ impl ModelProvider for GoogleProvider {
         };
 
         let url = format!(
-            "{}/models/{}:streamGenerateContent?alt=sse&key={}",
+            "{}/models/{}:streamGenerateContent?alt=sse",
             self.base_url.trim_end_matches('/'),
-            model_id,
-            key
+            model_id
         );
 
         let resp = self
             .client
             .post(&url)
+            // Authenticate with a header, NOT a `?key=` query param. reqwest attaches
+            // the full request URL to transport errors (DNS/TLS/timeout), and those
+            // errors are stringified into user-facing error events and the tracing
+            // log — a query-param key would leak the user's secret there. The header
+            // form keeps the key out of every URL the error machinery can capture.
+            .header("x-goog-api-key", key)
             .header("Content-Type", "application/json")
             .json(&body)
             .send()

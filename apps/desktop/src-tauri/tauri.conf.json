@@ -38,6 +38,12 @@
     "category": "DeveloperTool",
     "shortDescription": "Local-first, privacy-preserving AI coding agent",
     "longDescription": "Private Code is a local-first AI coding agent: one in-process engine driving a CLI, daemon, desktop GUI, and TUI, with BYOK provider support.",
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }

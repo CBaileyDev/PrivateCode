@@ -88,6 +88,11 @@ pub struct PermissionSavedRow {
 pub async fn connect_db(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
     let options = db_url
         .parse::<SqliteConnectOptions>()?
+        // Create the database file on first run. sqlx defaults this to false, so
+        // without it a fresh install fails to open its on-disk DB with
+        // SQLITE_CANTOPEN (the CLI URL carries no `?mode=rwc`). Harmless for an
+        // existing file and for the `sqlite::memory:` test/bench URLs.
+        .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
@@ -353,8 +358,13 @@ pub async fn list_checkpoints(
     pool: &SqlitePool,
     session_id: &str,
 ) -> Result<Vec<CheckpointRow>, sqlx::Error> {
+    // `created_at` is whole-second granularity, but a single turn writes several
+    // checkpoints (turn_start / pre_step / post_step) within the same second. Tie-
+    // break on the implicit monotonic `rowid` (insertion order) so the newest
+    // checkpoint is unambiguously first — revert/undo selects the first non-backup
+    // row and must land on the latest one, not an arbitrary same-second sibling.
     sqlx::query_as::<_, CheckpointRow>(
-        "SELECT * FROM checkpoint WHERE session_id = ?1 ORDER BY created_at DESC",
+        "SELECT * FROM checkpoint WHERE session_id = ?1 ORDER BY created_at DESC, rowid DESC",
     )
     .bind(session_id)
     .fetch_all(pool)
@@ -548,6 +558,67 @@ mod tests {
         let pool = connect_db("sqlite::memory:").await.unwrap();
         run_migrations(&pool).await.unwrap();
         pool
+    }
+
+    #[tokio::test]
+    async fn test_connect_db_creates_missing_file() {
+        // Reproduces the CLI first-run path: `sqlite://<path>` with no `?mode=rwc`.
+        // Without `.create_if_missing(true)` this fails with SQLITE_CANTOPEN.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("private-code.db");
+        assert!(!db_path.exists());
+
+        let url = format!("sqlite://{}", db_path.to_string_lossy());
+        let pool = connect_db(&url)
+            .await
+            .expect("first-run connect must create the db file");
+        run_migrations(&pool).await.unwrap();
+
+        assert!(db_path.exists(), "db file should exist after first connect");
+    }
+
+    #[tokio::test]
+    async fn test_list_checkpoints_orders_newest_first_within_same_second() {
+        let pool = setup_test_db().await;
+        let project_id = Uuid::new_v4().to_string();
+        let session_id = Uuid::new_v4().to_string();
+        create_project(&pool, &project_id, "P", "/tmp/p")
+            .await
+            .unwrap();
+        create_session(
+            &pool,
+            &session_id,
+            &project_id,
+            "/tmp/p",
+            "/tmp/p",
+            "S",
+            "build",
+            "{}",
+        )
+        .await
+        .unwrap();
+
+        // Three checkpoints written back-to-back — the common case where all share
+        // the same whole-second `created_at`. Insertion order is turn_start →
+        // pre_step → post_step.
+        let mut tx = pool.begin().await.unwrap();
+        for (id, kind) in [
+            ("cp1", "turn_start"),
+            ("cp2", "pre_step"),
+            ("cp3", "post_step"),
+        ] {
+            create_checkpoint(&mut tx, id, &session_id, "msg", "tree", "tool", kind)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+
+        // The latest checkpoint (post_step, inserted last) must sort first, so
+        // revert/undo — which picks the first non-backup row — lands on it rather
+        // than an arbitrary same-second sibling.
+        let cps = list_checkpoints(&pool, &session_id).await.unwrap();
+        let ids: Vec<&str> = cps.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["cp3", "cp2", "cp1"]);
     }
 
     #[tokio::test]
