@@ -12,6 +12,10 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
+/// Upper bound on a single framed message body, guarding against a giant
+/// allocation from a malformed/garbled `Content-Length`.
+const MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
+
 #[derive(Debug, thiserror::Error)]
 pub enum LspError {
     #[error("spawn failed: {0}")]
@@ -302,11 +306,22 @@ async fn read_message<R: AsyncReadExt + Unpin>(
         if line.is_empty() {
             break; // blank line: end of headers
         }
-        if let Some(v) = line.strip_prefix("Content-Length:") {
+        if content_len.is_none()
+            && let Some(v) = line.strip_prefix("Content-Length:")
+        {
+            // Keep the FIRST Content-Length (spec forbids duplicates; matching the
+            // last would let a malformed frame desync the stream).
             content_len = v.trim().parse().ok();
         }
     }
     let len = content_len.ok_or_else(|| LspError::Other("missing Content-Length".into()))?;
+    // Defence-in-depth: refuse an absurd length rather than attempting a giant
+    // allocation off an untrusted/garbled header.
+    if len > MAX_MESSAGE_BYTES {
+        return Err(LspError::Other(format!(
+            "Content-Length {len} exceeds the {MAX_MESSAGE_BYTES}-byte cap"
+        )));
+    }
 
     let mut body = vec![0u8; len];
     reader.read_exact(&mut body).await?;
@@ -401,5 +416,28 @@ mod tests {
         assert_eq!(m2["id"].as_i64(), Some(2));
         // EOF after the last frame yields None.
         assert!(read_message(&mut reader).await.unwrap().is_none());
+    }
+
+    /// Duplicate Content-Length headers (spec-forbidden) must use the FIRST value,
+    /// so a garbled second header can't desync the body read.
+    #[tokio::test]
+    async fn read_message_keeps_first_content_length() {
+        let body = r#"{"id":3}"#; // 8 bytes
+        let frame = format!(
+            "Content-Length: {}\r\nContent-Length: 9999\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let mut reader = BufReader::new(frame.as_bytes());
+        let msg = read_message(&mut reader).await.unwrap().unwrap();
+        assert_eq!(msg["id"].as_i64(), Some(3));
+    }
+
+    /// An absurd Content-Length is rejected rather than attempting a giant alloc.
+    #[tokio::test]
+    async fn read_message_rejects_oversize_content_length() {
+        let frame = "Content-Length: 99999999999\r\n\r\n";
+        let mut reader = BufReader::new(frame.as_bytes());
+        assert!(read_message(&mut reader).await.is_err());
     }
 }
