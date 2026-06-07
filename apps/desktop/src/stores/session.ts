@@ -226,49 +226,52 @@ async function createSessionInFolder(): Promise<void> {
     );
     setSessionStore("activeProjectId", project.id);
 
-    const session = (await invoke("create_session", {
+    let session = (await invoke("create_session", {
       projectId: project.id,
       title: project.name,
       workspacePath: project.directory,
     })) as SessionInfo;
 
+    // Pick a connected model BEFORE the session goes live. Doing it now (a plain
+    // DB write on a not-yet-live session) avoids switching the provider AFTER we
+    // subscribe — which would evict + rebuild the live session and tear down the
+    // event subscription we just established.
+    await loadProviderStatus();
+    const connectedCfg = connectedModelConfigFor(session.model_config);
+    if (connectedCfg) {
+      await invoke("set_model", { sessionId: session.id, modelConfig: connectedCfg });
+      session = { ...session, model_config: connectedCfg };
+    }
+
     setSessionStore("sessions", [...sessionStore.sessions, session]);
     await setActiveSession(session);
-
-    // Refresh provider connectivity, then default the session to a CONNECTED
-    // model if its default provider (anthropic) has no key but another provider
-    // does — so the first turn can actually reach a model.
-    await loadProviderStatus();
-    await defaultToConnectedModel(session);
   } catch (e) {
     showToast(`Failed to start session: ${String(e)}`);
   }
 }
 
-/** If the session's configured provider is not connected but another provider
- * is, switch the session to the first connected model. No-op otherwise. */
-async function defaultToConnectedModel(session: SessionInfo): Promise<void> {
-  let configuredProvider: string | null = null;
+/** If `currentConfig`'s provider is NOT connected but another provider is,
+ * returns the first connected model's config JSON; else null. Pure (reads the
+ * providers store). */
+function connectedModelConfigFor(currentConfig: string): string | null {
+  let provider: string | null = null;
   try {
-    configuredProvider = JSON.parse(session.model_config).provider_id ?? null;
+    provider = JSON.parse(currentConfig).provider_id ?? null;
   } catch {
     /* malformed — treat as unconfigured */
   }
-  const configuredConnected = providerStore.providers.some(
-    (p) => p.id === configuredProvider && p.connected,
-  );
-  if (configuredConnected) return;
-
+  if (providerStore.providers.some((p) => p.id === provider && p.connected)) {
+    return null; // already on a connected provider
+  }
   const connected = connectedModels();
-  if (connected.length === 0) return; // nothing connected yet — user adds a key
+  if (connected.length === 0) return null; // nothing connected yet
 
   const value = connected[0].value; // "provider|model_id"
   const sep = value.indexOf("|");
-  const cfg = JSON.stringify({
+  return JSON.stringify({
     provider_id: value.slice(0, sep),
     model_id: value.slice(sep + 1),
   });
-  await setActiveModel(cfg);
 }
 
 /** Delete a session. */
@@ -336,9 +339,18 @@ function patchSessionConfig(id: string, patch: Partial<SessionInfo>) {
 // the WRONG session's row.
 let pendingModelChange: { sessionId: string; config: string } | null = null;
 
+function providerIdOf(cfg: string): string | null {
+  try {
+    return JSON.parse(cfg).provider_id ?? null;
+  } catch {
+    return null;
+  }
+}
+
 async function setActiveModel(modelConfig: string): Promise<boolean> {
   const s = sessionStore.activeSession;
   if (!s) return true;
+  const providerChanged = providerIdOf(s.model_config) !== providerIdOf(modelConfig);
   try {
     const { invoke } = await import("@tauri-apps/api/core");
     const live = (await invoke("set_model", {
@@ -347,6 +359,12 @@ async function setActiveModel(modelConfig: string): Promise<boolean> {
     })) as boolean;
     patchSessionConfig(s.id, { model_config: modelConfig });
     pendingModelChange = live ? null : { sessionId: s.id, config: modelConfig };
+    // A LIVE provider change evicts + rebuilds the session in the coordinator,
+    // which tears down our event subscription. Re-attach so streaming keeps
+    // working (same-provider model changes need no eviction → no re-subscribe).
+    if (live && providerChanged) {
+      await setActiveSession({ ...s, model_config: modelConfig });
+    }
     return live;
   } catch (e) {
     showToast(`Failed to switch model: ${String(e)}`);

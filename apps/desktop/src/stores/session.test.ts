@@ -173,6 +173,24 @@ describe("setActiveModel / setActiveAgent", () => {
     expect(sessionStore.activeSession?.model_config).toBe(cfg);
   });
 
+  it("does NOT re-subscribe on a same-provider model change", async () => {
+    setSessionStore("activeSession", fakeSession("s1"));
+    setSessionStore("sessions", [fakeSession("s1")]);
+    responses["set_model"] = true;
+    await setActiveModel('{"provider_id":"anthropic","model_id":"claude-haiku-4-5"}');
+    expect(calls.some((c) => c.cmd === "subscribe_session")).toBe(false);
+  });
+
+  it("re-subscribes after a LIVE provider change (eviction tears down the stream)", async () => {
+    setSessionStore("activeSession", fakeSession("s1"));
+    setSessionStore("sessions", [fakeSession("s1")]);
+    responses["set_model"] = true;
+    responses["get_messages"] = [];
+    responses["subscribe_session"] = null;
+    await setActiveModel('{"provider_id":"openai","model_id":"gpt-4.1"}');
+    expect(calls.some((c) => c.cmd === "subscribe_session")).toBe(true);
+  });
+
   it("setActiveAgent persists and patches the store", async () => {
     setSessionStore("activeSession", fakeSession("s1"));
     setSessionStore("sessions", [fakeSession("s1")]);
