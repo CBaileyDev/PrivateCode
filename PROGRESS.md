@@ -204,8 +204,10 @@ Ran a 4-dimension read-only review workflow (WS recovery, CSP, coordinator concu
 | 5.8 | Slash commands `/cost`, `/share`, `/init` + config `commands` schema | ✅ done (GUI + TUI partial) |
 | 5.9 | `/init` AGENTS.md generation | ✅ done — GUI `/init` now actually invokes `send_prompt` (was an optimistic bubble only). |
 | 5.10 | Session export (CLI + Tauri `export_session`) | ✅ done — renderer fixed to extract ChatMessage content (was dumping raw JSON); md/json/file-write regression-tested. |
-| 5.11 | Auto-update | ⚠️ partial — CLI `private-code update` checks GitHub releases; Tauri updater not wired (see §3). |
-| 5.12–5.14 | Packaging (`dist-workspace.toml`, `release.yml`, `install.sh`) | ⚠️ scaffold — see §3 (signing/notarization + first green remote CI are human-only steps). |
+| 5.11 | Auto-update | ⚠️ CLI-only for v1 — `private-code update` checks GitHub releases (works); the Tauri in-app updater is intentionally deferred (needs a signing keypair = human; the release workflow already passes `TAURI_SIGNING_PRIVATE_KEY` through if provided). |
+| 5.12 | CLI packaging (`release.yml`, `install.sh`) | ✅ wired — `release.yml` builds the CLI on a `v*` tag across 5 native-runner targets (macOS x64/arm64, Linux x64/arm64, Windows x64) with per-artifact SHA256; `install.sh` resolves the matching target triple. CLI release build verified locally; remote run is the human "first green CI" step. Replaced the conflicting unused `dist-workspace.toml` (cargo-dist) with this single hand-written path. |
+| 5.13 | Desktop packaging | ⚠️ wired, human-ceiling — `release.yml` has a `tauri-action` desktop job (`continue-on-error`) and `tauri.conf.json` now has a valid `bundle` config (Linux PNG icons suffice). macOS/Windows distribution additionally needs `cargo tauri icon` (icon.icns/icon.ico) + code signing/notarization certs (human). Not observed green remotely. |
+| 5.14 | Package-manager distribution (Homebrew/Scoop/AUR/Nix) | ❌ deferred — formulas need a real published release's artifact URLs + SHA256s, so they are post-first-release (can't be authored meaningfully before the first tag ships). |
 | 5.15 | Phase-5 verification | ✅ `crates/core/tests/phase5.rs` expanded to test export + keyring; green gate. |
 
 **⚠️ Correction (2026-06-06, release punch-list pass):** a prior line here claimed "clippy clean, **182** nextest passed" as a green gate. That was **false** — at that point `cargo fmt --all --check` was RED and `cargo nextest` was **181 pass / 1 fail** (`daemon::tests::test_daemon_authentication_and_routes`, a real bind-before-bootstrap startup defect). See `RELEASE_PUNCHLIST.md`.
@@ -215,7 +217,8 @@ Ran a 4-dimension read-only review workflow (WS recovery, CSP, coordinator concu
 - **§1 HIGH — DONE (all 3, each with a regression test; a 5-agent adversarial self-review confirmed 0 must-fix defects):** LSP `read_message`; MCP request/response pairing; Gemini tool round-trips (unique ids + name-keyed `functionResponse`).
 - **§2 MEDIUM — DONE except 5.3:** OpenAI-compat + Gemini cost; Gemini `finish_reason` + terminal stop; GUI `/init`; export renderer + `phase5.rs` tests. **5.3 plugins is DEFERRED** (see table) — this supersedes the §0 note that said 5.3 was "being fixed"; it is **not** fixed and is explicitly out of scope for v1 until the sandbox (§4 LOW) lands. A user can configure a plugin and see it "loaded" yet get nothing — documented, not a silent surprise.
 - **Gate (after §2):** `fmt` clean, `clippy -D warnings` clean, **205 nextest passed / 0 failed (4 skipped)**, desktop typecheck + build + **40 vitest** passed.
-- **§3 Packaging / §4 LOW / §5 Docs:** in progress.
+- **§3 Packaging — WIRED (human ceilings surfaced):** multi-target CLI release matrix + matching `install.sh` (CLI release build verified locally); desktop `tauri-action` job + valid `bundle` config (best-effort). Human-only: code signing/notarization (certs), `cargo tauri icon` for macOS/Windows icon sets, first observed green remote CI (`gh` unauth here), package-manager formulas (need a shipped release to hash), and the Tauri in-app updater (signing key). Removed the unused conflicting `dist-workspace.toml`.
+- **§4 LOW / §5 Docs:** in progress.
 
 **Ceilings (honest):** plugin WASM execution + sandbox = post-v1 (5.3 deferred); GUI smoke + live BYOK provider smoke are human-only; code signing/notarization + first observed green remote CI are human-only (no certs / `gh` unauth here); Homebrew/Scoop/AUR/Nix formulas not authored.
 

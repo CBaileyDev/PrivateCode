@@ -1,5 +1,15 @@
 name: Release
 
+# Tag-triggered release: builds the CLI for all supported targets and (best-effort)
+# the desktop bundles, attaching them to the GitHub Release for the tag.
+#
+# Verified locally: `cargo build --release --locked -p private-code-cli` succeeds
+# and the binary runs. The matrix below uses NATIVE runners per target, so each
+# artifact is built on its own platform. NOT yet observed green on the remote (gh
+# is unauthenticated in the dev env) — confirming the first green run is a human
+# step. Desktop bundles are unsigned unless the signing secrets are present
+# (macOS notarization / Windows signing / Tauri updater key are human-provided).
+
 on:
   push:
     tags:
@@ -9,18 +19,109 @@ permissions:
   contents: write
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  cli:
+    name: CLI ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-13, target: x86_64-apple-darwin }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-gnu }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build CLI release binary
-        run: cargo build --release -p private-code-cli
-      - name: Package
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - name: Install aarch64 Linux cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+          mkdir -p .cargo
+          {
+            echo '[target.aarch64-unknown-linux-gnu]'
+            echo 'linker = "aarch64-linux-gnu-gcc"'
+          } >> .cargo/config.toml
+      - name: Build CLI
+        run: cargo build --release --locked -p private-code-cli --target ${{ matrix.target }}
+      - name: Package (unix)
+        if: matrix.os != 'windows-latest'
+        shell: bash
         run: |
           mkdir -p dist
-          cp target/release/private-code-cli dist/private-code-$(uname -m)-unknown-linux-gnu
-          sha256sum dist/* > dist/SHA256SUMS
-      - uses: softprops/action-gh-release@v2
+          out="dist/private-code-${{ matrix.target }}"
+          cp "target/${{ matrix.target }}/release/private-code-cli" "$out"
+          shasum -a 256 "$out" | tee "$out.sha256"
+      - name: Package (windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $out = "dist/private-code-${{ matrix.target }}.exe"
+          Copy-Item "target/${{ matrix.target }}/release/private-code-cli.exe" $out
+          (Get-FileHash $out -Algorithm SHA256).Hash | Out-File "$out.sha256"
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
         with:
           files: dist/*
+
+  # Desktop bundles (dmg / AppImage+deb / msi). HUMAN CEILING: macOS bundling
+  # needs icons/icon.icns and Windows needs icons/icon.ico (generate once with
+  # `cargo tauri icon apps/desktop/src-tauri/icons/icon.png`); code signing +
+  # notarization need certs supplied as the secrets referenced below. Without the
+  # signing secrets the bundles are produced UNSIGNED (fine for testing, not for
+  # public distribution). This job has NOT been observed green remotely.
+  desktop:
+    name: Desktop ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # Best-effort: macOS/Windows bundling needs platform icons (icons/icon.icns,
+    # icons/icon.ico via `cargo tauri icon`) and signing certs that aren't present
+    # yet, so a failure here must NOT block the CLI release. Linux bundles (the
+    # PNG icons suffice) and any platform with the secrets configured will succeed.
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install Linux desktop deps
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf
+      - name: Install frontend deps
+        working-directory: apps/desktop
+        run: npm ci
+      - name: Build + bundle desktop app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # macOS signing + notarization (optional; unsigned without these):
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          # Tauri updater signing key (optional; enables signed update artifacts):
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: "Private Code ${{ github.ref_name }}"
+          releaseDraft: false
+          prerelease: false
