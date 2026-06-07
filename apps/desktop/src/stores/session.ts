@@ -47,6 +47,7 @@ export interface SessionInfo {
   title: string;
   agent_id: string;
   model_config: string;
+  workspace_path: string;
   cost: number;
   tokens_input: number;
   tokens_output: number;

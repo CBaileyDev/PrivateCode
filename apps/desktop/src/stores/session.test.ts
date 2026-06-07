@@ -27,6 +27,7 @@ function fakeSession(
     title: "t",
     agent_id: "build",
     model_config: model,
+    workspace_path: "/tmp/ws",
     cost: 0,
     tokens_input: 0,
     tokens_output: 0,

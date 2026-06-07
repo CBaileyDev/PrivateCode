@@ -97,9 +97,17 @@ export default function App() {
             >
               ☰
             </button>
-            <span class="header-title">
+            <span
+              class="header-title"
+              title={sessionStore.activeSession?.workspace_path ?? ""}
+            >
               {sessionStore.activeSession ? sessionStore.activeSession.title : "Private Code"}
             </span>
+            <Show when={sessionStore.activeSession}>
+              <span class="header-workspace" title={sessionStore.activeSession!.workspace_path}>
+                📂 {sessionStore.activeSession!.workspace_path}
+              </span>
+            </Show>
           </div>
           <div class="header-actions">
             <div class="connection-status">

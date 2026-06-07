@@ -1663,3 +1663,14 @@ body {
 /* ── Empty-state actions ────────────────────────────────────────────────── */
 .empty-actions { display: flex; gap: var(--space-3); justify-content: center; margin-top: var(--space-4); flex-wrap: wrap; }
 .empty-hint { color: var(--text-muted); font-size: var(--text-sm); margin-top: var(--space-4); max-width: 460px; }
+
+/* Active workspace folder shown in the header so it's clear where the agent runs */
+.header-workspace {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-family: var(--font-mono);
+  max-width: 360px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
