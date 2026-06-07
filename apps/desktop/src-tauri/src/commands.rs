@@ -81,6 +81,40 @@ pub struct CheckpointInfo {
     pub created_at: i64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ProviderModel {
+    pub id: String,
+    pub display_name: String,
+}
+
+/// Per-provider connection status for the Settings panel + model picker.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct ProviderStatus {
+    pub id: String,
+    pub display_name: String,
+    /// True when a key resolves (keyring/env) for a cloud provider, or a local
+    /// endpoint is reachable.
+    pub connected: bool,
+    /// `false` for local providers (Ollama / LM Studio) that need no API key.
+    pub requires_key: bool,
+    pub local: bool,
+    pub models: Vec<ProviderModel>,
+}
+
+/// The providers Private Code can connect to. All are registered with the
+/// coordinator at startup (they resolve credentials lazily), so a key added in
+/// Settings at runtime takes effect on the next turn without re-registration.
+pub const KNOWN_PROVIDERS: &[(&str, &str, bool)] = &[
+    ("anthropic", "Anthropic (Claude)", true),
+    ("openai", "OpenAI", true),
+    ("google", "Google Gemini", true),
+    ("nvidia", "NVIDIA", true),
+    ("deepseek", "DeepSeek", true),
+    ("groq", "Groq", true),
+    ("ollama", "Ollama (local)", false),
+    ("lmstudio", "LM Studio (local)", false),
+];
+
 // ─── Project commands ──────────────────────────────────────────────────────
 
 #[tauri::command]
@@ -117,6 +151,102 @@ pub async fn init_project(
         directory,
         created_at: chrono::Utc::now().timestamp(),
     })
+}
+
+/// Find the project rooted at `directory`, or create one (name = folder
+/// basename). This is the GUI's "open a folder" entry point — it removes the
+/// need for a pre-existing project before a session can be created. The path is
+/// canonicalized so the same folder always maps to one project.
+#[tauri::command]
+pub async fn open_or_create_project(
+    coord: State<'_, SessionCoordinator>,
+    directory: String,
+) -> Result<ProjectInfo, String> {
+    let dir = std::fs::canonicalize(&directory)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or(directory);
+
+    if let Some(existing) = db::list_projects(&coord.pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|p| p.directory == dir)
+    {
+        return Ok(ProjectInfo {
+            id: existing.id,
+            name: existing.name,
+            directory: existing.directory,
+            created_at: existing.created_at,
+        });
+    }
+
+    let name = std::path::Path::new(&dir)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("project")
+        .to_string();
+    let id = uuid::Uuid::new_v4().to_string();
+    db::create_project(&coord.pool, &id, &name, &dir)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(ProjectInfo {
+        id,
+        name,
+        directory: dir,
+        created_at: chrono::Utc::now().timestamp(),
+    })
+}
+
+// ─── Provider / key commands (Settings) ────────────────────────────────────
+
+/// Connection status for every known provider + the catalog models it offers.
+/// Connectivity reuses `detect_providers` (cloud key resolvable OR local port
+/// reachable). Never returns key VALUES.
+#[tauri::command]
+pub async fn provider_status() -> Result<Vec<ProviderStatus>, String> {
+    use private_code_providers::{detect_providers, ModelCatalog};
+    let connected: std::collections::HashSet<String> =
+        detect_providers().await.into_keys().collect();
+    let catalog = ModelCatalog::from_vendored();
+    let all = catalog.all();
+    Ok(KNOWN_PROVIDERS
+        .iter()
+        .map(|(id, name, requires_key)| {
+            let models = all
+                .iter()
+                .filter(|m| m.provider_id == *id)
+                .map(|m| ProviderModel {
+                    id: m.model_id.clone(),
+                    display_name: m.display_name.clone(),
+                })
+                .collect();
+            ProviderStatus {
+                id: id.to_string(),
+                display_name: name.to_string(),
+                connected: connected.contains(*id),
+                requires_key: *requires_key,
+                local: !*requires_key,
+                models,
+            }
+        })
+        .collect())
+}
+
+/// Store a provider API key in the OS keychain. The value is never logged or
+/// echoed back. Takes effect on the next turn (providers resolve keys lazily).
+#[tauri::command]
+pub async fn set_provider_key(provider: String, key: String) -> Result<(), String> {
+    let key = key.trim();
+    if key.is_empty() {
+        return Err("API key is empty".to_string());
+    }
+    private_code_providers::keyring_store::set_key(&provider, key).map_err(|e| e.to_string())
+}
+
+/// Remove a stored provider API key from the OS keychain.
+#[tauri::command]
+pub async fn remove_provider_key(provider: String) -> Result<(), String> {
+    private_code_providers::keyring_store::delete_key(&provider).map_err(|e| e.to_string())
 }
 
 // ─── Session commands ──────────────────────────────────────────────────────
@@ -624,6 +754,48 @@ mod tests {
         .await
         .expect_err("a non-UUID session id must be rejected");
         assert!(err.contains("invalid session id"), "got: {err}");
+    }
+
+    /// open_or_create_project finds-or-creates one project per folder.
+    #[tokio::test]
+    async fn open_or_create_project_is_idempotent_per_directory() {
+        let (app, dir) = harness(Arc::new(ScriptedProvider::one_shot_text("hi"))).await;
+        let path = dir.path().to_str().unwrap().to_string();
+        let p1 = open_or_create_project(app.state(), path.clone())
+            .await
+            .unwrap();
+        assert!(!p1.id.is_empty());
+        let p2 = open_or_create_project(app.state(), path.clone())
+            .await
+            .unwrap();
+        assert_eq!(p1.id, p2.id, "same folder maps to ONE project");
+        assert_eq!(
+            list_projects(app.state()).await.unwrap().len(),
+            1,
+            "no duplicate project created"
+        );
+    }
+
+    /// provider_status lists every known provider with its catalog models, and
+    /// flags local providers as not-requiring-a-key. (Connectivity is
+    /// environment-dependent, so only the shape is asserted.)
+    #[tokio::test]
+    async fn provider_status_lists_known_providers_with_models() {
+        let statuses = provider_status().await.unwrap();
+        assert_eq!(statuses.len(), KNOWN_PROVIDERS.len());
+        let anthropic = statuses.iter().find(|s| s.id == "anthropic").unwrap();
+        assert!(!anthropic.models.is_empty(), "anthropic has catalog models");
+        assert!(anthropic.requires_key && !anthropic.local);
+        let ollama = statuses.iter().find(|s| s.id == "ollama").unwrap();
+        assert!(!ollama.requires_key && ollama.local);
+    }
+
+    /// An empty/whitespace key is rejected before touching the keychain.
+    #[tokio::test]
+    async fn set_provider_key_rejects_empty() {
+        assert!(set_provider_key("anthropic".into(), "   ".into())
+            .await
+            .is_err());
     }
 
     /// init_project → create_session → list/get → set_agent → set_model →

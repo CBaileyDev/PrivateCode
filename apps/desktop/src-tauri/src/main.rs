@@ -26,6 +26,7 @@ fn main() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let app_handle = app.handle().clone();
 
@@ -55,9 +56,11 @@ fn main() {
             // Build the shared coordinator (Anthropic default + NVIDIA), start
             // the idle reaper, and manage it as global state.
             let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            let coordinator =
-                tauri::async_runtime::block_on(build_coordinator(pool, data_dir, &workspace));
-            coordinator.start_reaper(Duration::from_secs(30 * 60), Duration::from_secs(60));
+            let coordinator = tauri::async_runtime::block_on(async {
+                let coordinator = build_coordinator(pool, data_dir, &workspace).await;
+                coordinator.start_reaper(Duration::from_secs(30 * 60), Duration::from_secs(60));
+                coordinator
+            });
             app.manage(coordinator);
 
             Ok(())
@@ -65,6 +68,10 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::list_projects,
             commands::init_project,
+            commands::open_or_create_project,
+            commands::provider_status,
+            commands::set_provider_key,
+            commands::remove_provider_key,
             commands::create_session,
             commands::list_sessions,
             commands::get_session,
