@@ -227,7 +227,7 @@ Ran a 4-dimension read-only review workflow (WS recovery, CSP, coordinator concu
 - **§5 Docs — DONE:** this reconciliation + AIChatContext Phase-5 update; human-only steps surfaced below.
 
 **✅ Final v1 Definition-of-Done gate (truthfully green, 2026-06-06):**
-`cargo fmt --all --check` clean · `cargo clippy --workspace --all-targets --locked -- -D warnings` clean · `cargo nextest run --workspace` **209 passed / 0 failed (4 skipped = `#[ignore]`d live-network tests)** · `cargo deny check` advisories/bans/licenses/sources ok · desktop `npm run typecheck` clean + `npm run build` ok + **40 vitest passed**.
+`cargo fmt --all --check` clean · `cargo clippy --workspace --all-targets --locked -- -D warnings` clean · `cargo nextest run --workspace` **210 passed / 0 failed (4 skipped = `#[ignore]`d live-network tests)** · `cargo deny check` advisories/bans/licenses/sources ok · desktop `npm run typecheck` clean + `npm run build` ok + **40 vitest passed**.
 
 **Two human-only steps remain for sign-off (cannot be done headless here):**
 1. **GUI smoke test** — launch the desktop app, run a turn, exercise the comparison/checkpoint panels, and force an error to confirm the error banner shows.

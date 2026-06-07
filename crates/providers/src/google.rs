@@ -250,8 +250,22 @@ fn parse_gemini_chunk(data: &str, state: &mut GeminiSseState) -> Vec<ProviderEve
         state.finish_reason = Some(map_gemini_finish_reason(fr));
     }
     if let Some(usage) = v.get("usageMetadata") {
-        state.usage.input_tokens = usage["promptTokenCount"].as_i64().unwrap_or(0);
-        state.usage.output_tokens = usage["candidatesTokenCount"].as_i64().unwrap_or(0);
+        // Guard each field on presence so a partial usageMetadata chunk can't zero
+        // a value seen earlier (and so a thoughts-only chunk can't fabricate an
+        // output total). Matches Reference gemini.ts mapUsage.
+        if let Some(prompt) = usage["promptTokenCount"].as_i64() {
+            state.usage.input_tokens = prompt;
+        }
+        // `candidatesTokenCount` is VISIBLE-text-only and excludes thinking
+        // tokens; sum it with `thoughtsTokenCount` for the inclusive output count
+        // (otherwise output — and thus cost — under-reports for thinking models).
+        if let Some(candidates) = usage["candidatesTokenCount"].as_i64() {
+            let thoughts = usage["thoughtsTokenCount"].as_i64().unwrap_or(0);
+            state.usage.output_tokens = candidates + thoughts;
+        }
+        if let Some(thoughts) = usage["thoughtsTokenCount"].as_i64() {
+            state.usage.reasoning_tokens = thoughts;
+        }
     }
 
     events
@@ -430,6 +444,29 @@ mod tests {
             finalize_gemini(&mut st, &cat, "google", "gemini-2.5-flash").is_empty(),
             "finalize is idempotent"
         );
+    }
+
+    /// Gemini's candidatesTokenCount is visible-only; thinking tokens
+    /// (thoughtsTokenCount) must be summed into output_tokens and recorded as
+    /// reasoning_tokens (else output + cost under-report for thinking models).
+    #[test]
+    fn gemini_usage_sums_thoughts_into_output_and_records_reasoning() {
+        let cat = ModelCatalog::from_vendored();
+        let mut st = GeminiSseState::default();
+        // Mirrors the recorded fixture: prompt 55, visible 15, thoughts 45.
+        let _ = parse_gemini_chunk(
+            r#"{"candidates":[{"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":55,"candidatesTokenCount":15,"thoughtsTokenCount":45}}"#,
+            &mut st,
+        );
+        let fin = finalize_gemini(&mut st, &cat, "google", "gemini-2.5-flash");
+        match &fin[0] {
+            ProviderEvent::MessageStop { usage, .. } => {
+                assert_eq!(usage.input_tokens, 55);
+                assert_eq!(usage.output_tokens, 60, "candidates(15) + thoughts(45)");
+                assert_eq!(usage.reasoning_tokens, 45);
+            }
+            other => panic!("expected MessageStop, got {other:?}"),
+        }
     }
 
     /// finalize defaults finishReason to "stop" when Gemini never sent one.

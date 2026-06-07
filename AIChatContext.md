@@ -382,12 +382,12 @@ The legacy TypeScript OpenCode lives in **`Reference/`** and is **READ-ONLY** �
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo nextest run --workspace                      # 209 pass, 4 skipped
+cargo nextest run --workspace                      # 210 pass, 4 skipped
 cargo deny check                                   # for dependency-touching clusters
 # desktop:
 cd apps/desktop && npm run typecheck && npm run build && npx vitest run   # 40 tests, 7 files
 ```
-Current state (after the Phase-5 release punch-list pass, 2026-06-06): **truthfully green** — fmt + clippy clean, **209 nextest pass / 0 fail (4 skipped)**, `cargo deny` ok, frontend **40 vitest**. Two human-only sign-off steps remain (GUI smoke + live BYOK provider smoke) — see `PROGRESS.md`.
+Current state (after the Phase-5 release punch-list pass, 2026-06-06): **truthfully green** — fmt + clippy clean, **210 nextest pass / 0 fail (4 skipped)**, `cargo deny` ok, frontend **40 vitest**. Two human-only sign-off steps remain (GUI smoke + live BYOK provider smoke) — see `PROGRESS.md`.
 
 ## 3. Architecture & repo layout
 
