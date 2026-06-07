@@ -65,6 +65,8 @@ impl McpClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // Reap the MCP server when the client is dropped (no leaked child).
+            .kill_on_drop(true)
             .env_clear();
         // Allowlist env: only explicit config vars + PATH for npx/node resolution.
         cmd.env("PATH", std::env::var("PATH").unwrap_or_default());
@@ -92,7 +94,7 @@ impl McpClient {
     /// Construct a client over arbitrary byte streams, spawning the response-
     /// router task. Used by [`connect_stdio`] (over the child's stdio) and by
     /// tests (over an in-memory duplex pair).
-    fn with_io<W, R>(name: &str, stdin: W, stdout: R, child: Option<Child>) -> Self
+    pub(crate) fn with_io<W, R>(name: &str, stdin: W, stdout: R, child: Option<Child>) -> Self
     where
         W: AsyncWrite + Send + Unpin + 'static,
         R: AsyncRead + Send + Unpin + 'static,

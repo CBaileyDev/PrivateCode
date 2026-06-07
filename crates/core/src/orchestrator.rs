@@ -1048,6 +1048,10 @@ impl Orchestrator {
                     }
                     "bash" => arguments["command"].as_str().unwrap_or("*"),
                     "web_fetch" => arguments["url"].as_str().unwrap_or("*"),
+                    // MCP tools: scope the permission (and any saved "always" rule)
+                    // to THIS tool by its qualified name, not a blanket "mcp"/"*"
+                    // that would auto-allow every MCP tool from one approval.
+                    "mcp" => tool.name(),
                     _ => "*",
                 };
 

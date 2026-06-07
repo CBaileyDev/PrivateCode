@@ -42,7 +42,11 @@ impl Tool for McpToolAdapter {
     }
 
     fn mutates(&self) -> bool {
-        false
+        // We can't know what an arbitrary MCP tool does, so treat every call as
+        // potentially mutating: the orchestrator takes a checkpoint around it,
+        // keeping MCP side effects undoable (the old hardcoded `false` defeated
+        // checkpoints for any MCP tool that wrote to the workspace).
+        true
     }
 
     fn permission_class(&self) -> &str {
@@ -54,5 +58,35 @@ impl Tool for McpToolAdapter {
             .call_tool(&self.def.name, arguments)
             .await
             .map_err(|e| ToolError::Other(e.to_string()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn adapter(server: &str, tool: &str) -> McpToolAdapter {
+        let (client_io, _server_io) = tokio::io::duplex(1024);
+        let (r, w) = tokio::io::split(client_io);
+        let client = Arc::new(McpClient::with_io(server, w, r, None));
+        McpToolAdapter::new(
+            client,
+            McpToolDef {
+                name: tool.to_string(),
+                description: "d".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn mcp_tool_is_qualified_mutating_and_gated() {
+        let a = adapter("srv", "echo");
+        // Qualified name keeps the permission/saved-rule scope per-tool.
+        assert_eq!(a.name(), "mcp_srv_echo");
+        // Treated as mutating so the orchestrator checkpoints around it (undoable).
+        assert!(a.mutates());
+        // Gated under the "mcp" permission class (prompts by default).
+        assert_eq!(a.permission_class(), "mcp");
     }
 }
