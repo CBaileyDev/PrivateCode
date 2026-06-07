@@ -18,6 +18,8 @@ import {
   sendPrompt,
 } from "../stores/messages";
 import { usageStore, formatCost } from "../stores/usage";
+import { connectedModels } from "../stores/providers";
+import { openSettings } from "../stores/ui";
 
 /** Selectable models. `value` is `provider|model_id` (model_id may itself
  * contain `/`, e.g. NVIDIA's "meta/llama-…", so we split on the first `|`). */
@@ -59,6 +61,14 @@ export default function InputBar() {
     return "anthropic|claude-opus-4-8";
   };
   const currentAgent = () => sessionStore.activeSession?.agent_id ?? "build";
+
+  // The model picker shows models from CONNECTED providers; before any provider
+  // is connected it falls back to the static list so the control is never empty
+  // (sending without a key surfaces a clear error toast).
+  const modelOptions = () => {
+    const connected = connectedModels();
+    return connected.length > 0 ? connected : MODEL_OPTIONS;
+  };
 
   const onModelChange = async (value: string) => {
     const live = await setActiveModel(parseModelConfig(value));
@@ -300,15 +310,23 @@ export default function InputBar() {
             onChange={(e) => onModelChange(e.currentTarget.value)}
             id="model-selector"
           >
-            {/* Show a session's model even if it isn't a built-in option (e.g.
+            {/* Show a session's model even if it isn't in the connected list (e.g.
                 set via a slash command) so the select never renders blank. */}
-            <Show when={!MODEL_OPTIONS.some((o) => o.value === currentModelValue())}>
+            <Show when={!modelOptions().some((o) => o.value === currentModelValue())}>
               <option value={currentModelValue()}>{currentModelValue()}</option>
             </Show>
-            <For each={MODEL_OPTIONS}>
+            <For each={modelOptions()}>
               {(opt) => <option value={opt.value}>{opt.label}</option>}
             </For>
           </select>
+          <button
+            class="btn icon-only"
+            onClick={openSettings}
+            data-tooltip="Model providers (⌘,)"
+            id="inputbar-settings-btn"
+          >
+            ⚙
+          </button>
 
           <select
             class="agent-selector"

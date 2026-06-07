@@ -7,9 +7,18 @@ import ComparisonView from "./components/ComparisonView";
 import CheckpointTimeline from "./components/CheckpointTimeline";
 import PermissionDialog from "./components/PermissionDialog";
 import CommandPalette from "./components/CommandPalette";
-import { sessionStore, loadSessions, flushPendingModelChange } from "./stores/session";
+import Settings from "./components/Settings";
+import Toast from "./components/Toast";
+import {
+  sessionStore,
+  loadSessions,
+  flushPendingModelChange,
+  createSessionInFolder,
+} from "./stores/session";
 import { messageStore } from "./stores/messages";
 import { permissionStore } from "./stores/permissions";
+import { loadProviderStatus, anyConnected } from "./stores/providers";
+import { settingsOpen, openSettings, closeSettings } from "./stores/ui";
 
 export default function App() {
   const [sidebarOpen, setSidebarOpen] = createSignal(true);
@@ -38,8 +47,13 @@ export default function App() {
       e.preventDefault();
       setPaletteOpen(!paletteOpen());
     }
-    if (e.key === "Escape" && paletteOpen()) {
-      setPaletteOpen(false);
+    if (mod && e.key === ",") {
+      e.preventDefault();
+      openSettings();
+    }
+    if (e.key === "Escape") {
+      if (paletteOpen()) setPaletteOpen(false);
+      if (settingsOpen()) closeSettings();
     }
   };
 
@@ -52,6 +66,7 @@ export default function App() {
   onMount(() => {
     document.addEventListener("keydown", handleKeyDown);
     loadSessions();
+    void loadProviderStatus();
   });
 
   onCleanup(() => {
@@ -102,6 +117,14 @@ export default function App() {
             </button>
             <button
               class="btn icon-only"
+              onClick={openSettings}
+              data-tooltip="Model providers (⌘,)"
+              id="open-settings-btn"
+            >
+              ⚙
+            </button>
+            <button
+              class="btn icon-only"
               onClick={() => setRightPanelOpen(!rightPanelOpen())}
               data-tooltip="Toggle details (⌘E)"
               id="toggle-right-panel-btn"
@@ -119,9 +142,29 @@ export default function App() {
               <div class="empty-icon">⚡</div>
               <h3>Welcome to Private Code</h3>
               <p>
-                Create a new session to start an AI-powered coding conversation.
-                Your code stays private — everything runs locally.
+                Open a project folder to start an AI-powered coding session. Your
+                code stays private — everything runs locally.
               </p>
+              <div class="empty-actions">
+                <button
+                  class="new-session-btn"
+                  onClick={() => void createSessionInFolder()}
+                  id="empty-open-folder-btn"
+                >
+                  📂 Open a folder
+                </button>
+                <Show when={!anyConnected()}>
+                  <button class="btn" onClick={openSettings} id="empty-add-key-btn">
+                    🔌 Connect a model
+                  </button>
+                </Show>
+              </div>
+              <Show when={!anyConnected()}>
+                <p class="empty-hint">
+                  No model connected yet — add a provider API key in Settings (⌘,) so
+                  your sessions can talk to a model.
+                </p>
+              </Show>
             </div>
           }
         >
@@ -154,6 +197,13 @@ export default function App() {
       <Show when={paletteOpen()}>
         <CommandPalette onClose={() => setPaletteOpen(false)} />
       </Show>
+
+      <Show when={settingsOpen()}>
+        <Settings />
+      </Show>
+
+      {/* Transient notifications */}
+      <Toast />
     </div>
   );
 }

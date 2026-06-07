@@ -6,7 +6,7 @@ import { createSignal, For, Show, createMemo } from "solid-js";
 import {
   sessionStore,
   setActiveSession,
-  createNewSession,
+  createSessionInFolder,
   deleteSession,
   type SessionInfo,
 } from "../stores/session";
@@ -15,8 +15,6 @@ import { formatCost } from "../stores/usage";
 
 export default function Sidebar() {
   const [searchQuery, setSearchQuery] = createSignal("");
-  const [showNewSession, setShowNewSession] = createSignal(false);
-  const [newTitle, setNewTitle] = createSignal("");
 
   const filteredSessions = createMemo(() => {
     const q = searchQuery().toLowerCase();
@@ -33,12 +31,9 @@ export default function Sidebar() {
     await loadMessages(session.id);
   };
 
-  const handleCreateSession = async () => {
-    const title = newTitle().trim() || `Session ${sessionStore.sessions.length + 1}`;
-    await createNewSession(title, ".");
-    setNewTitle("");
-    setShowNewSession(false);
-  };
+  // "New session" = pick a project folder (find-or-create its project, create a
+  // session rooted there, activate it). This is the working entry point.
+  const handleNewSession = () => void createSessionInFolder();
 
   const handleDeleteSession = async (e: MouseEvent, sessionId: string) => {
     e.stopPropagation();
@@ -76,8 +71,8 @@ export default function Sidebar() {
         <h2>Sessions</h2>
         <button
           class="btn icon-only"
-          onClick={() => setShowNewSession(!showNewSession())}
-          data-tooltip="New session"
+          onClick={handleNewSession}
+          data-tooltip="New session (choose a folder)"
           id="new-session-btn"
         >
           +
@@ -102,43 +97,6 @@ export default function Sidebar() {
           />
         </div>
 
-        {/* New Session Form */}
-        <Show when={showNewSession()}>
-          <div
-            style={{
-              padding: "var(--space-3)",
-              background: "var(--bg-tertiary)",
-              "border-radius": "var(--radius-md)",
-              "margin-bottom": "var(--space-3)",
-              border: "1px solid var(--border)",
-            }}
-          >
-            <input
-              type="text"
-              class="input-field"
-              style={{
-                "min-height": "36px",
-                "font-size": "var(--text-sm)",
-                padding: "var(--space-2) var(--space-3)",
-                "margin-bottom": "var(--space-2)",
-              }}
-              placeholder="Session title..."
-              value={newTitle()}
-              onInput={(e) => setNewTitle(e.currentTarget.value)}
-              onKeyDown={(e) => e.key === "Enter" && handleCreateSession()}
-              id="new-session-title-input"
-            />
-            <div style={{ display: "flex", gap: "var(--space-2)" }}>
-              <button class="btn primary" style={{ flex: 1 }} onClick={handleCreateSession}>
-                Create
-              </button>
-              <button class="btn" onClick={() => setShowNewSession(false)}>
-                Cancel
-              </button>
-            </div>
-          </div>
-        </Show>
-
         {/* Session List */}
         <Show
           when={filteredSessions().length > 0}
@@ -147,14 +105,14 @@ export default function Sidebar() {
               <p style={{ color: "var(--text-muted)", "font-size": "var(--text-sm)" }}>
                 {sessionStore.isLoading ? "Loading..." : "No sessions yet"}
               </p>
-              <Show when={!sessionStore.isLoading && sessionStore.sessions.length === 0}>
+              <Show when={!sessionStore.isLoading}>
                 <button
                   class="new-session-btn"
                   style={{ "margin-top": "var(--space-3)" }}
-                  onClick={() => setShowNewSession(true)}
+                  onClick={handleNewSession}
                   id="create-first-session-btn"
                 >
-                  + Create your first session
+                  📂 Open a folder
                 </button>
               </Show>
             </div>

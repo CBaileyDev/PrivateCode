@@ -194,6 +194,11 @@ function handleProtocolEvent(event: any) {
     case "error": {
       console.error(`Session error [${event.code}]: ${event.message}`);
       addSystemMessage(`⚠️ Error [${event.code}]: ${event.message}`);
+      // Also surface it as a toast so a failed turn (e.g. missing API key) is
+      // unmistakable, not just a faint system line.
+      import("./toast").then(({ showToast }) =>
+        showToast(`${event.message || "Turn failed"}`, "error"),
+      );
       resetStreaming();
       break;
     }

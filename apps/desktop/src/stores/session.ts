@@ -11,6 +11,8 @@ import {
 } from "./messages";
 import { clearCandidates } from "./candidates";
 import { clearCheckpoints } from "./checkpoints";
+import { showToast } from "./toast";
+import { loadProviderStatus } from "./providers";
 
 // Monotonic subscription generation. Each `setActiveSession` mints a new value;
 // only the LATEST subscription's channel applies events. This subsumes the
@@ -167,7 +169,10 @@ async function setActiveSession(session: SessionInfo) {
 /** Create a new session in the active project. */
 async function createNewSession(title: string, workspacePath: string) {
   const projectId = sessionStore.activeProjectId;
-  if (!projectId) return;
+  if (!projectId) {
+    showToast("Pick a folder first — use “Open a folder” to start a session.", "info");
+    return;
+  }
 
   try {
     const { invoke } = await import("@tauri-apps/api/core");
@@ -180,7 +185,50 @@ async function createNewSession(title: string, workspacePath: string) {
     setSessionStore("sessions", [...sessionStore.sessions, session]);
     await setActiveSession(session);
   } catch (e) {
-    console.error("Failed to create session:", e);
+    showToast(`Failed to create session: ${String(e)}`);
+  }
+}
+
+/**
+ * Start a session by picking a project FOLDER. This is the primary "new session"
+ * entry point: it opens a native folder dialog, finds-or-creates the project for
+ * that directory, creates a session rooted there, and activates it. Without this
+ * (and a real workspace) the agent has no directory to operate in — the original
+ * bug where "New Session" did nothing because no project existed.
+ */
+async function createSessionInFolder(): Promise<void> {
+  try {
+    const dialog = await import("@tauri-apps/plugin-dialog");
+    const picked = await dialog.open({
+      directory: true,
+      multiple: false,
+      title: "Choose a project folder for Private Code",
+    });
+    if (!picked || typeof picked !== "string") return; // cancelled
+
+    const { invoke } = await import("@tauri-apps/api/core");
+    const project = (await invoke("open_or_create_project", {
+      directory: picked,
+    })) as ProjectInfo;
+
+    // Upsert the project + make it active.
+    setSessionStore("projects", (ps) =>
+      ps.some((p) => p.id === project.id) ? ps : [...ps, project],
+    );
+    setSessionStore("activeProjectId", project.id);
+
+    const session = (await invoke("create_session", {
+      projectId: project.id,
+      title: project.name,
+      workspacePath: project.directory,
+    })) as SessionInfo;
+
+    setSessionStore("sessions", [...sessionStore.sessions, session]);
+    await setActiveSession(session);
+    // Refresh provider connectivity so the model picker is accurate.
+    void loadProviderStatus();
+  } catch (e) {
+    showToast(`Failed to start session: ${String(e)}`);
   }
 }
 
@@ -262,7 +310,7 @@ async function setActiveModel(modelConfig: string): Promise<boolean> {
     pendingModelChange = live ? null : { sessionId: s.id, config: modelConfig };
     return live;
   } catch (e) {
-    console.error("set_model failed:", e);
+    showToast(`Failed to switch model: ${String(e)}`);
     return true;
   }
 }
@@ -287,7 +335,7 @@ async function setActiveAgent(agentId: string): Promise<void> {
     await invoke("set_agent", { sessionId: s.id, agentId });
     patchSessionConfig(s.id, { agent_id: agentId });
   } catch (e) {
-    console.error("set_agent failed:", e);
+    showToast(`Failed to switch agent: ${String(e)}`);
   }
 }
 
@@ -326,6 +374,7 @@ export {
   loadSessions,
   setActiveSession,
   createNewSession,
+  createSessionInFolder,
   deleteSession,
   initProject,
   setActiveModel,

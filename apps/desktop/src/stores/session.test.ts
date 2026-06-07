@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import {
+  createSessionInFolder,
   flushPendingModelChange,
   loadSessions,
   revertActiveSession,
@@ -77,6 +78,41 @@ beforeEach(() => {
 });
 
 afterEach(() => clearMocks());
+
+describe("createSessionInFolder", () => {
+  it("picks a folder, opens a project, and activates a new session", async () => {
+    responses["plugin:dialog|open"] = "/Users/me/proj";
+    responses["open_or_create_project"] = {
+      id: "p1",
+      name: "proj",
+      directory: "/Users/me/proj",
+      created_at: 0,
+    };
+    responses["create_session"] = fakeSession("s1");
+    responses["get_messages"] = [];
+    responses["subscribe_session"] = null;
+    responses["provider_status"] = [];
+
+    await createSessionInFolder();
+
+    expect(
+      calls.find((c) => c.cmd === "open_or_create_project")?.args,
+    ).toMatchObject({ directory: "/Users/me/proj" });
+    expect(calls.find((c) => c.cmd === "create_session")?.args).toMatchObject({
+      projectId: "p1",
+      workspacePath: "/Users/me/proj",
+    });
+    expect(sessionStore.activeSession?.id).toBe("s1");
+    expect(sessionStore.activeProjectId).toBe("p1");
+  });
+
+  it("does nothing when the folder dialog is cancelled", async () => {
+    responses["plugin:dialog|open"] = null; // user cancelled
+    await createSessionInFolder();
+    expect(calls.some((c) => c.cmd === "create_session")).toBe(false);
+    expect(sessionStore.activeSession).toBeNull();
+  });
+});
 
 describe("setActiveModel / setActiveAgent", () => {
   it("setActiveModel persists and patches the store (live)", async () => {
