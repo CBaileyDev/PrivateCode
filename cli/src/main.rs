@@ -526,12 +526,13 @@ async fn run_selftest(turns: u32) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_auth(action: &AuthCommands) -> Result<(), Box<dyn std::error::Error>> {
     match action {
         AuthCommands::Set { provider } => {
-            print!("Enter API key for {provider}: ");
-            use std::io::{self, Write};
-            io::stdout().flush()?;
-            let mut key = String::new();
-            io::stdin().read_line(&mut key)?;
+            // Read WITHOUT echo so the key never appears on screen or in scrollback
+            // (still from stdin, never argv; the value is never printed back).
+            let key = rpassword::prompt_password(format!("Enter API key for {provider}: "))?;
             let key = key.trim();
+            if key.is_empty() {
+                return Err("no key entered".into());
+            }
             set_key(provider, key)?;
             println!("Stored key for {provider} in OS keychain.");
         }

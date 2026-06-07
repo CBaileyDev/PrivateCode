@@ -487,6 +487,9 @@ pub async fn export_session(
     format: String,
 ) -> Result<String, String> {
     use private_code_core::export;
+    // Validate the id as a UUID before interpolating it into a filesystem path —
+    // defence-in-depth against path traversal (session ids are always v4 UUIDs).
+    uuid::Uuid::parse_str(&session_id).map_err(|_| "invalid session id".to_string())?;
     let ext = if format == "json" { "json" } else { "md" };
     let out_path = coord
         .global_data_dir
@@ -606,6 +609,21 @@ mod tests {
             Ok(())
         });
         (channel, collected)
+    }
+
+    /// export_session rejects a non-UUID id before it can be interpolated into a
+    /// filesystem path (path-traversal defence-in-depth).
+    #[tokio::test]
+    async fn export_session_rejects_non_uuid_id() {
+        let (app, _dir) = harness(Arc::new(ScriptedProvider::one_shot_text("hi"))).await;
+        let err = export_session(
+            app.state(),
+            "../../../../etc/passwd".into(),
+            "markdown".into(),
+        )
+        .await
+        .expect_err("a non-UUID session id must be rejected");
+        assert!(err.contains("invalid session id"), "got: {err}");
     }
 
     /// init_project → create_session → list/get → set_agent → set_model →

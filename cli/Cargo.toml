@@ -28,6 +28,8 @@ futures-util.workspace = true
 http.workspace = true
 async-trait.workspace = true
 tempfile.workspace = true
+# Read API keys without echoing them to the terminal / scrollback.
+rpassword = "7"
 
 
 

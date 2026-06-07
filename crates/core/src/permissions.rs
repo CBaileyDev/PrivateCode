@@ -146,6 +146,9 @@ pub fn agent_default_rules(agent_id: &str) -> Vec<PermissionRule> {
             r("patch", "*", Ask),
             r("bash", "*", Ask),
             r("web_fetch", "*", Ask),
+            // External/untrusted MCP tools always prompt (the broad `*` Allow above
+            // would otherwise silently grant them).
+            r("mcp", "*", Ask),
             r("read_file", "*.env", Ask),
             r("read_file", "*.env.*", Ask),
             r("read_file", "*.env.example", Allow),
@@ -160,6 +163,9 @@ pub fn agent_default_rules(agent_id: &str) -> Vec<PermissionRule> {
             r("patch", "*", Ask),
             r("bash", "*", Ask),
             r("web_fetch", "*", Ask),
+            // External/untrusted MCP tools always prompt (explicit, not just via the
+            // no-match Ask fallback — survives future rule additions).
+            r("mcp", "*", Ask),
             // .env carve-out: reading secrets prompts even though reads are allowed.
             r("read_file", "*.env", Ask),
             r("read_file", "*.env.*", Ask),
@@ -314,6 +320,23 @@ mod tests {
         );
         assert_eq!(
             evaluate("bash", "rm -rf /", "build", ws, &saved),
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn test_mcp_tools_prompt_under_every_agent() {
+        let ws = Path::new("/workspace");
+        let rules = vec![];
+        // MCP tools (action "mcp") are external/untrusted: they must PROMPT, not be
+        // silently auto-allowed by the `general` agent's broad `*,*→Allow`.
+        assert_eq!(
+            evaluate("mcp", "mcp_server_dangerous", "general", ws, &rules),
+            PermissionDecision::Ask,
+            "general must not auto-allow MCP tools"
+        );
+        assert_eq!(
+            evaluate("mcp", "mcp_server_dangerous", "build", ws, &rules),
             PermissionDecision::Ask
         );
     }
