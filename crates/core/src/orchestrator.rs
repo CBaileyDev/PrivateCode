@@ -2,6 +2,7 @@ use crate::checkpoint::{GitSnapshotEngine, Snapshot};
 use crate::config::{AppConfig, DEFAULT_MODEL_ID};
 use crate::context::{Reconcile, SystemContextRegistry};
 use crate::db::{self};
+use crate::ecosystem::Ecosystem;
 use crate::orchestration::{self, OrchestrationMode};
 use crate::permissions::{
     self, PermissionDecision, PermissionPrompt, PermissionReply, PermissionRule,
@@ -32,6 +33,7 @@ pub struct Orchestrator {
     pub providers: HashMap<String, Arc<dyn ModelProvider>>,
     pub context_registry: SystemContextRegistry,
     pub tool_registry: Arc<ToolRegistry>,
+    pub ecosystem: Option<Arc<Ecosystem>>,
     pub permission_prompt_tx: mpsc::Sender<(PermissionPrompt, oneshot::Sender<PermissionReply>)>,
     pub event_tx: mpsc::Sender<ProtocolEvent>,
 }
@@ -173,9 +175,22 @@ impl Orchestrator {
             providers: HashMap::new(),
             context_registry: SystemContextRegistry::new(),
             tool_registry,
+            ecosystem: None,
             permission_prompt_tx,
             event_tx,
         }
+    }
+
+    pub fn with_ecosystem(mut self, ecosystem: Arc<Ecosystem>) -> Self {
+        self.ecosystem = Some(ecosystem);
+        self
+    }
+
+    pub fn maybe_ecosystem(mut self, ecosystem: Option<Arc<Ecosystem>>) -> Self {
+        if let Some(e) = ecosystem {
+            self.ecosystem = Some(e);
+        }
+        self
     }
 
     /// Attach the id→provider map used for multi-model orchestration. Builder so
@@ -1202,10 +1217,37 @@ impl Orchestrator {
                     r = tool.run(&mut tool_ctx, arguments.clone()) => r,
                 };
 
-                let (result_content, is_err) = match execute_res {
+                let (mut result_content, is_err) = match execute_res {
                     Ok(val) => (ToolResultContent::Json(val), false),
                     Err(e) => (ToolResultContent::Text(e.to_string()), true),
                 };
+
+                // Append LSP diagnostics after mutating file writes (Phase 5.1).
+                if !is_err
+                    && tool.mutates()
+                    && let Some(eco) = &self.ecosystem
+                    && let Some(rel) = arguments["path"].as_str()
+                {
+                    let file_path = workspace_path.join(rel);
+                    let file_text = std::fs::read_to_string(&file_path).unwrap_or_default();
+                    let lsp_note = eco.lsp_after_write(&file_path, &file_text).await;
+                    if !lsp_note.is_empty() {
+                        result_content = match result_content {
+                            ToolResultContent::Json(mut v) => {
+                                if let Some(obj) = v.as_object_mut() {
+                                    obj.insert(
+                                        "lsp_diagnostics".into(),
+                                        serde_json::Value::String(lsp_note),
+                                    );
+                                }
+                                ToolResultContent::Json(v)
+                            }
+                            ToolResultContent::Text(t) => {
+                                ToolResultContent::Text(format!("{t}\n\n{lsp_note}"))
+                            }
+                        };
+                    }
+                }
 
                 // If tool mutates, take a Post-Step checkpoint
                 if tool.mutates() {

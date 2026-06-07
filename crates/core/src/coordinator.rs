@@ -51,6 +51,7 @@ pub struct SessionCoordinator {
     /// default; the production daemon registers the extra ones it serves.
     pub providers: HashMap<String, Arc<dyn private_code_providers::ModelProvider>>,
     pub tool_registry: Arc<private_code_tools::ToolRegistry>,
+    pub ecosystem: Option<Arc<crate::ecosystem::Ecosystem>>,
     /// Tracks every spawned task (event/permission routers + turn drains + reaper)
     /// so a graceful shutdown can wait for them to finish under a bounded timeout.
     pub tracker: TaskTracker,
@@ -135,9 +136,15 @@ impl SessionCoordinator {
             provider,
             providers: HashMap::new(),
             tool_registry,
+            ecosystem: None,
             tracker: TaskTracker::new(),
             shutdown_token: CancellationToken::new(),
         }
+    }
+
+    pub fn with_ecosystem(mut self, ecosystem: Arc<crate::ecosystem::Ecosystem>) -> Self {
+        self.ecosystem = Some(ecosystem);
+        self
     }
 
     /// Register a named provider, selected per-session when a session's
@@ -288,7 +295,8 @@ impl SessionCoordinator {
                 permission_prompt_tx,
                 event_tx,
             )
-            .with_providers(orch_providers),
+            .with_providers(orch_providers)
+            .maybe_ecosystem(self.ecosystem.clone()),
         );
 
         // Large enough that a burst of ephemeral token deltas can't evict durable

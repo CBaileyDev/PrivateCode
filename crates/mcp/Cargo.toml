@@ -1,0 +1,14 @@
+[package]
+name = "private-code-mcp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+private-code-tools.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "sync", "rt", "macros", "time"] }
+tracing.workspace = true

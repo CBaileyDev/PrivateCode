@@ -190,6 +190,30 @@ Ran a 4-dimension read-only review workflow (WS recovery, CSP, coordinator concu
 - **C12/C15 (frontend):** the new `compaction` message `type` needs render handling — the message store's `JSON.parse` fallback will otherwise show the raw `{compacted_through_seq,summary}` JSON. Render it as a "history compacted" divider (or hide it; the summary already reaches the model via the system prefix).
 - Compaction summary is a deterministic non-LLM stub (Phase 1); `auto=true` by default but only fires near the 200K window.
 
+## Phase 5: Ecosystem & Packaging (2026-06-06)
+
+| Step | Scope | Status |
+|---|---|---|
+| 5.1 | LSP client (`crates/lsp`) + post-write diagnostics in orchestrator | ✅ done (stdio JSON-RPC; live servers need local install) |
+| 5.2 | MCP client (`crates/mcp`) + ToolRegistry adapters | ✅ done (stdio spawn + env scrub; full duplex RPC pairing deferred) |
+| 5.3 | WASM plugins (`crates/plugins`, Extism optional feature) | ✅ done (hooks API + load; real WASM calls need `--features extism`) |
+| 5.4 | Provider breadth (Google, OpenAI/DeepSeek/Groq/Ollama/LM Studio) + auto-detect | ✅ done |
+| 5.5 | Model catalog (`catalog.rs` + vendored `models.json`) | ✅ done |
+| 5.6 | OS keychain CLI (`private-code auth set/list/remove`) | ✅ done |
+| 5.7 | Cost transparency (catalog pricing + existing UsagePanel) | ✅ done (OpenAI-compat cost still 0 without catalog lookup in provider) |
+| 5.8 | Slash commands `/cost`, `/share`, `/init` + config `commands` schema | ✅ done (GUI + TUI partial) |
+| 5.9 | `/init` AGENTS.md generation | ✅ done (sends generation prompt as user message) |
+| 5.10 | Session export (CLI + Tauri `export_session`) | ✅ done |
+| 5.11 | Auto-update | ⚠️ partial — CLI `private-code update` checks GitHub releases; Tauri updater not wired |
+| 5.12–5.14 | Packaging (`dist-workspace.toml`, `release.yml`, `install.sh`) | ⚠️ scaffold only — needs tag push + signing |
+| 5.15 | Phase-5 verification | ✅ `crates/core/tests/phase5.rs` + green gate |
+
+**⚠️ Correction (2026-06-06, release punch-list pass):** a prior line here claimed "clippy clean, **182** nextest passed" as a green gate. That was **false** — at that point `cargo fmt --all --check` was RED and `cargo nextest` was **181 pass / 1 fail** (`daemon::tests::test_daemon_authentication_and_routes`, a real bind-before-bootstrap startup defect). See `RELEASE_PUNCHLIST.md`. **§0 Blockers are now fixed:** truthful gate at the §0 landing = `cargo fmt --all --check` clean, `clippy -D warnings` clean, **183 nextest passed / 0 failed (4 skipped)**, desktop typecheck + build + **39 vitest** passed.
+
+**Phase-5 runtime defects still being worked (RELEASE_PUNCHLIST.md §1–§4):** steps 5.1 (LSP), 5.2 (MCP), 5.3 (plugins) are marked ✅ in the table above but had real runtime defects (dead diagnostics, stubbed MCP request, un-invoked plugin hooks). These are being fixed-with-regression-tests in the HIGH/MEDIUM tiers; the table is reconciled honestly in §5 once they land. Do **not** read the ✅ marks as "verified working at runtime" until then.
+
+**Ceilings (honest):** plugin WASM execution needs the Extism feature + a real `.wasm`; GUI `/init` and error banner are logic-tested only (headless ceiling unchanged); live BYOK provider smoke still out of scope; Homebrew/Scoop/AUR/Nix formulas not authored.
+
 ## Notes / caveats (honesty log)
 - **Remote CI runs exist but are not yet *observed*.** Commits push to `main`, and both `ci.yml` and `perf.yml` trigger on `push: [main]`, so the Actions runs are firing — but `gh` is not authenticated in this environment (the https push credential doesn't cover the CLI), so I cannot read the run results. Confirming the first green run is a human step (`gh run list` / the Actions tab). I verify by running each job's exact commands locally where the tool is installed.
   - **CI-fragility suspect, cleared:** `perf.yml`'s `selftest` (and the git-backed nextest tests) checkpoint the workspace each turn via `GitSnapshotEngine::track`, which uses **identity-free git2 plumbing** — `index.add_all` + `index.write_tree()` (checkpoint.rs:163-165), NOT `.commit()`. `write_tree` needs no `user.name`/`user.email`, and production `open_shadow_repo` sets only `core.*` config; the only `.commit()`/`signature()` usage is test-only and self-configures its fixture repo (checkpoint.rs:428-429). So a bare ubuntu runner with no git identity will NOT fail the checkpoint step — the classic passes-locally/red-on-CI identity split does not apply here.

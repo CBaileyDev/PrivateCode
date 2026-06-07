@@ -13,6 +13,9 @@ private-code-providers = { path = "crates/providers" }
 private-code-tools = { path = "crates/tools" }
 private-code-tui = { path = "crates/tui" }
 private-code-codeintel = { path = "crates/codeintel" }
+private-code-lsp = { path = "crates/lsp" }
+private-code-mcp = { path = "crates/mcp" }
+private-code-plugins = { path = "crates/plugins" }
 
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["rt"] }

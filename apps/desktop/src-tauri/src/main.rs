@@ -11,6 +11,7 @@ use private_code_desktop::state::build_coordinator;
 
 use private_code_core::coordinator::SessionCoordinator;
 use private_code_core::db;
+use std::path::PathBuf;
 use std::time::Duration;
 use tauri::Manager;
 use tracing_subscriber::EnvFilter;
@@ -53,7 +54,9 @@ fn main() {
 
             // Build the shared coordinator (Anthropic default + NVIDIA), start
             // the idle reaper, and manage it as global state.
-            let coordinator = build_coordinator(pool, data_dir);
+            let workspace = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            let coordinator =
+                tauri::async_runtime::block_on(build_coordinator(pool, data_dir, &workspace));
             coordinator.start_reaper(Duration::from_secs(30 * 60), Duration::from_secs(60));
             app.manage(coordinator);
 
@@ -79,6 +82,7 @@ fn main() {
             commands::list_checkpoints,
             commands::get_config,
             commands::get_usage,
+            commands::export_session,
         ])
         .build(tauri::generate_context!())
         .expect("error while building Private Code");

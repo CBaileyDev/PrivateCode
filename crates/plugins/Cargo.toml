@@ -1,0 +1,16 @@
+[package]
+name = "private-code-plugins"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+extism = ["dep:extism"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+extism = { version = "1.21", optional = true }

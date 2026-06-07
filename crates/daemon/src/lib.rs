@@ -7,9 +7,11 @@ use axum::{
     routing::{get, post},
     Router,
 };
+use private_code_core::config::AppConfig;
 use private_code_core::coordinator::SessionCoordinator;
+use private_code_core::ecosystem::Ecosystem;
 use private_code_providers::anthropic::AnthropicProvider;
-use private_code_providers::ModelProvider;
+use private_code_providers::{detect_providers, ModelProvider};
 use private_code_tools::{
     BashTool, EditTool, GlobTool, GrepTool, PatchTool, ReadFileTool, ToolRegistry, WebFetchTool,
     WriteFileTool,
@@ -113,12 +115,14 @@ pub async fn serve_daemon(
 /// Dependency-injected entrypoint used by both the real daemon and tests: the
 /// caller supplies the provider, tool registry, a pre-bound listener, and a
 /// shutdown token. The loopback auth token is read/created from global_data_dir.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_daemon_with(
     pool: sqlx::SqlitePool,
     global_data_dir: PathBuf,
     provider: Arc<dyn ModelProvider>,
     extra_providers: Vec<(String, Arc<dyn ModelProvider>)>,
     tool_registry: Arc<ToolRegistry>,
+    ecosystem: Option<Arc<Ecosystem>>,
     listener: TcpListener,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -126,6 +130,9 @@ pub async fn start_daemon_with(
     let token = auth::get_or_create_token(&global_data_dir)?;
     let mut coordinator_inner =
         SessionCoordinator::new(pool.clone(), global_data_dir, provider, tool_registry);
+    if let Some(eco) = ecosystem {
+        coordinator_inner = coordinator_inner.with_ecosystem(eco);
+    }
     // Register additional providers selected per-session by `model_config.provider_id`.
     for (id, p) in extra_providers {
         coordinator_inner.register_provider(id, p);
@@ -163,25 +170,40 @@ pub async fn start_daemon(
 ) -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Starting daemon on port {}", port);
 
-    let tool_registry = Arc::new(default_tool_registry());
+    // Bind the listener FIRST — before the (potentially slow) ecosystem bootstrap.
+    // Once the socket is LISTENing the kernel completes inbound handshakes and
+    // queues connections in the accept backlog, so a client that connects during
+    // bootstrap waits for the response instead of getting "connection refused".
+    // (Previously bind ran AFTER `Ecosystem::bootstrap` + `detect_providers`, so
+    // a slow LSP discovery/spawn left the port unbound and refused early clients —
+    // the deterministic `test_daemon_authentication_and_routes` failure.)
+    let addr = SocketAddr::from(([127, 0, 0, 1], port));
+    let listener = TcpListener::bind(addr).await?;
+    tracing::info!("Listening on {}", addr);
+
+    let config = AppConfig::load(&global_data_dir, std::path::Path::new("."));
+    let mut tool_registry = default_tool_registry();
+    let ecosystem = Arc::new(
+        Ecosystem::bootstrap(
+            std::path::Path::new("."),
+            &global_data_dir,
+            &config,
+            &mut tool_registry,
+        )
+        .await,
+    );
+    let tool_registry = Arc::new(tool_registry);
     let provider: Arc<dyn ModelProvider> = Arc::new(AnthropicProvider::new());
-    // Additional providers selected per-session by `model_config.provider_id`.
-    // Anthropic is ALSO registered by name (same Arc as the default) so a
-    // multi-model fan-out from ANY session can resolve "anthropic/<model>" — the
-    // orchestration resolver matches only registered ids and never silently falls
-    // back to the default. NVIDIA's OpenAI-compatible gateway (key: NVIDIA_API_KEY
-    // or keyring "private-code/nvidia"); keys resolve lazily on first use.
-    let extra_providers: Vec<(String, Arc<dyn ModelProvider>)> = vec![
+    let mut extra_providers: Vec<(String, Arc<dyn ModelProvider>)> = vec![
         ("anthropic".to_string(), provider.clone()),
         (
             "nvidia".to_string(),
             Arc::new(private_code_providers::OpenAiCompatProvider::nvidia()),
         ),
     ];
-
-    let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!("Listening on {}", addr);
+    for (id, p) in detect_providers().await {
+        extra_providers.push((id, p));
+    }
 
     // Cancel on Ctrl-C so axum drains gracefully. (The full SIGTERM + drain
     // sequence is wired in cluster C7.)
@@ -200,6 +222,7 @@ pub async fn start_daemon(
         provider,
         extra_providers,
         tool_registry,
+        Some(ecosystem),
         listener,
         shutdown,
     )
@@ -312,7 +335,8 @@ mod tests {
 
         let handle = tokio::spawn(async move {
             // Discard the non-Send Box<dyn Error> result; we only assert the task ends.
-            let _ = start_daemon_with(pool, dir, provider, vec![], registry, listener, sd).await;
+            let _ =
+                start_daemon_with(pool, dir, provider, vec![], registry, None, listener, sd).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;

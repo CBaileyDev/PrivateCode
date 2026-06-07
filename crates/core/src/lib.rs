@@ -4,6 +4,8 @@ pub mod config;
 pub mod context;
 pub mod coordinator;
 pub mod db;
+pub mod ecosystem;
+pub mod export;
 pub mod fuzzy;
 pub mod indexer;
 pub mod orchestration;

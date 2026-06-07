@@ -480,6 +480,25 @@ pub async fn get_usage(
     }
 }
 
+#[tauri::command]
+pub async fn export_session(
+    coord: State<'_, SessionCoordinator>,
+    session_id: String,
+    format: String,
+) -> Result<String, String> {
+    use private_code_core::export;
+    let ext = if format == "json" { "json" } else { "md" };
+    let out_path = coord
+        .global_data_dir
+        .join("exports")
+        .join(format!("{session_id}.{ext}"));
+    std::fs::create_dir_all(out_path.parent().unwrap()).map_err(|e| e.to_string())?;
+    export::export_session_to_file(&coord.pool, &session_id, &out_path, &format)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(out_path.to_string_lossy().to_string())
+}
+
 // ─── Command-layer test harness ────────────────────────────────────────────
 //
 // Drives the REAL command functions headless: a `tauri::test::mock_app` manages

@@ -22,6 +22,11 @@ use std::sync::OnceLock;
 
 /// NVIDIA's OpenAI-compatible inference gateway.
 pub const NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
+pub const OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEEPSEEK_BASE_URL: &str = "https://api.deepseek.com/v1";
+pub const GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
+pub const OLLAMA_BASE_URL: &str = "http://127.0.0.1:11434/v1";
+pub const LMSTUDIO_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 
 pub struct OpenAiCompatProvider {
     client: reqwest::Client,
@@ -48,6 +53,28 @@ impl OpenAiCompatProvider {
     /// NVIDIA's hosted models (key `nvidia` / `NVIDIA_API_KEY`).
     pub fn nvidia() -> Self {
         Self::new("nvidia", NVIDIA_BASE_URL)
+    }
+
+    pub fn openai() -> Self {
+        Self::new("openai", OPENAI_BASE_URL)
+    }
+
+    pub fn deepseek() -> Self {
+        Self::new("deepseek", DEEPSEEK_BASE_URL)
+    }
+
+    pub fn groq() -> Self {
+        Self::new("groq", GROQ_BASE_URL)
+    }
+
+    /// Local Ollama (no API key required; port auto-detected separately).
+    pub fn ollama() -> Self {
+        Self::new("ollama", OLLAMA_BASE_URL)
+    }
+
+    /// Local LM Studio OpenAI-compatible endpoint.
+    pub fn lmstudio() -> Self {
+        Self::new("lmstudio", LMSTUDIO_BASE_URL)
     }
 
     /// Resolve and cache the API key (keyring → env fallback), so the OS keychain

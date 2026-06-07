@@ -17,6 +17,7 @@ import {
   messageStore,
   resetStreaming,
 } from "../stores/messages";
+import { usageStore, formatCost } from "../stores/usage";
 
 /** Selectable models. `value` is `provider|model_id` (model_id may itself
  * contain `/`, e.g. NVIDIA's "meta/llama-…", so we split on the first `|`). */
@@ -166,7 +167,39 @@ export default function InputBar() {
             "/revert — Revert workspace to last checkpoint\n" +
             "/compact — Compact context\n" +
             "/clear — Clear the local view\n" +
+            "/cost — Show session cost breakdown\n" +
+            "/share — Export session to Markdown\n" +
+            "/init — Generate AGENTS.md for this project\n" +
             "/help — Show this help"
+        );
+        break;
+      }
+      case "/cost": {
+        const u = usageStore.session;
+        addSystemMessage(
+          `Session cost: ${formatCost(u.cost)}\n` +
+            `Tokens — in: ${u.input_tokens}, out: ${u.output_tokens}, ` +
+            `cache read: ${u.cache_read_tokens}, cache write: ${u.cache_write_tokens}`
+        );
+        break;
+      }
+      case "/share": {
+        if (!sessionStore.activeSession) break;
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          const path = await invoke<string>("export_session", {
+            sessionId: sessionStore.activeSession.id,
+            format: "markdown",
+          });
+          addSystemMessage(`Session exported to ${path}`);
+        } catch (e) {
+          addSystemMessage(`Export failed: ${String(e)}`);
+        }
+        break;
+      }
+      case "/init": {
+        addUserMessage(
+          "Please analyze this repository and generate an AGENTS.md file at the project root with: project overview, architecture notes, coding conventions, testing instructions, and key file paths."
         );
         break;
       }

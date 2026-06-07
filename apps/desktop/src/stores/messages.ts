@@ -193,8 +193,7 @@ function handleProtocolEvent(event: any) {
 
     case "error": {
       console.error(`Session error [${event.code}]: ${event.message}`);
-      // An error ends the turn without a `message_completed`; clear the live
-      // buffers so the input doesn't stay locked in the abort-only state.
+      addSystemMessage(`⚠️ Error [${event.code}]: ${event.message}`);
       resetStreaming();
       break;
     }

@@ -2,33 +2,30 @@
 name = "private-code-providers"
 version = "0.1.0"
 edition = "2024"
-
 publish = false
+
+[features]
+default = []
+testkit = []
+
 [dependencies]
 private-code-protocol.workspace = true
-tokio.workspace = true
-reqwest.workspace = true
+async-trait.workspace = true
 eventsource-stream.workspace = true
 futures-util.workspace = true
-keyring.workspace = true
+reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+keyring.workspace = true
 tracing.workspace = true
-async-trait.workspace = true
-
-[features]
-# Offline test doubles (ScriptedProvider, SSE replay). Off by default so they
-# never ship in release builds; enabled for this crate's own tests via the
-# self dev-dependency below, and by downstream crates' dev-dependencies.
-testkit = []
+schemars.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
 
 [dev-dependencies]
-private-code-providers = { path = ".", features = ["testkit"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
 criterion.workspace = true
 
 [[bench]]
 name = "parse_anthropic"
 harness = false
-

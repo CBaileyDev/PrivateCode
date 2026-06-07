@@ -1,0 +1,26 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build CLI release binary
+        run: cargo build --release -p private-code-cli
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/private-code-cli dist/private-code-$(uname -m)-unknown-linux-gnu
+          sha256sum dist/* > dist/SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

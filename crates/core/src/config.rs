@@ -1,5 +1,6 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::Path;
 use tracing::{info, warn};
 
@@ -44,6 +45,78 @@ impl Default for CompactionConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct LspConfigFile {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub servers: HashMap<String, LspServerOverride>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct LspServerOverride {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct McpConfig {
+    #[serde(default)]
+    pub servers: HashMap<String, McpServerEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpServerEntry {
+    pub command: String,
+    #[serde(default)]
+    pub args: Vec<String>,
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PluginEntry {
+    pub path: String,
+    #[serde(default)]
+    pub config: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CustomCommand {
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SharingMode {
+    #[default]
+    Disabled,
+    Manual,
+    Auto,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct SharingConfig {
+    #[serde(default)]
+    pub mode: SharingMode,
+    #[serde(default)]
+    pub export_dir: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
+pub struct CostConfig {
+    /// Warn when session cost exceeds this USD threshold (0 = disabled).
+    #[serde(default)]
+    pub warn_threshold_usd: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct AppConfig {
     pub snapshots: bool,
@@ -51,6 +124,21 @@ pub struct AppConfig {
     pub default_provider: ModelConfig,
     #[serde(default)]
     pub compaction: CompactionConfig,
+    #[serde(default)]
+    pub lsp: LspConfigFile,
+    #[serde(default)]
+    pub mcp: McpConfig,
+    #[serde(default)]
+    pub plugins: Vec<PluginEntry>,
+    #[serde(default)]
+    pub commands: HashMap<String, CustomCommand>,
+    #[serde(default)]
+    pub sharing: SharingConfig,
+    #[serde(default)]
+    pub cost: CostConfig,
+    /// Optional URL to refresh the model catalog in the background.
+    #[serde(default)]
+    pub catalog_refresh_url: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -63,6 +151,13 @@ impl Default for AppConfig {
                 model_id: DEFAULT_MODEL_ID.to_string(),
             },
             compaction: CompactionConfig::default(),
+            lsp: LspConfigFile::default(),
+            mcp: McpConfig::default(),
+            plugins: Vec::new(),
+            commands: HashMap::new(),
+            sharing: SharingConfig::default(),
+            cost: CostConfig::default(),
+            catalog_refresh_url: None,
         }
     }
 }

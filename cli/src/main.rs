@@ -5,8 +5,10 @@ use crossterm::{
 };
 use private_code_core::coordinator::SessionCoordinator;
 use private_code_core::db;
+use private_code_core::export;
 use private_code_protocol::event::{DeltaPayload, ProtocolEvent, UsageStats};
 use private_code_protocol::message::ChatMessage;
+use private_code_providers::keyring_store::{delete_key, list_configured_providers, set_key};
 use private_code_providers::{ModelProvider, ProviderError, ProviderEvent};
 use private_code_tools::ToolRegistry;
 use private_code_tui::run_tui;
@@ -81,6 +83,31 @@ enum Commands {
         #[arg(short, long, default_value_t = 3)]
         turns: u32,
     },
+    /// Securely store a provider API key in the OS keychain
+    Auth {
+        #[command(subcommand)]
+        action: AuthCommands,
+    },
+    /// Export a session to Markdown or JSON
+    Export {
+        session_id: String,
+        #[arg(short, long, default_value = "markdown")]
+        format: String,
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+    /// Check for CLI updates (prints latest release tag from GitHub)
+    Update,
+}
+
+#[derive(Subcommand, Debug)]
+enum AuthCommands {
+    /// Store an API key: `private-code auth set anthropic`
+    Set { provider: String },
+    /// List providers with configured keys (no values shown)
+    List,
+    /// Remove a stored key
+    Remove { provider: String },
 }
 
 async fn is_daemon_running(port: u16) -> bool {
@@ -132,6 +159,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return run_selftest(*turns).await;
     }
 
+    if let Some(Commands::Auth { action }) = &args.command {
+        return run_auth(action).await;
+    }
+
+    if let Some(Commands::Update) = &args.command {
+        return run_update_check().await;
+    }
+
     // 1. Establish workspace and global directories
     let workspace_path = std::fs::canonicalize(Path::new(&args.workspace))
         .unwrap_or_else(|_| PathBuf::from(&args.workspace));
@@ -151,6 +186,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_url = format!("sqlite://{}", db_path.to_string_lossy());
     let pool = db::connect_db(&db_url).await?;
     db::run_migrations(&pool).await?;
+
+    if let Some(Commands::Export {
+        session_id,
+        format,
+        output,
+    }) = &args.command
+    {
+        let content = if format == "json" {
+            export::export_session_json(&pool, session_id).await?
+        } else {
+            export::export_session_markdown(&pool, session_id).await?
+        };
+        if let Some(path) = output {
+            std::fs::write(path, content)?;
+            println!("Exported to {path}");
+        } else {
+            print!("{content}");
+        }
+        return Ok(());
+    }
 
     // 3. Resolve Project and Session
     let project_name = workspace_path
@@ -303,6 +358,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Intercepted before the DB bootstrap above (it must not touch on-disk
         // state), so the normal command dispatch never sees it.
         Commands::Selftest { .. } => unreachable!("selftest is handled before DB bootstrap"),
+        Commands::Auth { .. } | Commands::Export { .. } | Commands::Update => {
+            unreachable!("auth/export/update are handled before the command dispatch match")
+        }
     }
 
     Ok(())
@@ -462,5 +520,61 @@ async fn run_selftest(turns: u32) -> Result<(), Box<dyn std::error::Error>> {
         durations.len()
     );
 
+    Ok(())
+}
+
+async fn run_auth(action: &AuthCommands) -> Result<(), Box<dyn std::error::Error>> {
+    match action {
+        AuthCommands::Set { provider } => {
+            print!("Enter API key for {provider}: ");
+            use std::io::{self, Write};
+            io::stdout().flush()?;
+            let mut key = String::new();
+            io::stdin().read_line(&mut key)?;
+            let key = key.trim();
+            set_key(provider, key)?;
+            println!("Stored key for {provider} in OS keychain.");
+        }
+        AuthCommands::List => {
+            let candidates = [
+                "anthropic",
+                "openai",
+                "google",
+                "nvidia",
+                "deepseek",
+                "groq",
+            ];
+            let configured = list_configured_providers(&candidates);
+            if configured.is_empty() {
+                println!("No provider keys configured.");
+            } else {
+                for p in configured {
+                    println!("{p}");
+                }
+            }
+        }
+        AuthCommands::Remove { provider } => {
+            delete_key(provider)?;
+            println!("Removed key for {provider}.");
+        }
+    }
+    Ok(())
+}
+
+async fn run_update_check() -> Result<(), Box<dyn std::error::Error>> {
+    let client = reqwest::Client::new();
+    let resp = client
+        .get("https://api.github.com/repos/CBaileyDev/PrivateCode/releases/latest")
+        .header("User-Agent", "private-code-cli")
+        .send()
+        .await?;
+    if resp.status().is_success() {
+        let body: serde_json::Value = resp.json().await?;
+        let tag = body["tag_name"].as_str().unwrap_or("unknown");
+        println!("Latest release: {tag}");
+        println!("Download: https://github.com/CBaileyDev/PrivateCode/releases/latest");
+    } else {
+        eprintln!("Update check failed: HTTP {}", resp.status());
+    }
     Ok(())
 }

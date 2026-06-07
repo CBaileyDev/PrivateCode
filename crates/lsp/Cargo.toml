@@ -1,0 +1,15 @@
+[package]
+name = "private-code-lsp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["process", "io-util", "sync", "rt", "macros", "time"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

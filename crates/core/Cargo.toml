@@ -9,6 +9,9 @@ private-code-protocol.workspace = true
 private-code-providers.workspace = true
 private-code-tools.workspace = true
 private-code-codeintel.workspace = true
+private-code-lsp.workspace = true
+private-code-mcp.workspace = true
+private-code-plugins.workspace = true
 async-trait.workspace = true
 
 tokio.workspace = true

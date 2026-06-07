@@ -101,6 +101,7 @@ async fn ws_round_trip_prompt_permission_output_completed_and_replay() {
             provider,
             vec![],
             registry,
+            None,
             listener,
             sd,
         )
