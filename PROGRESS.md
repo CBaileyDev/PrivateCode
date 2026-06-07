@@ -35,7 +35,7 @@ working app:
 5. Try: tool use (it edits files in the chosen folder), the checkpoint timeline,
    `/revert`, `/compact`, model switch, the comparison panes for a fan-out.
 
-**Honest ceilings:** I verified compile + the app binary builds + 54 vitest +
+**Honest ceilings:** I verified compile + the app binary builds + 57 vitest +
 214 nextest + `build_coordinator` boot test; I did NOT launch the window or make a
 live API call (your key). LSP is still rooted at the app's launch CWD, not the
 per-session folder (deferred). Gate green throughout.

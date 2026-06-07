@@ -10,7 +10,7 @@ After the punch-list pass, a live GUI test found the desktop app's interactive f
 didn't work (no first-run path). The GUI was overhauled into a working app: native
 folder picker → project/session, in-app BYOK Settings (OS keychain), connected-model
 picker, visible error toasts, working ⌘K palette; providers resolve keys per-turn. A
-6-agent adversarial review's 7 runtime bugs were fixed. Gate: 214 nextest + 54 vitest,
+6-agent adversarial review's 7 runtime bugs were fixed. Gate: 214 nextest + 57 vitest,
 app binary builds. Full detail + how-to-test at the TOP of `PROGRESS.md`. The remaining
 human step is the live in-webview model conversation (your key).
 
