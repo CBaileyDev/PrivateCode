@@ -9,6 +9,7 @@ use futures_util::stream::{BoxStream, StreamExt};
 use private_code_protocol::event::UsageStats;
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role, ToolResultContent};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -72,6 +73,12 @@ fn lower_gemini_messages(
         })
     });
 
+    // Gemini matches a `functionResponse` to its `functionCall` BY NAME, and our
+    // `ContentBlock::ToolResult` carries only the tool_use_id (no name). Build an
+    // id→name map from the preceding `ToolUse` blocks (which always come before
+    // their result in message order) so the response can be keyed by the real
+    // function name.
+    let mut id_to_name: HashMap<String, String> = HashMap::new();
     let mut contents = Vec::new();
     for msg in messages {
         let role = match msg.role {
@@ -87,11 +94,13 @@ fn lower_gemini_messages(
                     parts.push(serde_json::json!({ "text": text }));
                 }
                 ContentBlock::ToolUse { id, name, input } => {
+                    id_to_name.insert(id.clone(), name.clone());
+                    // Gemini's functionCall is keyed by name; it carries no id
+                    // (matches the Reference lowering and the recorded wire shape).
                     parts.push(serde_json::json!({
                         "functionCall": {
                             "name": name,
                             "args": input,
-                            "id": id,
                         }
                     }));
                 }
@@ -100,25 +109,29 @@ fn lower_gemini_messages(
                     content,
                     is_error,
                 } => {
-                    let response = match content {
-                        ToolResultContent::Text(t) => serde_json::json!({ "result": t }),
+                    // Key by the real function name (Gemini matches by name), not
+                    // the internal tool_use_id.
+                    let fn_name = id_to_name
+                        .get(tool_use_id)
+                        .cloned()
+                        .unwrap_or_else(|| tool_use_id.clone());
+                    let content_val = match content {
+                        ToolResultContent::Text(t) => serde_json::json!(t),
                         ToolResultContent::Json(v) => v.clone(),
                     };
+                    let mut response = serde_json::json!({
+                        "name": &fn_name,
+                        "content": content_val,
+                    });
+                    if *is_error && let Some(obj) = response.as_object_mut() {
+                        obj.insert("error".into(), serde_json::json!(true));
+                    }
                     parts.push(serde_json::json!({
                         "functionResponse": {
-                            "name": tool_use_id,
+                            "name": &fn_name,
                             "response": response,
-                            "id": tool_use_id,
                         }
                     }));
-                    if *is_error {
-                        // Gemini treats errors via response content; flag in text.
-                        if let Some(p) = parts.last_mut()
-                            && let Some(obj) = p.as_object_mut()
-                        {
-                            obj.insert("error".into(), serde_json::json!(true));
-                        }
-                    }
                 }
                 ContentBlock::Reasoning { reasoning, .. } => {
                     parts.push(serde_json::json!({ "text": reasoning }));
@@ -151,6 +164,10 @@ fn lower_tools(tools: &[serde_json::Value]) -> Vec<serde_json::Value> {
 struct GeminiSseState {
     usage: UsageStats,
     finalized: bool,
+    /// Monotonic counter minting unique synthetic ids for Gemini tool calls
+    /// (Gemini's wire `functionCall` carries no id, so two parallel calls would
+    /// otherwise collide on the orchestrator's result routing).
+    tool_call_seq: u64,
 }
 
 fn finalize_gemini(
@@ -171,8 +188,9 @@ fn finalize_gemini(
     }]
 }
 
-pub fn parse_gemini_chunk(
+fn parse_gemini_chunk(
     data: &str,
+    state: &mut GeminiSseState,
     catalog: &ModelCatalog,
     provider_id: &str,
     model_id: &str,
@@ -188,7 +206,12 @@ pub fn parse_gemini_chunk(
                 events.push(ProviderEvent::TextDelta(text.to_string()));
             }
             if let Some(fc) = part.get("functionCall") {
-                let id = fc["id"].as_str().unwrap_or("call").to_string();
+                // Gemini sends no id; honour one if present, else mint a unique one.
+                let id = fc["id"].as_str().map(str::to_string).unwrap_or_else(|| {
+                    let n = state.tool_call_seq;
+                    state.tool_call_seq += 1;
+                    format!("call_{n}")
+                });
                 let name = fc["name"].as_str().unwrap_or("tool").to_string();
                 let input = fc
                     .get("args")
@@ -276,7 +299,13 @@ impl ModelProvider for GoogleProvider {
                         .collect()
                 }
                 Ok(c) => {
-                    let evs = parse_gemini_chunk(&c.data, &catalog, "google", &model_id_owned);
+                    let evs = parse_gemini_chunk(
+                        &c.data,
+                        &mut state,
+                        &catalog,
+                        "google",
+                        &model_id_owned,
+                    );
                     for ev in &evs {
                         if let ProviderEvent::MessageStop { usage, .. } = ev {
                             state.usage = usage.clone();
@@ -304,8 +333,90 @@ mod tests {
     #[test]
     fn parse_text_delta() {
         let cat = ModelCatalog::from_vendored();
+        let mut st = GeminiSseState::default();
         let data = r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}"#;
-        let evs = parse_gemini_chunk(data, &cat, "google", "gemini-2.5-flash");
+        let evs = parse_gemini_chunk(data, &mut st, &cat, "google", "gemini-2.5-flash");
         assert!(matches!(evs.first(), Some(ProviderEvent::TextDelta(t)) if t == "hello"));
+    }
+
+    /// Gemini's wire `functionCall` carries no `id` (verified against the Reference
+    /// recording), so each call must get a UNIQUE synthetic id — otherwise two
+    /// parallel calls collide on the orchestrator's tool-result routing.
+    #[test]
+    fn gemini_parallel_function_calls_get_distinct_ids() {
+        let cat = ModelCatalog::from_vendored();
+        let mut st = GeminiSseState::default();
+        let data = r#"{"candidates":[{"content":{"parts":[
+            {"functionCall":{"name":"get_weather","args":{"city":"Paris"}}},
+            {"functionCall":{"name":"get_weather","args":{"city":"London"}}}
+        ]}}]}"#;
+        let evs = parse_gemini_chunk(data, &mut st, &cat, "google", "gemini-2.5-flash");
+        let ids: Vec<String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                ProviderEvent::ToolUseComplete { id, .. } => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids.len(), 2, "both tool calls decode");
+        assert_ne!(ids[0], ids[1], "parallel tool calls must get distinct ids");
+    }
+
+    /// On the way back to Gemini, `functionResponse` must be keyed by the real
+    /// function NAME (Gemini matches by name), not the internal tool_use_id.
+    #[test]
+    fn gemini_tool_result_keyed_by_function_name() {
+        use private_code_protocol::message::{ChatMessage, ContentBlock, Role, ToolResultContent};
+        let mk = |role, content| ChatMessage {
+            id: "x".into(),
+            role,
+            content,
+            created_at: 0,
+        };
+        let msgs = vec![
+            mk(
+                Role::User,
+                vec![ContentBlock::Text {
+                    text: "weather?".into(),
+                }],
+            ),
+            mk(
+                Role::Assistant,
+                vec![ContentBlock::ToolUse {
+                    id: "call_0".into(),
+                    name: "get_weather".into(),
+                    input: serde_json::json!({"city":"Paris"}),
+                }],
+            ),
+            mk(
+                Role::User,
+                vec![ContentBlock::ToolResult {
+                    tool_use_id: "call_0".into(),
+                    content: ToolResultContent::Text("sunny".into()),
+                    is_error: false,
+                }],
+            ),
+        ];
+        let (_system, contents) = lower_gemini_messages(None, &msgs);
+
+        // The assistant functionCall is keyed by name.
+        let fc = contents
+            .iter()
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+            .find(|p| p.get("functionCall").is_some())
+            .expect("a functionCall part exists");
+        assert_eq!(fc["functionCall"]["name"], "get_weather");
+
+        // The tool result's functionResponse is keyed by the function NAME.
+        let fr = contents
+            .iter()
+            .flat_map(|c| c["parts"].as_array().cloned().unwrap_or_default())
+            .find(|p| p.get("functionResponse").is_some())
+            .expect("a functionResponse part exists");
+        assert_eq!(
+            fr["functionResponse"]["name"], "get_weather",
+            "functionResponse must be keyed by the function name, not the tool_use_id"
+        );
+        assert_eq!(fr["functionResponse"]["response"]["name"], "get_weather");
     }
 }
