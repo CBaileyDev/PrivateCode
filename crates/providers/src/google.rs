@@ -9,7 +9,7 @@ use futures_util::stream::{BoxStream, StreamExt};
 use private_code_protocol::event::UsageStats;
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role, ToolResultContent};
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
@@ -168,11 +168,35 @@ struct GeminiSseState {
     /// (Gemini's wire `functionCall` carries no id, so two parallel calls would
     /// otherwise collide on the orchestrator's result routing).
     tool_call_seq: u64,
+    /// Last-seen finishReason. Gemini may deliver `finishReason` and
+    /// `usageMetadata` in the SAME or in SEPARATE SSE chunks, so it is
+    /// accumulated and emitted once at stream end (the old code only read it
+    /// inside the usage chunk → telemetry saw `None` whenever they arrived apart).
+    finish_reason: Option<String>,
 }
 
+/// Normalize Gemini's finishReason vocabulary to the internal form.
+fn map_gemini_finish_reason(raw: &str) -> String {
+    match raw {
+        "STOP" => "stop",
+        "MAX_TOKENS" => "length",
+        "SAFETY" => "safety",
+        "RECITATION" => "recitation",
+        other => other,
+    }
+    .to_string()
+}
+
+/// Emit the single terminal `MessageStop` (idempotent). Gemini sends no `[DONE]`
+/// sentinel and may omit `usageMetadata`, so finalize MUST run at stream end to
+/// guarantee exactly one terminal event carrying the accumulated usage, cost, and
+/// finishReason (the old code's only `MessageStop` lived inside the usage chunk,
+/// so a stream without `usageMetadata` reported nothing and `finalize_gemini` was
+/// dead code).
 fn finalize_gemini(
     state: &mut GeminiSseState,
     catalog: &ModelCatalog,
+    provider_id: &str,
     model_id: &str,
 ) -> Vec<ProviderEvent> {
     if state.finalized {
@@ -180,21 +204,21 @@ fn finalize_gemini(
     }
     state.finalized = true;
     if state.usage.cost == 0.0 && state.usage.input_tokens + state.usage.output_tokens > 0 {
-        state.usage.cost = catalog.compute_cost("google", model_id, &state.usage);
+        state.usage.cost = catalog.compute_cost(provider_id, model_id, &state.usage);
     }
     vec![ProviderEvent::MessageStop {
         usage: state.usage.clone(),
-        finish_reason: Some("stop".into()),
+        finish_reason: state
+            .finish_reason
+            .clone()
+            .or_else(|| Some("stop".to_string())),
     }]
 }
 
-fn parse_gemini_chunk(
-    data: &str,
-    state: &mut GeminiSseState,
-    catalog: &ModelCatalog,
-    provider_id: &str,
-    model_id: &str,
-) -> Vec<ProviderEvent> {
+/// Parse one SSE chunk into streaming events (text + tool calls) and ACCUMULATE
+/// terminal state (usage, finishReason) into `state`. It never emits
+/// `MessageStop` — that is produced exactly once by [`finalize_gemini`].
+fn parse_gemini_chunk(data: &str, state: &mut GeminiSseState) -> Vec<ProviderEvent> {
     let mut events = Vec::new();
     let Ok(v) = serde_json::from_str::<serde_json::Value>(data) else {
         return events;
@@ -222,17 +246,12 @@ fn parse_gemini_chunk(
         }
     }
 
+    if let Some(fr) = v["candidates"][0]["finishReason"].as_str() {
+        state.finish_reason = Some(map_gemini_finish_reason(fr));
+    }
     if let Some(usage) = v.get("usageMetadata") {
-        let mut stats = UsageStats::default();
-        stats.input_tokens = usage["promptTokenCount"].as_i64().unwrap_or(0);
-        stats.output_tokens = usage["candidatesTokenCount"].as_i64().unwrap_or(0);
-        stats.cost = catalog.compute_cost(provider_id, model_id, &stats);
-        events.push(ProviderEvent::MessageStop {
-            usage: stats,
-            finish_reason: v["candidates"][0]["finishReason"]
-                .as_str()
-                .map(String::from),
-        });
+        state.usage.input_tokens = usage["promptTokenCount"].as_i64().unwrap_or(0);
+        state.usage.output_tokens = usage["candidatesTokenCount"].as_i64().unwrap_or(0);
     }
 
     events
@@ -286,39 +305,71 @@ impl ModelProvider for GoogleProvider {
             return Err(ProviderError::Api { status, message });
         }
 
-        let catalog = ModelCatalog::from_vendored();
-        let model_id_owned = model_id.to_string();
-        let mut state = GeminiSseState::default();
+        // Drive the SSE source with `unfold` (not `flat_map`) so a normal stream
+        // END triggers exactly one terminal `finalize_gemini` — Gemini never sends
+        // a `[DONE]` sentinel, so flat_map would silently drop the MessageStop.
+        struct GState {
+            inner: BoxStream<
+                'static,
+                Result<
+                    eventsource_stream::Event,
+                    eventsource_stream::EventStreamError<reqwest::Error>,
+                >,
+            >,
+            sse: GeminiSseState,
+            pending: VecDeque<Result<ProviderEvent, ProviderError>>,
+            finished: bool,
+            catalog: ModelCatalog,
+            model_id: String,
+        }
 
-        let stream = resp.bytes_stream().eventsource().flat_map(move |item| {
-            let events: Vec<Result<ProviderEvent, ProviderError>> = match item {
-                Ok(c) if c.data == "[DONE]" => {
-                    finalize_gemini(&mut state, &catalog, &model_id_owned)
-                        .into_iter()
-                        .map(Ok)
-                        .collect()
+        let gst = GState {
+            inner: resp.bytes_stream().eventsource().boxed(),
+            sse: GeminiSseState::default(),
+            pending: VecDeque::new(),
+            finished: false,
+            catalog: ModelCatalog::from_vendored(),
+            model_id: model_id.to_string(),
+        };
+
+        let stream = futures_util::stream::unfold(gst, |mut st| async move {
+            loop {
+                if let Some(ev) = st.pending.pop_front() {
+                    return Some((ev, st));
                 }
-                Ok(c) => {
-                    let evs = parse_gemini_chunk(
-                        &c.data,
-                        &mut state,
-                        &catalog,
-                        "google",
-                        &model_id_owned,
-                    );
-                    for ev in &evs {
-                        if let ProviderEvent::MessageStop { usage, .. } = ev {
-                            state.usage = usage.clone();
+                if st.finished {
+                    return None;
+                }
+                match st.inner.next().await {
+                    Some(Ok(c)) if c.data.trim() == "[DONE]" => {
+                        for ev in finalize_gemini(&mut st.sse, &st.catalog, "google", &st.model_id)
+                        {
+                            st.pending.push_back(Ok(ev));
+                        }
+                        st.finished = true;
+                    }
+                    Some(Ok(c)) => {
+                        for ev in parse_gemini_chunk(&c.data, &mut st.sse) {
+                            st.pending.push_back(Ok(ev));
                         }
                     }
-                    evs.into_iter().map(Ok).collect()
+                    Some(Err(e)) => {
+                        st.pending
+                            .push_back(Err(ProviderError::Other(e.to_string())));
+                    }
+                    None => {
+                        // Normal stream end (no [DONE]): emit the one MessageStop.
+                        for ev in finalize_gemini(&mut st.sse, &st.catalog, "google", &st.model_id)
+                        {
+                            st.pending.push_back(Ok(ev));
+                        }
+                        st.finished = true;
+                    }
                 }
-                Err(e) => vec![Err(ProviderError::Other(e.to_string()))],
-            };
-            futures_util::stream::iter(events)
+            }
         });
 
-        Ok(Box::pin(stream))
+        Ok(stream.boxed())
     }
 
     fn count_tokens(&self, _model_id: &str, text: &str) -> usize {
@@ -332,11 +383,66 @@ mod tests {
 
     #[test]
     fn parse_text_delta() {
-        let cat = ModelCatalog::from_vendored();
         let mut st = GeminiSseState::default();
         let data = r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]}}]}"#;
-        let evs = parse_gemini_chunk(data, &mut st, &cat, "google", "gemini-2.5-flash");
+        let evs = parse_gemini_chunk(data, &mut st);
         assert!(matches!(evs.first(), Some(ProviderEvent::TextDelta(t)) if t == "hello"));
+    }
+
+    /// finishReason and usageMetadata accumulate across chunks and surface in the
+    /// single terminal MessageStop emitted by finalize — not as `None` (the old
+    /// bug) when they arrive apart. parse itself emits NO MessageStop.
+    #[test]
+    fn gemini_finish_reason_accumulated_and_emitted_at_finalize() {
+        let cat = ModelCatalog::from_vendored();
+        let mut st = GeminiSseState::default();
+        // Text chunk: no finishReason/usage yet.
+        let _ = parse_gemini_chunk(
+            r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]}}]}"#,
+            &mut st,
+        );
+        // Terminal metadata chunk (finishReason + usage, no content parts).
+        let evs = parse_gemini_chunk(
+            r#"{"candidates":[{"finishReason":"MAX_TOKENS"}],"usageMetadata":{"promptTokenCount":5,"candidatesTokenCount":3}}"#,
+            &mut st,
+        );
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, ProviderEvent::MessageStop { .. })),
+            "MessageStop is emitted only at finalize"
+        );
+
+        let fin = finalize_gemini(&mut st, &cat, "google", "gemini-2.5-flash");
+        assert_eq!(fin.len(), 1, "exactly one terminal MessageStop");
+        match &fin[0] {
+            ProviderEvent::MessageStop {
+                usage,
+                finish_reason,
+            } => {
+                assert_eq!(finish_reason.as_deref(), Some("length"));
+                assert_eq!(usage.input_tokens, 5);
+                assert_eq!(usage.output_tokens, 3);
+            }
+            other => panic!("expected MessageStop, got {other:?}"),
+        }
+        // Idempotent.
+        assert!(
+            finalize_gemini(&mut st, &cat, "google", "gemini-2.5-flash").is_empty(),
+            "finalize is idempotent"
+        );
+    }
+
+    /// finalize defaults finishReason to "stop" when Gemini never sent one.
+    #[test]
+    fn gemini_finalize_defaults_finish_reason() {
+        let cat = ModelCatalog::from_vendored();
+        let mut st = GeminiSseState::default();
+        st.usage.input_tokens = 1;
+        let fin = finalize_gemini(&mut st, &cat, "google", "gemini-2.5-flash");
+        assert!(matches!(
+            &fin[0],
+            ProviderEvent::MessageStop { finish_reason, .. } if finish_reason.as_deref() == Some("stop")
+        ));
     }
 
     /// Gemini's wire `functionCall` carries no `id` (verified against the Reference
@@ -344,13 +450,12 @@ mod tests {
     /// parallel calls collide on the orchestrator's tool-result routing.
     #[test]
     fn gemini_parallel_function_calls_get_distinct_ids() {
-        let cat = ModelCatalog::from_vendored();
         let mut st = GeminiSseState::default();
         let data = r#"{"candidates":[{"content":{"parts":[
             {"functionCall":{"name":"get_weather","args":{"city":"Paris"}}},
             {"functionCall":{"name":"get_weather","args":{"city":"London"}}}
         ]}}]}"#;
-        let evs = parse_gemini_chunk(data, &mut st, &cat, "google", "gemini-2.5-flash");
+        let evs = parse_gemini_chunk(data, &mut st);
         let ids: Vec<String> = evs
             .iter()
             .filter_map(|e| match e {

@@ -11,6 +11,7 @@
 //! single terminal [`ProviderEvent::MessageStop`] exactly once (on `[DONE]` or
 //! stream end), mirroring the contract the orchestrator already relies on.
 
+use crate::catalog::ModelCatalog;
 use crate::provider::{ModelProvider, ProviderError, ProviderEvent, resolve_api_key};
 use eventsource_stream::Eventsource;
 use futures_util::stream::{BoxStream, StreamExt};
@@ -147,12 +148,16 @@ pub fn parse_openai_chunk(
     // A usage-only chunk (sent last when stream_options.include_usage) has empty
     // choices but carries the token totals.
     if let Some(usage) = val.get("usage").filter(|u| u.is_object()) {
-        state.usage.input_tokens = usage["prompt_tokens"].as_i64().unwrap_or(0);
-        state.usage.output_tokens = usage["completion_tokens"].as_i64().unwrap_or(0);
-        // Cached prompt tokens, when the gateway reports them.
-        state.usage.cache_read_tokens = usage["prompt_tokens_details"]["cached_tokens"]
+        let prompt = usage["prompt_tokens"].as_i64().unwrap_or(0);
+        // Cached prompt tokens, when the gateway reports them. OpenAI's
+        // `prompt_tokens` INCLUDES cached tokens, so subtract them out of the
+        // (full-price) input bucket — otherwise cost double-counts the cache hit.
+        let cached = usage["prompt_tokens_details"]["cached_tokens"]
             .as_i64()
             .unwrap_or(0);
+        state.usage.cache_read_tokens = cached;
+        state.usage.input_tokens = (prompt - cached).max(0);
+        state.usage.output_tokens = usage["completion_tokens"].as_i64().unwrap_or(0);
     }
 
     let Some(choice) = val["choices"].get(0) else {
@@ -231,9 +236,14 @@ pub fn parse_openai_chunk(
 
 /// Emit the terminal events exactly once: a `ToolUseComplete` for each fully
 /// reassembled tool call (parsing its accumulated JSON arguments), then a single
-/// `MessageStop`. Idempotent — the second caller (e.g. stream-end after `[DONE]`)
-/// gets nothing.
-pub fn finalize(state: &mut OpenAiSseState) -> Vec<ProviderEvent> {
+/// `MessageStop` carrying catalog-computed cost. Idempotent — the second caller
+/// (e.g. stream-end after `[DONE]`) gets nothing.
+pub fn finalize(
+    state: &mut OpenAiSseState,
+    catalog: &ModelCatalog,
+    provider_id: &str,
+    model_id: &str,
+) -> Vec<ProviderEvent> {
     if state.finalized {
         return Vec::new();
     }
@@ -255,6 +265,15 @@ pub fn finalize(state: &mut OpenAiSseState) -> Vec<ProviderEvent> {
             name: tc.name.clone(),
             input,
         });
+    }
+    // OpenAI-compatible gateways don't return a dollar cost — compute it from the
+    // model catalog (keyed by the provider's credential namespace, e.g. "nvidia"),
+    // so every turn reports real spend instead of $0.00. Uncatalogued models keep
+    // the existing (zero) cost honestly.
+    if state.usage.cost == 0.0
+        && state.usage.input_tokens + state.usage.output_tokens + state.usage.cache_read_tokens > 0
+    {
+        state.usage.cost = catalog.compute_cost(provider_id, model_id, &state.usage);
     }
     out.push(ProviderEvent::MessageStop {
         usage: state.usage.clone(),
@@ -468,6 +487,9 @@ impl ModelProvider for OpenAiCompatProvider {
             sse: OpenAiSseState,
             pending: VecDeque<Result<ProviderEvent, ProviderError>>,
             finished: bool,
+            catalog: ModelCatalog,
+            provider_id: String,
+            model_id: String,
         }
 
         let st = StreamState {
@@ -475,6 +497,9 @@ impl ModelProvider for OpenAiCompatProvider {
             sse: OpenAiSseState::new(),
             pending: VecDeque::new(),
             finished: false,
+            catalog: ModelCatalog::from_vendored(),
+            provider_id: self.key_name.clone(),
+            model_id: model_id.to_string(),
         };
 
         let stream = futures_util::stream::unfold(st, |mut st| async move {
@@ -489,7 +514,9 @@ impl ModelProvider for OpenAiCompatProvider {
                     Some(Ok(event)) => {
                         // OpenAI's terminal sentinel — not JSON.
                         if event.data.trim() == "[DONE]" {
-                            for ev in finalize(&mut st.sse) {
+                            for ev in
+                                finalize(&mut st.sse, &st.catalog, &st.provider_id, &st.model_id)
+                            {
                                 st.pending.push_back(Ok(ev));
                             }
                             st.finished = true;
@@ -511,7 +538,8 @@ impl ModelProvider for OpenAiCompatProvider {
                     }
                     None => {
                         // Stream ended without an explicit [DONE]; finalize once.
-                        for ev in finalize(&mut st.sse) {
+                        for ev in finalize(&mut st.sse, &st.catalog, &st.provider_id, &st.model_id)
+                        {
                             st.pending.push_back(Ok(ev));
                         }
                         st.finished = true;
@@ -569,9 +597,10 @@ mod tests {
             )
             .unwrap(),
         );
-        // finalize twice — second is a no-op.
-        evs.extend(finalize(&mut st));
-        evs.extend(finalize(&mut st));
+        // finalize twice — second is a no-op. Uncatalogued model → cost stays 0.
+        let cat = ModelCatalog::from_vendored();
+        evs.extend(finalize(&mut st, &cat, "openai", "uncatalogued-test-model"));
+        evs.extend(finalize(&mut st, &cat, "openai", "uncatalogued-test-model"));
 
         assert_eq!(
             evs,
@@ -605,7 +634,8 @@ mod tests {
             )
             .unwrap(),
         );
-        evs.extend(finalize(&mut st));
+        let cat = ModelCatalog::from_vendored();
+        evs.extend(finalize(&mut st, &cat, "openai", "uncatalogued-test-model"));
 
         assert_eq!(
             evs[0],
@@ -682,6 +712,45 @@ mod tests {
             out[3],
             serde_json::json!({ "role": "tool", "tool_call_id": "call_1", "content": "sunny" })
         );
+    }
+
+    /// A catalogued model gets a non-zero dollar cost at finalize (previously
+    /// every OpenAI-compatible turn reported $0.00).
+    #[test]
+    fn finalize_computes_cost_from_catalog() {
+        let mut st = OpenAiSseState::new();
+        parse_openai_chunk(
+            &chunk(r#"{"choices":[],"usage":{"prompt_tokens":1000000,"completion_tokens":0}}"#),
+            &mut st,
+        )
+        .unwrap();
+        let cat = ModelCatalog::from_vendored();
+        let evs = finalize(&mut st, &cat, "openai", "gpt-4.1");
+        let stop = evs
+            .iter()
+            .find_map(|e| match e {
+                ProviderEvent::MessageStop { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .unwrap();
+        assert!(stop.cost > 0.0, "catalogued model reports real cost");
+    }
+
+    /// Cached prompt tokens are excluded from the full-price input bucket so cost
+    /// can't double-count them.
+    #[test]
+    fn cached_tokens_are_subtracted_from_input() {
+        let mut st = OpenAiSseState::new();
+        parse_openai_chunk(
+            &chunk(
+                r#"{"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":40}}}"#,
+            ),
+            &mut st,
+        )
+        .unwrap();
+        assert_eq!(st.usage.input_tokens, 60, "input = prompt - cached");
+        assert_eq!(st.usage.cache_read_tokens, 40);
+        assert_eq!(st.usage.output_tokens, 10);
     }
 
     #[test]
