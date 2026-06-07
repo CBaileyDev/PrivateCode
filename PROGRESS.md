@@ -1,5 +1,47 @@
 # A-grade marathon — progress tracker
 
+## 🖥️ Desktop GUI overhaul — now actually usable (2026-06-07)
+
+The packaged GUI booted but nothing inside worked (couldn't start a session,
+select a model, or connect a provider) — the interactive flows were built
+"data-layer-tested, rendering = headless ceiling" and never exercised end-to-end.
+Root cause: **no first-run path** (no project → New Session no-opped; no model
+dropdown without a session; no in-app API-key entry at all). Overhauled to a
+working app:
+
+- **New session = native folder picker** → finds/creates a project for that
+  folder → session rooted in your real directory (tools + checkpoints run there).
+- **Settings (⚙ / ⌘,) — BYOK + local**: paste keys for Anthropic/OpenAI/Google/
+  NVIDIA/DeepSeek/Groq (stored in the OS keychain, never logged/returned); local
+  Ollama/LM Studio auto-detected; connected/disconnected dots. All providers are
+  registered at startup and resolve their key per-turn, so a key you paste takes
+  effect on the next message (and removing one takes effect immediately).
+- **Model picker** lists models from connected providers; a new session defaults
+  to a connected model. **Errors are visible** (toasts) — a missing key now shows
+  a clear message instead of silently doing nothing.
+- **⌘K command palette** commands all work now (new session, settings, toggles,
+  revert/compact/clear/help); sessions span all opened folders.
+- A 6-agent adversarial review found 7 runtime bugs; all fixed (incl. the
+  key-cache staleness + a re-subscribe-on-provider-change stream freeze).
+
+**How to run + test (your step — a live turn needs YOUR key):**
+1. `cd apps/desktop && npm install && npm run app`  (`npm run app` = `tauri dev`;
+   `npm run app:build` for a bundle). Requires the Rust toolchain + Tauri prereqs.
+2. In the app: **⚙ Settings → paste your provider API key → it shows "Connected."**
+3. **"Open a folder"** (empty state, sidebar **+**, or ⌘K → New Session) → pick a
+   project directory.
+4. Pick a model in the composer dropdown → type a message → send. You should see
+   streamed output; if a key is missing you'll get a clear error toast.
+5. Try: tool use (it edits files in the chosen folder), the checkpoint timeline,
+   `/revert`, `/compact`, model switch, the comparison panes for a fan-out.
+
+**Honest ceilings:** I verified compile + the app binary builds + 54 vitest +
+214 nextest + `build_coordinator` boot test; I did NOT launch the window or make a
+live API call (your key). LSP is still rooted at the app's launch CWD, not the
+per-session folder (deferred). Gate green throughout.
+
+---
+
 Goal: take Phases 1–3 to A grade in **every area that does not require a human to launch the GUI or make a live BYOK Claude call**. Workspace must stay green at every cluster boundary: `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, workspace tests (nextest), and for the desktop `npm run typecheck && npm run build && vitest run`.
 
 Blueprint of record: the consolidated A-grade plan (clusters C0–C16) produced by the design/review workflow. Each cluster is committed + pushed to https://github.com/CBaileyDev/PrivateCode on completion.
