@@ -20,6 +20,7 @@ import {
 import { usageStore, formatCost } from "../stores/usage";
 import { connectedModels } from "../stores/providers";
 import { openSettings } from "../stores/ui";
+import { showToast } from "../stores/toast";
 
 /** Selectable models. `value` is `provider|model_id` (model_id may itself
  * contain `/`, e.g. NVIDIA's "meta/llama-…", so we split on the first `|`). */
@@ -107,7 +108,10 @@ export default function InputBar() {
     try {
       await sendPrompt(sessionStore.activeSession!.id, prompt);
     } catch (e) {
-      console.error("Failed to send prompt:", e);
+      // Synchronous admission errors (backlog full, session missing) reject the
+      // invoke and never become a ProtocolEvent::Error — surface them so the user
+      // isn't left wondering whether the send worked.
+      showToast(`Couldn't send: ${String(e)}`, "error");
     } finally {
       setIsSending(false);
     }
@@ -121,15 +125,25 @@ export default function InputBar() {
     switch (command) {
       case "/model": {
         if (args) {
-          // Accept "provider/model" (provider ∈ {anthropic,nvidia}) or a bare
-          // model id (defaults to anthropic).
+          // Accept "<provider>/<model>" for any known provider (the model id may
+          // itself contain "/", e.g. nvidia/meta/llama-3.3-70b — split on the
+          // FIRST slash), or a bare model id (defaults to anthropic).
+          const KNOWN = [
+            "anthropic",
+            "openai",
+            "google",
+            "nvidia",
+            "deepseek",
+            "groq",
+            "ollama",
+            "lmstudio",
+          ];
           let provider = "anthropic";
           let model = args;
-          if (args.startsWith("nvidia/")) {
-            provider = "nvidia";
-            model = args.slice("nvidia/".length);
-          } else if (args.startsWith("anthropic/")) {
-            model = args.slice("anthropic/".length);
+          const slash = args.indexOf("/");
+          if (slash > 0 && KNOWN.includes(args.slice(0, slash))) {
+            provider = args.slice(0, slash);
+            model = args.slice(slash + 1);
           }
           const cfg = JSON.stringify({ provider_id: provider, model_id: model });
           const live = await setActiveModel(cfg);

@@ -621,11 +621,9 @@ pub async fn export_session(
     // defence-in-depth against path traversal (session ids are always v4 UUIDs).
     uuid::Uuid::parse_str(&session_id).map_err(|_| "invalid session id".to_string())?;
     let ext = if format == "json" { "json" } else { "md" };
-    let out_path = coord
-        .global_data_dir
-        .join("exports")
-        .join(format!("{session_id}.{ext}"));
-    std::fs::create_dir_all(out_path.parent().unwrap()).map_err(|e| e.to_string())?;
+    let exports_dir = coord.global_data_dir.join("exports");
+    std::fs::create_dir_all(&exports_dir).map_err(|e| e.to_string())?;
+    let out_path = exports_dir.join(format!("{session_id}.{ext}"));
     export::export_session_to_file(&coord.pool, &session_id, &out_path, &format)
         .await
         .map_err(|e| e.to_string())?;

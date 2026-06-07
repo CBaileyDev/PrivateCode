@@ -5,7 +5,6 @@ use private_code_protocol::event::UsageStats;
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::sync::OnceLock;
 
 /// Default Anthropic API base. Overridable per-instance (tests / proxies) via
 /// [`AnthropicProvider::with_base_url`] or the `PRIVATE_CODE_ANTHROPIC_BASE_URL`
@@ -14,7 +13,6 @@ const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
 
 pub struct AnthropicProvider {
     client: reqwest::Client,
-    api_key: OnceLock<String>,
     base_url: String,
 }
 
@@ -24,7 +22,6 @@ impl Default for AnthropicProvider {
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         Self {
             client: reqwest::Client::new(),
-            api_key: OnceLock::new(),
             base_url,
         }
     }
@@ -41,20 +38,16 @@ impl AnthropicProvider {
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key: OnceLock::new(),
             base_url: base_url.into(),
         }
     }
 
-    /// Resolve the Anthropic API key once and cache it (keyring → env fallback),
-    /// instead of hitting the OS keychain on every turn.
+    /// Resolve the Anthropic API key (keyring → env) on EACH turn — not cached —
+    /// so a key added/removed/changed in the GUI Settings takes effect on the
+    /// next turn (a per-turn keychain read is cheap; a cached key would survive a
+    /// removal and 401 instead of reporting "no key").
     fn resolve_key(&self) -> Result<String, ProviderError> {
-        if let Some(k) = self.api_key.get() {
-            return Ok(k.clone());
-        }
-        let k = resolve_api_key("anthropic")?;
-        let _ = self.api_key.set(k.clone());
-        Ok(k)
+        resolve_api_key("anthropic")
     }
 }
 

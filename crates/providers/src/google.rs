@@ -10,13 +10,11 @@ use private_code_protocol::event::UsageStats;
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role, ToolResultContent};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
-use std::sync::OnceLock;
 
 const DEFAULT_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 
 pub struct GoogleProvider {
     client: reqwest::Client,
-    api_key: OnceLock<String>,
     base_url: String,
 }
 
@@ -30,7 +28,6 @@ impl GoogleProvider {
     pub fn new() -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key: OnceLock::new(),
             base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
@@ -38,18 +35,14 @@ impl GoogleProvider {
     pub fn with_base_url(base_url: impl Into<String>) -> Self {
         Self {
             client: reqwest::Client::new(),
-            api_key: OnceLock::new(),
             base_url: base_url.into(),
         }
     }
 
+    /// Resolve the API key (keyring → env) on EACH turn — not cached — so a key
+    /// added/removed/changed in the GUI Settings takes effect immediately.
     fn resolve_key(&self) -> Result<String, ProviderError> {
-        if let Some(k) = self.api_key.get() {
-            return Ok(k.clone());
-        }
-        let k = resolve_api_key("google")?;
-        let _ = self.api_key.set(k.clone());
-        Ok(k)
+        resolve_api_key("google")
     }
 }
 

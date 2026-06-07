@@ -19,7 +19,6 @@ use private_code_protocol::event::UsageStats;
 use private_code_protocol::message::{ChatMessage, ContentBlock, Role, ToolResultContent};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::sync::OnceLock;
 
 /// NVIDIA's OpenAI-compatible inference gateway.
 pub const NVIDIA_BASE_URL: &str = "https://integrate.api.nvidia.com/v1";
@@ -35,7 +34,6 @@ pub struct OpenAiCompatProvider {
     /// `<NAME>_API_KEY` env fallback), e.g. "nvidia" or "openai".
     key_name: String,
     base_url: String,
-    api_key: OnceLock<String>,
 }
 
 impl OpenAiCompatProvider {
@@ -47,7 +45,6 @@ impl OpenAiCompatProvider {
             client: reqwest::Client::new(),
             key_name: key_name.into(),
             base_url: base_url.into(),
-            api_key: OnceLock::new(),
         }
     }
 
@@ -78,15 +75,11 @@ impl OpenAiCompatProvider {
         Self::new("lmstudio", LMSTUDIO_BASE_URL)
     }
 
-    /// Resolve and cache the API key (keyring → env fallback), so the OS keychain
-    /// is hit at most once.
+    /// Resolve the API key (keyring → env) on EACH turn — not cached — so a key
+    /// added/removed/changed in the GUI Settings takes effect immediately (a
+    /// cached key would survive a removal and 401).
     fn resolve_key(&self) -> Result<String, ProviderError> {
-        if let Some(k) = self.api_key.get() {
-            return Ok(k.clone());
-        }
-        let k = resolve_api_key(&self.key_name)?;
-        let _ = self.api_key.set(k.clone());
-        Ok(k)
+        resolve_api_key(&self.key_name)
     }
 }
 

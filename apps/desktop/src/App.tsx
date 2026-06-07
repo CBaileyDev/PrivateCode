@@ -54,8 +54,10 @@ export default function App() {
       openSettings();
     }
     if (e.key === "Escape") {
+      // Stacked dismissal: close the topmost modal only (palette opens over
+      // settings), so one Esc doesn't dismiss both.
       if (paletteOpen()) setPaletteOpen(false);
-      if (settingsOpen()) closeSettings();
+      else if (settingsOpen()) closeSettings();
     }
   };
 

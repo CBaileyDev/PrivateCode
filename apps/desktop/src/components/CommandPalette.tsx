@@ -8,8 +8,9 @@ import {
   compactActiveSession,
   createSessionInFolder,
 } from "../stores/session";
-import { addSystemMessage, clearMessages } from "../stores/messages";
+import { clearMessages } from "../stores/messages";
 import { openSettings, toggleSidebar, toggleRightPanel, toggleTheme } from "../stores/ui";
+import { showToast } from "../stores/toast";
 
 interface PaletteCommand {
   id: string;
@@ -56,7 +57,7 @@ export default function CommandPalette(props: Props) {
       action: () => {
         props.onClose();
         void revertActiveSession().then((err) => {
-          if (err) addSystemMessage(`Revert failed: ${err}`);
+          showToast(err ? `Revert failed: ${err}` : "Workspace reverted.", err ? "error" : "success");
         });
       },
     },
@@ -68,7 +69,7 @@ export default function CommandPalette(props: Props) {
       action: () => {
         props.onClose();
         void compactActiveSession().then((err) => {
-          addSystemMessage(err ? `Compact failed: ${err}` : "Context compacted.");
+          showToast(err ? `Compact failed: ${err}` : "Context compacted.", err ? "error" : "success");
         });
       },
     },
@@ -118,14 +119,11 @@ export default function CommandPalette(props: Props) {
       shortcut: "/help",
       action: () => {
         props.onClose();
-        addSystemMessage(
-          "Available commands:\n" +
-            "/model <provider/name> — Switch model\n" +
-            "/agent <name> — Switch agent\n" +
-            "/revert — Revert workspace to last checkpoint\n" +
-            "/compact — Compact context\n" +
-            "/clear — Clear the local view\n" +
-            "/help — Show this help",
+        showToast(
+          "Commands: /model <provider/name>, /agent <name>, /revert, /compact, /clear, /help. " +
+            "Cmd+K palette, Cmd+, settings, Cmd+B sidebar, Cmd+E details.",
+          "info",
+          12000,
         );
       },
     },

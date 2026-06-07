@@ -170,7 +170,7 @@ async function setActiveSession(session: SessionInfo) {
 
     setSessionStore("connectionStatus", "connected");
   } catch (e) {
-    console.error("Failed to subscribe to session:", e);
+    showToast(`Lost connection to this session: ${String(e)}`, "error");
     setSessionStore("connectionStatus", "offline");
   }
 }
@@ -239,8 +239,14 @@ async function createSessionInFolder(): Promise<void> {
     await loadProviderStatus();
     const connectedCfg = connectedModelConfigFor(session.model_config);
     if (connectedCfg) {
-      await invoke("set_model", { sessionId: session.id, modelConfig: connectedCfg });
-      session = { ...session, model_config: connectedCfg };
+      // Best-effort: if this fails the session still opens with its default
+      // model (don't orphan a created session behind a thrown error).
+      try {
+        await invoke("set_model", { sessionId: session.id, modelConfig: connectedCfg });
+        session = { ...session, model_config: connectedCfg };
+      } catch (e) {
+        console.error("default-connected model selection failed:", e);
+      }
     }
 
     setSessionStore("sessions", [...sessionStore.sessions, session]);
@@ -362,7 +368,10 @@ async function setActiveModel(modelConfig: string): Promise<boolean> {
     // A LIVE provider change evicts + rebuilds the session in the coordinator,
     // which tears down our event subscription. Re-attach so streaming keeps
     // working (same-provider model changes need no eviction → no re-subscribe).
-    if (live && providerChanged) {
+    // Guard on the session still being active: the user may have switched away
+    // during the set_model await; re-subscribing to the stale session would point
+    // displayedSessionId back at it and freeze the now-active session's view.
+    if (live && providerChanged && sessionStore.activeSession?.id === s.id) {
       await setActiveSession({ ...s, model_config: modelConfig });
     }
     return live;
