@@ -48,6 +48,11 @@ pub struct LspClient {
     stdin: Arc<Mutex<ChildStdin>>,
     next_id: AtomicI64,
     diagnostics: Arc<Mutex<HashMap<PathBuf, Vec<Diagnostic>>>>,
+    /// Open documents and their last `textDocument` version, so we `didOpen` once
+    /// per file and send strictly-monotonic `didChange` versions afterward (LSP
+    /// requires open-once + monotonic versions; re-opening or a fixed version can
+    /// make a strict server drop diagnostics).
+    open_docs: Arc<Mutex<HashMap<PathBuf, i64>>>,
     _child: Child,
 }
 
@@ -59,6 +64,9 @@ impl LspClient {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
+            // Reap the language server when this client is dropped (e.g. daemon
+            // shutdown) instead of leaking the child process.
+            .kill_on_drop(true)
             .spawn()
             .map_err(|e| LspError::Spawn(format!("{command}: {e}")))?;
 
@@ -119,6 +127,7 @@ impl LspClient {
             stdin,
             next_id: AtomicI64::new(1),
             diagnostics,
+            open_docs: Arc::new(Mutex::new(HashMap::new())),
             _child: child,
         };
 
@@ -177,6 +186,36 @@ impl LspClient {
             serde_json::json!({ "textDocument": { "uri": uri } }),
         )
         .await
+    }
+
+    /// Notify the server a file was written: `didOpen` the FIRST time, otherwise a
+    /// `didChange` at a strictly-incrementing version, then `didSave`. This keeps
+    /// the open-once / monotonic-version contract (the old caller re-sent `didOpen`
+    /// on every write with a hardcoded `version: 2`).
+    pub async fn notify_file(
+        &self,
+        path: &Path,
+        language_id: &str,
+        text: &str,
+    ) -> Result<(), LspError> {
+        let next_version = {
+            let mut docs = self.open_docs.lock().await;
+            match docs.get_mut(path) {
+                Some(v) => {
+                    *v += 1;
+                    Some(*v)
+                }
+                None => {
+                    docs.insert(path.to_path_buf(), 1);
+                    None
+                }
+            }
+        };
+        match next_version {
+            None => self.did_open(path, language_id, text).await?,
+            Some(v) => self.did_change(path, v, text).await?,
+        }
+        self.did_save(path).await
     }
 
     pub async fn diagnostics_for(&self, path: &Path) -> Vec<Diagnostic> {
@@ -329,13 +368,54 @@ async fn read_message<R: AsyncReadExt + Unpin>(
 }
 
 fn path_to_uri(path: &Path) -> String {
-    format!("file://{}", path.display())
+    // Percent-encode each path byte except the unreserved set + '/'. Without this,
+    // a path with spaces / non-ASCII produces an invalid URI; the server then
+    // normalizes it and reports diagnostics under a key we'd never match.
+    let mut out = String::from("file://");
+    for &b in path.to_string_lossy().as_bytes() {
+        match b {
+            b'/' | b'-' | b'_' | b'.' | b'~' | b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 fn uri_to_path(uri: &str) -> PathBuf {
-    uri.strip_prefix("file://")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(uri))
+    let raw = uri.strip_prefix("file://").unwrap_or(uri);
+    PathBuf::from(percent_decode(raw))
+}
+
+/// Decode `%XX` escapes back to bytes (the inverse of [`path_to_uri`]'s encoding),
+/// so diagnostics keyed by the server's normalized URI match our `PathBuf` lookups.
+fn percent_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push(h * 16 + l);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -439,5 +519,20 @@ mod tests {
         let frame = "Content-Length: 99999999999\r\n\r\n";
         let mut reader = BufReader::new(frame.as_bytes());
         assert!(read_message(&mut reader).await.is_err());
+    }
+
+    /// file:// URIs percent-encode spaces/non-ASCII and round-trip back to the
+    /// same path (so diagnostics keyed by the server's URI match our lookups).
+    #[test]
+    fn path_uri_round_trips_spaces_and_unicode() {
+        let p = PathBuf::from("/tmp/my project/café.rs");
+        let uri = path_to_uri(&p);
+        assert!(uri.starts_with("file:///tmp/my%20project/caf"));
+        assert!(!uri.contains(' '), "spaces are percent-encoded");
+        assert_eq!(
+            uri_to_path(&uri),
+            p,
+            "uri decodes back to the original path"
+        );
     }
 }

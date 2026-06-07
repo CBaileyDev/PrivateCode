@@ -1,6 +1,6 @@
 //! Ecosystem services: LSP, MCP tools, WASM plugins (Phase 5).
 
-use private_code_lsp::{LspConfig, LspManager, LspServerOverride};
+use private_code_lsp::{LspClient, LspConfig, LspManager, LspServerOverride};
 use private_code_mcp::{McpClient, McpToolAdapter};
 use private_code_plugins::{PluginConfig, PluginManager};
 use private_code_tools::ToolRegistry;
@@ -65,12 +65,31 @@ impl Ecosystem {
     }
 
     pub async fn lsp_after_write(&self, path: &Path, content: &str) -> String {
-        self.lsp
-            .lock()
-            .await
-            .notify_file_written(path, content)
-            .await
-            .unwrap_or_default()
+        // Resolve the client under a SHORT manager lock, then run the LSP I/O +
+        // the diagnostics settle wait with the lock RELEASED — otherwise every
+        // post-write diagnostics call serializes behind the 200ms sleep across all
+        // sessions (the manager lock was previously held for the whole sequence).
+        let resolved = {
+            let mgr = self.lsp.lock().await;
+            mgr.resolve_for_path(path)
+        };
+        let Some((client, lang, rel)) = resolved else {
+            return String::new();
+        };
+        if client.notify_file(path, lang, content).await.is_err() {
+            return String::new();
+        }
+        // Allow diagnostics to arrive.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let diags = client.diagnostics_for(path).await;
+        if diags.is_empty() {
+            return String::new();
+        }
+        format!(
+            "LSP diagnostics for {}:\n{}",
+            rel.display(),
+            LspClient::format_diagnostics(&diags)
+        )
     }
 }
 

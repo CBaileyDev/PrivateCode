@@ -1,10 +1,11 @@
 //! Manages multiple LSP clients for a workspace.
 
-use crate::client::{Diagnostic, LspClient, LspError};
+use crate::client::{Diagnostic, LspClient};
 use crate::discovery::{LanguageServerSpec, discover_servers};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tracing::{info, warn};
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -23,7 +24,7 @@ pub struct LspConfig {
 }
 
 pub struct LspManager {
-    clients: HashMap<String, LspClient>,
+    clients: HashMap<String, Arc<LspClient>>,
     language_map: HashMap<String, String>,
     workspace: PathBuf,
 }
@@ -52,7 +53,7 @@ impl LspManager {
                         for lang in &spec.language_ids {
                             language_map.insert(lang.clone(), spec.id.clone());
                         }
-                        clients.insert(spec.id.clone(), client);
+                        clients.insert(spec.id.clone(), Arc::new(client));
                     }
                     Err(e) => warn!("Failed to start LSP {}: {e}", spec.id),
                 }
@@ -77,40 +78,22 @@ impl LspManager {
         }
     }
 
-    pub async fn notify_file_written(
-        &self,
-        path: &Path,
-        content: &str,
-    ) -> Result<String, LspError> {
-        let rel = path.strip_prefix(&self.workspace).unwrap_or(path);
-        let lang = self.language_id_for_path(path).unwrap_or("plaintext");
-        let server_id = self
-            .language_map
-            .get(lang)
-            .cloned()
-            .or_else(|| self.clients.keys().next().cloned());
-
-        let Some(sid) = server_id else {
-            return Ok(String::new());
-        };
-        let Some(client) = self.clients.get(&sid) else {
-            return Ok(String::new());
-        };
-
-        client.did_open(path, lang, content).await.ok();
-        client.did_change(path, 2, content).await?;
-        client.did_save(path).await?;
-        // Allow diagnostics to arrive.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        let diags = client.diagnostics_for(path).await;
-        if diags.is_empty() {
-            return Ok(String::new());
-        }
-        Ok(format!(
-            "LSP diagnostics for {}:\n{}",
-            rel.display(),
-            LspClient::format_diagnostics(&diags)
-        ))
+    /// Resolve the LSP client + language id + workspace-relative path for a
+    /// written file. Returns a CLONED `Arc<LspClient>` so the caller can run the
+    /// `notify_file` + diagnostics wait WITHOUT holding the manager lock across
+    /// those awaits (the old code held it across a 200ms sleep, serializing
+    /// post-write diagnostics across every session). Returns `None` when no server
+    /// handles the file's language — NO arbitrary-server fallback (the old
+    /// `clients.keys().next()` would route, say, a `.txt` write to rust-analyzer).
+    pub fn resolve_for_path(&self, path: &Path) -> Option<(Arc<LspClient>, &'static str, PathBuf)> {
+        let lang = self.language_id_for_path(path)?;
+        let server_id = self.language_map.get(lang)?;
+        let client = self.clients.get(server_id)?.clone();
+        let rel = path
+            .strip_prefix(&self.workspace)
+            .unwrap_or(path)
+            .to_path_buf();
+        Some((client, lang, rel))
     }
 
     pub async fn diagnostics_for(&self, path: &Path) -> Vec<Diagnostic> {
