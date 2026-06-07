@@ -218,9 +218,22 @@ Ran a 4-dimension read-only review workflow (WS recovery, CSP, coordinator concu
 - **§2 MEDIUM — DONE except 5.3:** OpenAI-compat + Gemini cost; Gemini `finish_reason` + terminal stop; GUI `/init`; export renderer + `phase5.rs` tests. **5.3 plugins is DEFERRED** (see table) — this supersedes the §0 note that said 5.3 was "being fixed"; it is **not** fixed and is explicitly out of scope for v1 until the sandbox (§4 LOW) lands. A user can configure a plugin and see it "loaded" yet get nothing — documented, not a silent surprise.
 - **Gate (after §2):** `fmt` clean, `clippy -D warnings` clean, **205 nextest passed / 0 failed (4 skipped)**, desktop typecheck + build + **40 vitest** passed.
 - **§3 Packaging — WIRED (human ceilings surfaced):** multi-target CLI release matrix + matching `install.sh` (CLI release build verified locally); desktop `tauri-action` job + valid `bundle` config (best-effort). Human-only: code signing/notarization (certs), `cargo tauri icon` for macOS/Windows icon sets, first observed green remote CI (`gh` unauth here), package-manager formulas (need a shipped release to hash), and the Tauri in-app updater (signing key). Removed the unused conflicting `dist-workspace.toml`.
-- **§4 LOW / §5 Docs:** in progress.
+- **§4 LOW — DONE (security first), each fix regression-tested where unit-testable:**
+  - *Security:* `general` agent no longer auto-allows MCP tools (`mcp,*→Ask` on general+build); `auth set` reads the key with no echo (`rpassword`); `export_session` validates the id as a UUID before path-joining.
+  - *LSP:* `kill_on_drop`; `notify_file` does didOpen-once + monotonic didChange versions; percent-encoded `file://` URIs (round-trip tested); `resolve_for_path` has no arbitrary-server fallback and the manager lock is released across the 200ms diagnostics settle.
+  - *MCP:* `kill_on_drop`; per-tool permission scope (qualified name, not blanket `*`); `mutates()=true` so MCP effects are checkpointed/undoable.
+  - *Plugins (deferred path):* extism sandbox now bounded — 64 MiB / 5s / WASI-closed — verified under `--features extism`.
+  - *Deferred + documented (not fixed):* LSP await-real-`initialize` (would reintroduce a startup hang), per-session LSP workspace rooting (architectural), and the plugin host-function registration that would un-defer 5.3.
+- **§5 Docs — DONE:** this reconciliation + AIChatContext Phase-5 update; human-only steps surfaced below.
 
-**Ceilings (honest):** plugin WASM execution + sandbox = post-v1 (5.3 deferred); GUI smoke + live BYOK provider smoke are human-only; code signing/notarization + first observed green remote CI are human-only (no certs / `gh` unauth here); Homebrew/Scoop/AUR/Nix formulas not authored.
+**✅ Final v1 Definition-of-Done gate (truthfully green, 2026-06-06):**
+`cargo fmt --all --check` clean · `cargo clippy --workspace --all-targets --locked -- -D warnings` clean · `cargo nextest run --workspace` **209 passed / 0 failed (4 skipped = `#[ignore]`d live-network tests)** · `cargo deny check` advisories/bans/licenses/sources ok · desktop `npm run typecheck` clean + `npm run build` ok + **40 vitest passed**.
+
+**Two human-only steps remain for sign-off (cannot be done headless here):**
+1. **GUI smoke test** — launch the desktop app, run a turn, exercise the comparison/checkpoint panels, and force an error to confirm the error banner shows.
+2. **Live BYOK provider smoke** — one real end-to-end turn against a real provider key (e.g. Anthropic), plus (optional) confirming the first green run of `release.yml`/`ci.yml` in the GitHub Actions tab.
+
+**Ceilings (honest):** plugin WASM execution + host-fn sandbox = post-v1 (5.3 deferred); GUI smoke + live BYOK provider smoke are human-only; code signing/notarization + first observed green remote CI are human-only (no certs / `gh` unauth here); Homebrew/Scoop/AUR/Nix formulas not authored (need a shipped release to hash); LSP await-`initialize` + per-session rooting deferred.
 
 ## Notes / caveats (honesty log)
 - **Remote CI runs exist but are not yet *observed*.** Commits push to `main`, and both `ci.yml` and `perf.yml` trigger on `push: [main]`, so the Actions runs are firing — but `gh` is not authenticated in this environment (the https push credential doesn't cover the CLI), so I cannot read the run results. Confirming the first green run is a human step (`gh run list` / the Actions tab). I verify by running each job's exact commands locally where the tool is installed.

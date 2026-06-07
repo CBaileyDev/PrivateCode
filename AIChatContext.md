@@ -376,18 +376,18 @@ The legacy TypeScript OpenCode lives in **`Reference/`** and is **READ-ONLY** �
 | **2** | Daemon: HTTP/WS, eviction reaper, steer/queue, durable replay, graceful shutdown | ✅ done (C6–C9) + Phase-2 review |
 | **3** | Desktop: command→engine seam, frontend (XSS/session-bleed/locks fixes), model/agent/slash wiring, virtualization + Shiki-in-worker, store tests, perf instrumentation | ✅ done (C10–C16) + Phase-3 review |
 | **4** | **Moat & Differentiators:** code intelligence (tree-sitter, FTS5, fuzzy, repomap, watcher, 9 languages) + multi-model orchestration (fan-out, synthesis, role routing) + GUI comparison/checkpoint views | ✅ done (P4-C1..C11) + Phase-4 review |
-| **5** | **Ecosystem & Packaging** — LSP, MCP, WASM plugins, provider breadth, model catalog, keychain, cost UI, slash commands, `/init`, export, auto-update, packaging | ⏭️ **NEXT — not started** |
+| **5** | **Ecosystem & Packaging** — LSP, MCP, WASM plugins, provider breadth, model catalog, keychain, cost UI, slash commands, `/init`, export, auto-update, packaging | ✅ **landed + release punch-list worked** (LSP/MCP/Gemini/cost/export fixed & tested; 5.3 plugins DEFERRED; packaging WIRED with human-only signing/CI). See `RELEASE_PUNCHLIST.md` + `PROGRESS.md`. |
 
 **Green gate (must pass at every cluster boundary):**
 ```
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo nextest run --workspace                      # 163 tests pass, 4 skipped
+cargo nextest run --workspace                      # 209 pass, 4 skipped
 cargo deny check                                   # for dependency-touching clusters
 # desktop:
-cd apps/desktop && npm run typecheck && npm run build && npx vitest run   # 39 tests, 7 files
+cd apps/desktop && npm run typecheck && npm run build && npx vitest run   # 40 tests, 7 files
 ```
-Current state: **all green.** Rust ~164 test fns / 163 nextest cases; frontend 39 vitest.
+Current state (after the Phase-5 release punch-list pass, 2026-06-06): **truthfully green** — fmt + clippy clean, **209 nextest pass / 0 fail (4 skipped)**, `cargo deny` ok, frontend **40 vitest**. Two human-only sign-off steps remain (GUI smoke + live BYOK provider smoke) — see `PROGRESS.md`.
 
 ## 3. Architecture & repo layout
 
@@ -441,17 +441,15 @@ Editions: daemon is edition 2021 (no let-chains); core/providers/cli/codeintel a
 - **Orchestration ceilings (deliberate):** fan-out/synthesis run **no tool loop** and **no proactive compaction**; mid-turn steers are dropped in an orchestrated turn; the synthesizer sees only the request + candidate texts (no full history); comparison "merge" is copy-to-clipboard (real merge is the server-side synthesis); checkpoint revert is latest-only (no arbitrary "restore to tree X" command yet).
 - **Deferred infra:** durable event-log table (closes the post-eviction cold-reconnect gap); Google-Fonts self-hosting; `enclosing_scope`/parent_scope for non-Rust languages.
 
-## 7. What's next — Phase 5 (Ecosystem & Packaging)
+## 7. Phase 5 (Ecosystem & Packaging) — LANDED + release punch-list worked
 
-Start at `plan.md` → "### Phase 5". Steps, in plan order:
-- **5.1 LSP client** (`crates/lsp`, not yet created) — generic JSON-RPC client, server lifecycle, diagnostics → tool results, definition/references.
-- **5.2 MCP client** (`crates/mcp`) — `rmcp` SDK, stdio + Streamable HTTP, auto-register MCP tools into `ToolRegistry`.
-- **5.3 WASM plugins** (`crates/plugins`) — Extism runtime, host fns (workspace-bounded fs, log, config), pre/post turn/tool hooks, sandbox (no net, 64MB).
-- **5.4 Provider breadth** — OpenAI/DeepSeek/Groq, Google Gemini, Ollama, LM Studio; per-provider prompt caching; env/port auto-detection.
-- **5.5 Model catalog** (`catalog.rs`) — standalone owned `ModelInfo` (get/all/available), vendored models.dev snapshot (zero-network cold start), lazy/background refresh.
-- **5.6 OS keychain**, **5.7 cost transparency UI**, **5.8 slash + custom commands**, **5.9 `/init` AGENTS.md generation**, **5.10 session export/share**, **5.11 GUI auto-update**, **5.12 CLI packaging**, **5.13 desktop packaging**, **5.14 package-manager distribution**, **5.15 Phase-5 verification**.
+Phase 5 is implemented and committed, and the `RELEASE_PUNCHLIST.md` (34-agent adversarial review) has been worked to a truthfully green gate. The crates `crates/{lsp,mcp,plugins}`, `crates/providers/{catalog,detect,google,keyring_store}.rs`, and `crates/core/{ecosystem,export}.rs` now exist. Status per step (full detail + ceilings in `PROGRESS.md` → "Phase 5"):
+- **5.1 LSP** ✅ working — `read_message` Content-Length bug fixed (diagnostics parse); kill_on_drop, open-once/monotonic versions, percent-encoded URIs, no wrong-server fallback, lock released across the settle. *Deferred:* await-real-`initialize`, per-session workspace rooting.
+- **5.2 MCP** ✅ working — real id↔response pairing + newline framing + 30s timeout; kill_on_drop; per-tool permission scope; `mutates()=true`. (Was a stub returning `{"tools":[]}`.)
+- **5.3 WASM plugins** ⛔ **DEFERRED for v1** — load + hook API present but hooks never invoked; sandbox bounded (64 MiB/5s/WASI-closed under `--features extism`) but host functions not registered. Un-defer path documented.
+- **5.4 provider breadth** ✅ · **5.5 catalog** ✅ · **5.6 keychain** ✅ · **5.7 cost** ✅ (OpenAI-compat + Gemini now compute real cost) · **5.8 slash** ✅ · **5.9 `/init`** ✅ (now actually sends) · **5.10 export** ✅ (renders content, not raw JSON) · **5.11 auto-update** ⚠️ CLI-only (Tauri updater needs a signing key) · **5.12–5.14 packaging** ⚠️ wired; signing/notarization/formulas/first-green-CI are human-only · **5.15 verification** ✅ (`phase5.rs` expanded).
 
-Recommended approach: same cluster cadence as Phase 4 — scope a cluster, advisor-check the design, implement with tests, green gate, commit+push; run a Phase-5 adversarial-review workflow at the boundary. `crates/{lsp,mcp,plugins}` do NOT exist yet — they need scaffolding (add to `Cargo.toml` workspace members + `[workspace.dependencies]`).
+Remaining for sign-off: the two human-only smoke tests (GUI; live BYOK provider) — see `PROGRESS.md`.
 
 ## 8. Phase-4 deliverables (what landed this session, for quick orientation)
 

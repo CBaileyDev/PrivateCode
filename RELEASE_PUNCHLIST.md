@@ -4,7 +4,21 @@
 >
 > **How to use (Claude Code):** work top-down — **Blockers → HIGH → MEDIUM → packaging → LOW**. Every item is a checkbox with the exact `file:line`, the problem, and the fix. After each cluster, run the **Gate** at the bottom and only commit when it is truthfully green. Use the project conventions in `AIChatContext.md` (commit trailer, per-cluster gate→commit→push to `main`). Do **not** mark a step "done" in `PROGRESS.md` unless the gate passes.
 
-## Current state (verified 2026-06-06)
+## ✅ WORKED TO GREEN (2026-06-06) — this punch list has been executed
+
+| Check | At generation | After the punch-list pass |
+|---|---|---|
+| `cargo fmt --all --check` | ❌ RED | ✅ clean |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | ✅ clean | ✅ clean |
+| `cargo nextest run --workspace` | ❌ 181 pass / **1 FAIL** | ✅ **209 pass / 0 fail** (4 skipped) |
+| `cargo deny check` | (n/a) | ✅ advisories/bans/licenses/sources ok |
+| desktop `typecheck` + `build` + `vitest` | ✅ 39 | ✅ **40** |
+
+**What landed:** §0 blockers fixed · §1 HIGH all 3 fixed + regression-tested + 5-agent adversarial self-review (0 must-fix) · §2 MEDIUM all fixed **except 5.3 plugins (formally DEFERRED)** · §3 packaging wired (human-only signing/CI surfaced) · §4 LOW done (security first; a few items deferred + documented) · §5 docs reconciled. Full detail + the honest ceilings live in `PROGRESS.md` → "Phase 5". Two human-only sign-off steps remain (GUI smoke; live BYOK provider smoke). The individual checkboxes below are the original spec, kept for traceability.
+
+---
+
+## Original generated state (verified 2026-06-06, BEFORE the pass)
 
 | Check | Status |
 |---|---|
@@ -16,7 +30,7 @@
 
 **Severity counts (post adversarial-verification):** 3 HIGH · 5 MEDIUM · 20 LOW.
 
-⚠️ **Honesty note:** `PROGRESS.md` claims "clippy clean, **182** nextest passed." That is false — tests are **181 pass / 1 fail**, and `fmt` (red) was omitted from the claim. Correct this line as part of the work (see §5).
+⚠️ **Honesty note (now corrected):** `PROGRESS.md` claimed "clippy clean, **182** nextest passed." That was false — tests were **181 pass / 1 fail**, and `fmt` (red) was omitted. Corrected in `PROGRESS.md` as part of §5.
 
 ---
 
