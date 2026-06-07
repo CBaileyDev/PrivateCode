@@ -498,9 +498,10 @@ pub async fn stream_single(
     event_tx: &mpsc::Sender<ProtocolEvent>,
     cancel: &CancellationToken,
     timeout: Duration,
-) -> Result<(String, UsageStats), String> {
+) -> Result<(String, UsageStats, Option<String>), String> {
     let mut text = String::new();
     let mut usage = UsageStats::default();
+    let mut finish_reason: Option<String> = None;
 
     let stream_fut = async {
         let mut stream = provider
@@ -526,8 +527,12 @@ pub async fn stream_single(
                         })
                         .await;
                 }
-                Ok(ProviderEvent::MessageStop { usage: u, .. }) => {
+                Ok(ProviderEvent::MessageStop {
+                    usage: u,
+                    finish_reason: fr,
+                }) => {
                     usage = u;
+                    finish_reason = fr;
                     break;
                 }
                 Ok(_) => {}
@@ -546,7 +551,7 @@ pub async fn stream_single(
         }
     };
     result?;
-    Ok((text, usage))
+    Ok((text, usage, finish_reason))
 }
 
 #[cfg(test)]
@@ -1062,7 +1067,7 @@ mod tests {
     }
 
     /// `stream_single` emits ordinary MessageDelta (Text) events and returns the
-    /// assembled text + usage — the path the synthesis / final answer uses.
+    /// assembled text + usage + stop reason — the synthesis / final-answer path.
     #[tokio::test]
     async fn stream_single_emits_message_deltas_and_returns_text() {
         let provider: Arc<dyn ModelProvider> =
@@ -1071,7 +1076,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let msgs = user_msg("hi");
 
-        let (text, _usage) = stream_single(
+        let (text, _usage, finish_reason) = stream_single(
             &provider,
             "m",
             "sess",
@@ -1085,6 +1090,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(text, "synthesized");
+        assert_eq!(finish_reason.as_deref(), Some("end_turn"));
 
         let events = drain(&mut rx);
         assert!(

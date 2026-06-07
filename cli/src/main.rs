@@ -567,19 +567,54 @@ async fn run_auth(action: &AuthCommands) -> Result<(), Box<dyn std::error::Error
 }
 
 async fn run_update_check() -> Result<(), Box<dyn std::error::Error>> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()?;
     let resp = client
         .get("https://api.github.com/repos/CBaileyDev/PrivateCode/releases/latest")
         .header("User-Agent", "private-code-cli")
         .send()
         .await?;
-    if resp.status().is_success() {
-        let body: serde_json::Value = resp.json().await?;
-        let tag = body["tag_name"].as_str().unwrap_or("unknown");
-        println!("Latest release: {tag}");
-        println!("Download: https://github.com/CBaileyDev/PrivateCode/releases/latest");
-    } else {
-        eprintln!("Update check failed: HTTP {}", resp.status());
-    }
+    let status = resp.status();
+    let body = resp.text().await?;
+    let tag = latest_release_tag_from_response(status, &body)?;
+    println!("Latest release: {tag}");
+    println!("Download: https://github.com/CBaileyDev/PrivateCode/releases/latest");
     Ok(())
+}
+
+fn latest_release_tag_from_response(
+    status: reqwest::StatusCode,
+    body: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if !status.is_success() {
+        return Err(format!("update check failed: HTTP {status}").into());
+    }
+    let body: serde_json::Value = serde_json::from_str(body)?;
+    Ok(body["tag_name"].as_str().unwrap_or("unknown").to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::latest_release_tag_from_response;
+
+    #[test]
+    fn update_check_errors_on_http_failure() {
+        let err = latest_release_tag_from_response(reqwest::StatusCode::NOT_FOUND, "{}")
+            .expect_err("non-success release checks must fail");
+
+        assert!(
+            err.to_string().contains("HTTP 404 Not Found"),
+            "error should include the failing status, got {err}"
+        );
+    }
+
+    #[test]
+    fn update_check_parses_latest_release_tag() {
+        let tag =
+            latest_release_tag_from_response(reqwest::StatusCode::OK, r#"{"tag_name":"v0.1.0"}"#)
+                .unwrap();
+
+        assert_eq!(tag, "v0.1.0");
+    }
 }

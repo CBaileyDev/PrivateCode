@@ -679,6 +679,7 @@ impl Orchestrator {
             // the real text / thinking / tool interleaving).
             let mut blocks: Vec<PartialBlock> = Vec::new();
             let mut final_usage = UsageStats::default();
+            let mut final_finish_reason: Option<String> = None;
             // Set if the stream errors mid-flight: the turn did NOT complete cleanly.
             let mut stream_error: Option<String> = None;
 
@@ -819,9 +820,10 @@ impl Orchestrator {
                     }
                     ProviderEvent::MessageStop {
                         usage,
-                        finish_reason: _,
+                        finish_reason,
                     } => {
                         final_usage = usage;
+                        final_finish_reason = finish_reason;
                     }
                 }
             }
@@ -941,6 +943,7 @@ impl Orchestrator {
                         seq,
                         message_id: assistant_msg_id.clone(),
                         usage: final_usage.clone(),
+                        finish_reason: final_finish_reason.clone(),
                     })
                     .await
                     .ok();
@@ -1420,6 +1423,7 @@ impl Orchestrator {
         session_id: &str,
         text: &str,
         usage: UsageStats,
+        finish_reason: Option<String>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let assistant_msg_id = Uuid::new_v4().to_string();
         let msg = ChatMessage {
@@ -1461,6 +1465,7 @@ impl Orchestrator {
                 seq,
                 message_id: assistant_msg_id,
                 usage,
+                finish_reason,
             })
             .await
             .ok();
@@ -1617,7 +1622,7 @@ impl Orchestrator {
         };
 
         let synth_msgs = orchestration::build_synthesis_messages(user_request, &survivors);
-        let (synth_text, synth_usage) = match orchestration::stream_single(
+        let (synth_text, synth_usage, synth_finish_reason) = match orchestration::stream_single(
             &synth_provider,
             &synth_ref.model_id,
             session_id,
@@ -1650,7 +1655,7 @@ impl Orchestrator {
 
         let mut total = orchestration::sum_candidate_usage(&outcomes);
         add_usage(&mut total, &synth_usage);
-        self.persist_orchestrated_answer(session_id, &synth_text, total)
+        self.persist_orchestrated_answer(session_id, &synth_text, total, synth_finish_reason)
             .await
     }
 
@@ -1699,7 +1704,7 @@ impl Orchestrator {
             // Final stage with no synthesizer = the answer: stream as MessageDelta
             // and persist directly.
             if i == last_idx && !has_synth {
-                let (text, usage) = match orchestration::stream_single(
+                let (text, usage, finish_reason) = match orchestration::stream_single(
                     &provider,
                     &mref.model_id,
                     session_id,
@@ -1731,7 +1736,7 @@ impl Orchestrator {
                 }
                 add_usage(&mut total, &usage);
                 return self
-                    .persist_orchestrated_answer(session_id, &text, total)
+                    .persist_orchestrated_answer(session_id, &text, total, finish_reason)
                     .await;
             }
 
@@ -1790,7 +1795,7 @@ impl Orchestrator {
                 .await;
         };
         let synth_msgs = orchestration::build_synthesis_messages(user_request, &prior);
-        let (synth_text, synth_usage) = match orchestration::stream_single(
+        let (synth_text, synth_usage, synth_finish_reason) = match orchestration::stream_single(
             &synth_provider,
             &synth_ref.model_id,
             session_id,
@@ -1821,7 +1826,7 @@ impl Orchestrator {
                 .await;
         }
         add_usage(&mut total, &synth_usage);
-        self.persist_orchestrated_answer(session_id, &synth_text, total)
+        self.persist_orchestrated_answer(session_id, &synth_text, total, synth_finish_reason)
             .await
     }
 

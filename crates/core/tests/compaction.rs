@@ -26,6 +26,7 @@ struct Harness {
     orch: Orchestrator,
     pool: sqlx::SqlitePool,
     sid: String,
+    events: mpsc::Receiver<ProtocolEvent>,
     _ws: tempfile::TempDir,
     _data: tempfile::TempDir,
 }
@@ -62,8 +63,7 @@ async fn setup(provider: Arc<dyn ModelProvider>, project_config_json: &str) -> H
     .unwrap();
 
     let (ptx, _prx) = mpsc::channel::<(PermissionPrompt, oneshot::Sender<PermissionReply>)>(10);
-    let (etx, mut erx) = mpsc::channel::<ProtocolEvent>(4096);
-    tokio::spawn(async move { while erx.recv().await.is_some() {} });
+    let (etx, erx) = mpsc::channel::<ProtocolEvent>(4096);
 
     let orch = Orchestrator::new(
         pool.clone(),
@@ -78,6 +78,7 @@ async fn setup(provider: Arc<dyn ModelProvider>, project_config_json: &str) -> H
         orch,
         pool,
         sid,
+        events: erx,
         _ws: ws,
         _data: data,
     }
@@ -326,7 +327,7 @@ impl ModelProvider for TruncatedSuccessProvider {
 
 #[tokio::test]
 async fn truncation_finish_reason_is_success_and_never_compacts() {
-    let h = setup(
+    let mut h = setup(
         Arc::new(TruncatedSuccessProvider),
         r#"{"compaction":{"auto":true}}"#,
     )
@@ -352,5 +353,20 @@ async fn truncation_finish_reason_is_success_and_never_compacts() {
     assert!(
         msgs.iter().any(|m| m.data.contains("truncated answer")),
         "the truncated answer is persisted"
+    );
+
+    let mut completed_finish_reason = None;
+    while let Ok(Some(event)) =
+        tokio::time::timeout(std::time::Duration::from_millis(100), h.events.recv()).await
+    {
+        if let ProtocolEvent::MessageCompleted { finish_reason, .. } = event {
+            completed_finish_reason = finish_reason;
+            break;
+        }
+    }
+    assert_eq!(
+        completed_finish_reason.as_deref(),
+        Some("model_context_window_exceeded"),
+        "MessageCompleted must surface the provider stop reason"
     );
 }

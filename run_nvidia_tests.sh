@@ -1,21 +1,24 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-cd /Users/carterbarker/Downloads/PrivateCode
+if [[ -z "${NVIDIA_API_KEY:-}" ]]; then
+  echo "NVIDIA_API_KEY must be set in the environment before running live NVIDIA smoke tests." >&2
+  exit 1
+fi
 
-echo "=== Step 1: Git pull ==="
-git pull origin main
-
-echo ""
-echo "=== Step 2: Running NVIDIA smoke test ==="
-export NVIDIA_API_KEY='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'
-cargo test -p private-code-providers --test live_smoke nvidia -- --ignored --nocapture
-
-echo ""
-echo "=== Step 3: If tool use failed, trying with llama model ==="
-NVIDIA_TEST_MODEL=meta/llama-3.1-405b-instruct cargo test -p private-code-providers --test live_smoke live_nvidia_tool -- --ignored --nocapture
+echo "=== Step 1: Running NVIDIA text smoke test ==="
+cargo test -p private-code-providers --test live_smoke live_nvidia_text_turn_streams_and_completes -- --ignored --nocapture
 
 echo ""
-echo "=== Step 4: Sanity check - offline tests ==="
+echo "=== Step 2: Running NVIDIA tool smoke test ==="
+if ! cargo test -p private-code-providers --test live_smoke live_nvidia_tool_turn_yields_a_tool_use -- --ignored --nocapture; then
+  echo ""
+  echo "=== Step 2b: Default tool smoke failed; retrying with llama-3.1-405b ==="
+  NVIDIA_TEST_MODEL=meta/llama-3.1-405b-instruct cargo test -p private-code-providers --test live_smoke live_nvidia_tool_turn_yields_a_tool_use -- --ignored --nocapture
+fi
+
+echo ""
+echo "=== Step 3: Sanity check - offline tests ==="
 cargo nextest run --workspace
 
 echo ""
