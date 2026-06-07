@@ -3,8 +3,13 @@
  * Keyboard-first navigation with arrow keys and Enter to execute.
  */
 import { createSignal, createMemo, For, onMount, onCleanup } from "solid-js";
-import { revertActiveSession, compactActiveSession } from "../stores/session";
+import {
+  revertActiveSession,
+  compactActiveSession,
+  createSessionInFolder,
+} from "../stores/session";
 import { addSystemMessage, clearMessages } from "../stores/messages";
+import { openSettings, toggleSidebar, toggleRightPanel, toggleTheme } from "../stores/ui";
 
 interface PaletteCommand {
   id: string;
@@ -26,29 +31,21 @@ export default function CommandPalette(props: Props) {
   const commands: PaletteCommand[] = [
     {
       id: "new-session",
-      label: "New Session",
+      label: "New Session (open a folder)",
       icon: "➕",
       action: () => {
         props.onClose();
-        // Trigger new session flow
+        void createSessionInFolder();
       },
     },
     {
-      id: "switch-model",
-      label: "Switch Model",
-      icon: "🔄",
-      shortcut: "/model",
+      id: "model-providers",
+      label: "Model Providers (Settings)",
+      icon: "🔌",
+      shortcut: "⌘,",
       action: () => {
         props.onClose();
-      },
-    },
-    {
-      id: "switch-agent",
-      label: "Switch Agent",
-      icon: "👤",
-      shortcut: "Tab",
-      action: () => {
-        props.onClose();
+        openSettings();
       },
     },
     {
@@ -92,6 +89,7 @@ export default function CommandPalette(props: Props) {
       shortcut: "⌘B",
       action: () => {
         props.onClose();
+        toggleSidebar();
       },
     },
     {
@@ -101,6 +99,7 @@ export default function CommandPalette(props: Props) {
       shortcut: "⌘E",
       action: () => {
         props.onClose();
+        toggleRightPanel();
       },
     },
     {
@@ -108,12 +107,8 @@ export default function CommandPalette(props: Props) {
       label: "Toggle Theme",
       icon: "🎨",
       action: () => {
-        const current = document.documentElement.getAttribute("data-theme");
-        document.documentElement.setAttribute(
-          "data-theme",
-          current === "dark" ? "light" : "dark"
-        );
         props.onClose();
+        toggleTheme();
       },
     },
     {

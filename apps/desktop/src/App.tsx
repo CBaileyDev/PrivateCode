@@ -18,30 +18,32 @@ import {
 import { messageStore } from "./stores/messages";
 import { permissionStore } from "./stores/permissions";
 import { loadProviderStatus, anyConnected } from "./stores/providers";
-import { settingsOpen, openSettings, closeSettings } from "./stores/ui";
+import {
+  settingsOpen,
+  openSettings,
+  closeSettings,
+  sidebarOpen,
+  toggleSidebar,
+  rightPanelOpen,
+  toggleRightPanel,
+  theme,
+  applyTheme,
+  toggleTheme,
+} from "./stores/ui";
 
 export default function App() {
-  const [sidebarOpen, setSidebarOpen] = createSignal(true);
-  const [rightPanelOpen, setRightPanelOpen] = createSignal(true);
   const [paletteOpen, setPaletteOpen] = createSignal(false);
-  const [theme, setTheme] = createSignal<"dark" | "light">("dark");
-
-  const toggleTheme = () => {
-    const next = theme() === "dark" ? "light" : "dark";
-    setTheme(next);
-    document.documentElement.setAttribute("data-theme", next);
-  };
 
   // Global keyboard shortcuts
   const handleKeyDown = (e: KeyboardEvent) => {
     const mod = e.metaKey || e.ctrlKey;
     if (mod && e.key === "b") {
       e.preventDefault();
-      setSidebarOpen(!sidebarOpen());
+      toggleSidebar();
     }
     if (mod && e.key === "e") {
       e.preventDefault();
-      setRightPanelOpen(!rightPanelOpen());
+      toggleRightPanel();
     }
     if (mod && e.key === "k") {
       e.preventDefault();
@@ -65,6 +67,7 @@ export default function App() {
 
   onMount(() => {
     document.addEventListener("keydown", handleKeyDown);
+    applyTheme(theme());
     loadSessions();
     void loadProviderStatus();
   });
@@ -86,7 +89,7 @@ export default function App() {
           <div style={{ display: "flex", "align-items": "center", gap: "var(--space-3)" }}>
             <button
               class="btn icon-only"
-              onClick={() => setSidebarOpen(!sidebarOpen())}
+              onClick={toggleSidebar}
               data-tooltip="Toggle sidebar (⌘B)"
               id="toggle-sidebar-btn"
             >
@@ -125,7 +128,7 @@ export default function App() {
             </button>
             <button
               class="btn icon-only"
-              onClick={() => setRightPanelOpen(!rightPanelOpen())}
+              onClick={toggleRightPanel}
               data-tooltip="Toggle details (⌘E)"
               id="toggle-right-panel-btn"
             >

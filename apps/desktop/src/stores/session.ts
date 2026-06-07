@@ -12,7 +12,7 @@ import {
 import { clearCandidates } from "./candidates";
 import { clearCheckpoints } from "./checkpoints";
 import { showToast } from "./toast";
-import { loadProviderStatus } from "./providers";
+import { loadProviderStatus, connectedModels, providerStore } from "./providers";
 
 // Monotonic subscription generation. Each `setActiveSession` mints a new value;
 // only the LATEST subscription's channel applies events. This subsumes the
@@ -89,23 +89,32 @@ async function loadSessions() {
     const { invoke } = await import("@tauri-apps/api/core");
     const projects = (await invoke("list_projects")) as ProjectInfo[];
     setSessionStore("projects", projects);
-
     if (projects.length > 0) {
-      const projectId = projects[0].id;
-      setSessionStore("activeProjectId", projectId);
-      const sessions = (await invoke("list_sessions", {
-        projectId,
-      })) as SessionInfo[];
-      setSessionStore("sessions", sessions);
+      setSessionStore("activeProjectId", projects[0].id);
+    }
 
-      // Reload restore: re-attach to the previously-active session so a webview
-      // reload mid-conversation resumes streaming instead of silently dropping
-      // it until the user re-clicks the session.
-      const savedId = readPersistedSessionId();
-      if (savedId) {
-        const match = sessions.find((s) => s.id === savedId);
-        if (match) await setActiveSession(match);
-        else persistActiveSessionId(null);
+    // Load sessions across ALL projects so the sidebar shows every session
+    // regardless of which folder it belongs to (the GUI now spans multiple
+    // project folders via the folder picker). Newest first.
+    const all: SessionInfo[] = [];
+    for (const p of projects) {
+      const ss = (await invoke("list_sessions", { projectId: p.id })) as SessionInfo[];
+      all.push(...ss);
+    }
+    all.sort((a, b) => b.updated_at - a.updated_at);
+    setSessionStore("sessions", all);
+
+    // Reload restore: re-attach to the previously-active session (in ANY project)
+    // so a webview reload mid-conversation resumes streaming instead of silently
+    // dropping it until the user re-clicks the session.
+    const savedId = readPersistedSessionId();
+    if (savedId) {
+      const match = all.find((s) => s.id === savedId);
+      if (match) {
+        setSessionStore("activeProjectId", match.project_id);
+        await setActiveSession(match);
+      } else {
+        persistActiveSessionId(null);
       }
     }
   } catch (e) {
@@ -225,11 +234,41 @@ async function createSessionInFolder(): Promise<void> {
 
     setSessionStore("sessions", [...sessionStore.sessions, session]);
     await setActiveSession(session);
-    // Refresh provider connectivity so the model picker is accurate.
-    void loadProviderStatus();
+
+    // Refresh provider connectivity, then default the session to a CONNECTED
+    // model if its default provider (anthropic) has no key but another provider
+    // does — so the first turn can actually reach a model.
+    await loadProviderStatus();
+    await defaultToConnectedModel(session);
   } catch (e) {
     showToast(`Failed to start session: ${String(e)}`);
   }
+}
+
+/** If the session's configured provider is not connected but another provider
+ * is, switch the session to the first connected model. No-op otherwise. */
+async function defaultToConnectedModel(session: SessionInfo): Promise<void> {
+  let configuredProvider: string | null = null;
+  try {
+    configuredProvider = JSON.parse(session.model_config).provider_id ?? null;
+  } catch {
+    /* malformed — treat as unconfigured */
+  }
+  const configuredConnected = providerStore.providers.some(
+    (p) => p.id === configuredProvider && p.connected,
+  );
+  if (configuredConnected) return;
+
+  const connected = connectedModels();
+  if (connected.length === 0) return; // nothing connected yet — user adds a key
+
+  const value = connected[0].value; // "provider|model_id"
+  const sep = value.indexOf("|");
+  const cfg = JSON.stringify({
+    provider_id: value.slice(0, sep),
+    model_id: value.slice(sep + 1),
+  });
+  await setActiveModel(cfg);
 }
 
 /** Delete a session. */

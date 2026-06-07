@@ -112,6 +112,48 @@ describe("createSessionInFolder", () => {
     expect(calls.some((c) => c.cmd === "create_session")).toBe(false);
     expect(sessionStore.activeSession).toBeNull();
   });
+
+  it("defaults a new session to a CONNECTED model when its default provider isn't connected", async () => {
+    responses["plugin:dialog|open"] = "/Users/me/p";
+    responses["open_or_create_project"] = {
+      id: "p1",
+      name: "p",
+      directory: "/Users/me/p",
+      created_at: 0,
+    };
+    // create_session defaults to anthropic (not connected); openai IS connected.
+    responses["create_session"] = fakeSession(
+      "s1",
+      '{"provider_id":"anthropic","model_id":"claude-opus-4-8"}',
+    );
+    responses["get_messages"] = [];
+    responses["subscribe_session"] = null;
+    responses["set_model"] = true;
+    responses["provider_status"] = [
+      {
+        id: "anthropic",
+        display_name: "Anthropic",
+        connected: false,
+        requires_key: true,
+        local: false,
+        models: [{ id: "claude-opus-4-8", display_name: "Opus" }],
+      },
+      {
+        id: "openai",
+        display_name: "OpenAI",
+        connected: true,
+        requires_key: true,
+        local: false,
+        models: [{ id: "gpt-4.1", display_name: "GPT-4.1" }],
+      },
+    ];
+
+    await createSessionInFolder();
+
+    expect(calls.find((c) => c.cmd === "set_model")?.args).toMatchObject({
+      modelConfig: '{"provider_id":"openai","model_id":"gpt-4.1"}',
+    });
+  });
 });
 
 describe("setActiveModel / setActiveAgent", () => {
@@ -193,5 +235,22 @@ describe("reload restore", () => {
     await loadSessions();
 
     expect(sessionStore.activeSession?.id).toBe("s2");
+  });
+
+  it("loads sessions across ALL projects, newest first", async () => {
+    responses["list_projects"] = [
+      { id: "p1", name: "a", directory: "/a", created_at: 0 },
+      { id: "p2", name: "b", directory: "/b", created_at: 0 },
+    ];
+    responses["list_sessions"] = (args: unknown) => {
+      const pid = (args as { projectId: string }).projectId;
+      return pid === "p1"
+        ? [{ ...fakeSession("s1"), updated_at: 10 }]
+        : [{ ...fakeSession("s2"), updated_at: 20 }];
+    };
+
+    await loadSessions();
+
+    expect(sessionStore.sessions.map((s) => s.id)).toEqual(["s2", "s1"]);
   });
 });
