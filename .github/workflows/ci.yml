@@ -68,8 +68,19 @@ jobs:
       - name: cargo clippy -D warnings
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+      # The Tauri app crate's test binary links the system webview (wry/WebView2).
+      # On Windows it can't be loaded by the test runner — `--list` aborts with
+      # 0xc0000139 (STATUS_ENTRYPOINT_NOT_FOUND), which fails nextest's list phase
+      # for the whole workspace before any test runs. Exclude just that crate on
+      # Windows; it is still compiled + clippy-checked there, and its Rust tests
+      # still run on Linux/macOS.
       - name: cargo nextest run
+        if: runner.os != 'Windows'
         run: cargo nextest run --workspace --locked
+
+      - name: cargo nextest run (Windows — exclude the Tauri app bin)
+        if: runner.os == 'Windows'
+        run: cargo nextest run --workspace --exclude private-code-desktop --locked
 
   # ---- Supply chain: lock freshness, advisories, license/source policy ----
   supply-chain:
