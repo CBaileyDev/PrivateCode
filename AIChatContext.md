@@ -342,3 +342,120 @@ The plan is now comprehensive. Here's a summary of everything I reviewed and imp
 - Added `daemon/` crate (was missing entirely).
 - Added `apps/desktop/` for Tauri.
 - Added many new source files to existing crates (e.g., `checkpoint.rs`, `output_store.rs`, `keyring.rs`, `catalog.rs`, `fuzzy.rs`, `walker.rs`, `markdown.rs`, `theme.rs`).
+
+---
+---
+
+# 🤝 PROJECT HANDOFF — Private Code (current state)
+
+> Everything above this divider is the **original planning transcript** (Gemini/Antigravity, pre-implementation). Everything below is a **self-contained handoff** written after Phases 1–4 were implemented. If you are a fresh agent picking up this project, read this section — you don't need the transcript above.
+
+**Last updated:** 2026-06-06 · **Repo:** https://github.com/CBaileyDev/PrivateCode · **Branch:** `main` · **HEAD at handoff:** `6e16bb1`
+
+## 1. What this project is
+
+**Private Code** is a from-scratch **Rust rewrite of OpenCode** — a local-first, privacy-preserving AI coding agent. One in-process engine drives three front-ends:
+- **CLI** (`cli/`, bin `private-code-cli`) — includes a `--selftest` perf harness.
+- **Daemon** (`crates/daemon`) — axum HTTP + WebSocket server (loopback, bearer-token auth) exposing the engine.
+- **Desktop GUI** (`apps/desktop`) — **Tauri 2 + SolidJS** (TypeScript) talking to the same engine in-process via Tauri commands.
+- A **TUI** crate also exists (`crates/tui`, ~940 lines).
+
+The legacy TypeScript OpenCode lives in **`Reference/`** and is **READ-ONLY** — it is the ground-truth oracle. When asserting "X is wrong/right," ground the claim in `Reference/` source, not memory.
+
+### Source-of-truth documents (read these)
+- **`plan.md`** — the master roadmap (~1,800 lines). Phases 1–5, every step (e.g. `#### Step 4.9`). Phase 5 steps 5.1–5.15 are the next work.
+- **`PROGRESS.md`** — the living status tracker + **honesty log**. Every cluster (C0–C16, P4-C1..C11), every adversarial review, every documented ceiling. **Update this as you work.**
+- **`specs/`** — `database.md` (SQLite schema + queries), `context_engine.md` (system-context lifecycle + epoch compaction), `api_protocol.md` (REST + WS JSON-RPC).
+- **`PROJECT_END_GOAL.MD`**, **`README.MD`** — vision/brand.
+
+## 2. Status: Phases 1–4 are COMPLETE and green
+
+| Phase | Scope | Status |
+|---|---|---|
+| **1** | Core agent loop, SQLite persistence, git checkpoints, providers, tools, TUI | ✅ done (C0–C5) + Phase-1 adversarial review |
+| **2** | Daemon: HTTP/WS, eviction reaper, steer/queue, durable replay, graceful shutdown | ✅ done (C6–C9) + Phase-2 review |
+| **3** | Desktop: command→engine seam, frontend (XSS/session-bleed/locks fixes), model/agent/slash wiring, virtualization + Shiki-in-worker, store tests, perf instrumentation | ✅ done (C10–C16) + Phase-3 review |
+| **4** | **Moat & Differentiators:** code intelligence (tree-sitter, FTS5, fuzzy, repomap, watcher, 9 languages) + multi-model orchestration (fan-out, synthesis, role routing) + GUI comparison/checkpoint views | ✅ done (P4-C1..C11) + Phase-4 review |
+| **5** | **Ecosystem & Packaging** — LSP, MCP, WASM plugins, provider breadth, model catalog, keychain, cost UI, slash commands, `/init`, export, auto-update, packaging | ⏭️ **NEXT — not started** |
+
+**Green gate (must pass at every cluster boundary):**
+```
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo nextest run --workspace                      # 163 tests pass, 4 skipped
+cargo deny check                                   # for dependency-touching clusters
+# desktop:
+cd apps/desktop && npm run typecheck && npm run build && npx vitest run   # 39 tests, 7 files
+```
+Current state: **all green.** Rust ~164 test fns / 163 nextest cases; frontend 39 vitest.
+
+## 3. Architecture & repo layout
+
+```
+crates/
+  protocol/   ProtocolEvent enum + ChatMessage/ContentBlock + UsageStats (the wire types)
+  core/       THE ENGINE: coordinator, orchestrator, orchestration, db, checkpoint,
+              context, permissions, config, + code-intel glue (symbols, indexer, repomap,
+              fuzzy, watcher, code_context). benches/ = symbol_search, reindex, repomap_gen.
+  providers/  ModelProvider trait, AnthropicProvider, OpenAiCompatProvider (NVIDIA),
+              SSE parser, testkit (ScriptedProvider/PendingProvider — feature "testkit").
+  tools/      Tool trait + ToolRegistry + file/system tools (edit/patch/read/write/bash).
+  daemon/     axum build_router/serve_daemon/start_daemon_with (DI), auth, routes, ws.
+  tui/        ratatui terminal UI.
+  codeintel/  PURE-CPU code intelligence: tree-sitter parse, SymbolExtractor, LanguageRegistry,
+              walk. queries/*.scm for 10 languages. NO SQLite here (that stays in core).
+cli/          private-code-cli bin (+ --selftest).
+apps/desktop/ Tauri 2 (src-tauri/ Rust commands + state) + SolidJS frontend (src/).
+Reference/    READ-ONLY OpenCode TS oracle.
+specs/        database.md, context_engine.md, api_protocol.md.
+plan.md, PROGRESS.md, README.MD, PROJECT_END_GOAL.MD
+```
+
+Editions: daemon is edition 2021 (no let-chains); core/providers/cli/codeintel are edition 2024.
+
+## 4. LOAD-BEARING INVARIANTS — do not break these
+
+1. **Durable-event filter (`coordinator::is_durable_event`).** `sess.history` is a SEPARATE 1000-cap, durable-only buffer (NOT the broadcast channel). Anything **ephemeral** (`MessageDelta`, `CandidateStarted/Delta/Completed`) **MUST** be excluded there, or a burst evicts real durable events (`MessageCompleted`/`Error`/`ToolPermissionRequired`) and breaks lag-recovery + cold-reconnect. **Any new ephemeral event variant must be added to the `is_durable_event` exclusion list** and locked with a test. This was re-broken-and-fixed twice; treat it as sacred.
+2. **Never hold the `sessions` Mutex across an `.await`.** It blocks event routing and every other session. The coordinator is carefully structured around this (lock → compute → drop → await → relock + double-check).
+3. **Single-drain concurrency token.** `ActiveSession.active_turn_cancel` is set ONLY by `run_turn` (atomically with the spawn decision) and cleared ONLY by the drain loop's settlement hand-off (one lock, no await between `pop_front` and the clear). `abort_turn` never takes it. This is what prevents parallel drains. `evict_session` is idle-guarded for the same reason.
+4. **Durable seq comes from `db::next_sequence`** (the shared per-session counter) for messages, and `next_event_seq` for standalone events — all durable events share one monotonic space or replay dedup (`should_forward`/`durable_after`, keyed on `seq>watermark`) breaks.
+5. **Multi-model orchestration data model:** candidate events are ephemeral; only the synthesized answer persists as ONE durable `MessageCompleted`; synthesis streams via normal `MessageDelta`; usage = sum(candidates)+synthesizer; candidate failure → proceed with survivors; **0 survivors → durable `Error`, persist nothing**; fan-out resolves providers ONLY from the registered map (unregistered → that candidate fails honestly, never a silent default fallback). Live integration: `orchestrator::run_orchestrated_turn` (gated on `model_config.orchestration.mode != Single`).
+6. **Code-intel split:** `codeintel` is pure-CPU (tree-sitter/parse/format); **ALL SQLite stays in `core`**. Stored symbol filepaths are **workspace-relative, forward-slash**.
+7. **Security (from the system prompt + threat model):** never persist API keys to config (keyring → `{PROVIDER}_API_KEY` env fallback only); the bash tool scrubs its child env to an allowlist; any NEW child-process spawn must do the same. Never commit secrets.
+
+## 5. Conventions / working style
+
+- **Autonomous senior-lead.** Be critical, direct, truthful; don't sugarcoat or invent. Ground "this is wrong" in `Reference/`.
+- **Per-cluster discipline:** green gate → commit → push. Commit-message trailer (required):
+  `Co-Authored-By: Claude Opus 4.8 (1M context) <noreply@anthropic.com>`
+- **Branch policy:** the project commits each cluster directly to `main` (established convention — every P4 commit did so).
+- **Advisor:** consult the `advisor` tool at design checkpoints (before committing to an approach) and at completion (make the deliverable durable first). It has full transcript context and recalibrates severity/finds blind spots — give it serious weight.
+- **Ultracode is ON:** use the `Workflow` tool for substantive multi-agent work; at phase boundaries run an **adversarial review** (find → independent-skeptic-verify → triage), then fix every confirmed finding with a regression test. Token cost is not a constraint; optimize for exhaustive correctness.
+- **Default model id:** `claude-opus-4-8` (the single shared const `DEFAULT_MODEL_ID`).
+
+## 6. Known ceilings & open follow-ups (honest list — see PROGRESS.md for detail)
+
+- **GUI rendering is unverifiable headless.** Frontend logic (stores) is vitest-tested and typecheck+build pass, but actual rendering/scroll/keyboard/virtualization needs a **human GUI launch**. Documented, not faked. (Comparison view, checkpoint timeline, MessageList virtualization all fall here.)
+- **Live BYOK Claude/NVIDIA calls** are out of scope (need real keys). Everything is verified with `ScriptedProvider`s. A true 3-distinct-vendor fan-out needs more registered providers + keys (runtime config, not code).
+- **`Error` events have no visible GUI surface yet** — `messages.ts` only `console.error`s them. A spawned task chip tracks adding a banner/toast. (Broader than orchestration — all `Error`s share the gap.)
+- **Orchestration ceilings (deliberate):** fan-out/synthesis run **no tool loop** and **no proactive compaction**; mid-turn steers are dropped in an orchestrated turn; the synthesizer sees only the request + candidate texts (no full history); comparison "merge" is copy-to-clipboard (real merge is the server-side synthesis); checkpoint revert is latest-only (no arbitrary "restore to tree X" command yet).
+- **Deferred infra:** durable event-log table (closes the post-eviction cold-reconnect gap); Google-Fonts self-hosting; `enclosing_scope`/parent_scope for non-Rust languages.
+
+## 7. What's next — Phase 5 (Ecosystem & Packaging)
+
+Start at `plan.md` → "### Phase 5". Steps, in plan order:
+- **5.1 LSP client** (`crates/lsp`, not yet created) — generic JSON-RPC client, server lifecycle, diagnostics → tool results, definition/references.
+- **5.2 MCP client** (`crates/mcp`) — `rmcp` SDK, stdio + Streamable HTTP, auto-register MCP tools into `ToolRegistry`.
+- **5.3 WASM plugins** (`crates/plugins`) — Extism runtime, host fns (workspace-bounded fs, log, config), pre/post turn/tool hooks, sandbox (no net, 64MB).
+- **5.4 Provider breadth** — OpenAI/DeepSeek/Groq, Google Gemini, Ollama, LM Studio; per-provider prompt caching; env/port auto-detection.
+- **5.5 Model catalog** (`catalog.rs`) — standalone owned `ModelInfo` (get/all/available), vendored models.dev snapshot (zero-network cold start), lazy/background refresh.
+- **5.6 OS keychain**, **5.7 cost transparency UI**, **5.8 slash + custom commands**, **5.9 `/init` AGENTS.md generation**, **5.10 session export/share**, **5.11 GUI auto-update**, **5.12 CLI packaging**, **5.13 desktop packaging**, **5.14 package-manager distribution**, **5.15 Phase-5 verification**.
+
+Recommended approach: same cluster cadence as Phase 4 — scope a cluster, advisor-check the design, implement with tests, green gate, commit+push; run a Phase-5 adversarial-review workflow at the boundary. `crates/{lsp,mcp,plugins}` do NOT exist yet — they need scaffolding (add to `Cargo.toml` workspace members + `[workspace.dependencies]`).
+
+## 8. Phase-4 deliverables (what landed this session, for quick orientation)
+
+- **Code intelligence:** `crates/codeintel` (tree-sitter 0.26 runtime; grammars for rust/ts/js/python/go/c/cpp/java/ruby/php via `tree-sitter-language` bindings; `.scm` queries; `SymbolExtractor`, lazy `LanguageRegistry`). Core glue: `symbols` (FTS5 + bm25, migration `0002_symbols.sql`), `indexer` (rayon background index, best-effort), `repomap` (budget-bounded), `fuzzy` (nucleo), `watcher` (notify-debouncer-full 0.7; canonical-root path keying; directory-rename purge via `remove_under`), `code_context`.
+- **Multi-model orchestration:** `crates/core/src/orchestration.rs` (`OrchestrationConfig`+`validate`, `ModelRef`, `fan_out`, `stream_single`, synthesis/role message builders) wired into `orchestrator.rs` (`run_orchestrated_turn`/`run_fan_out`/`run_role_pipeline`/`persist_orchestrated_answer`). Protocol gained `CandidateStarted/Delta/Completed` (ephemeral).
+- **GUI:** `apps/desktop/src/stores/{candidates,checkpoints}.ts` + `components/{ComparisonView,CheckpointTimeline}.tsx`, wired through the existing session-bleed-guarded event dispatch.
+- **Phase-4 adversarial review (C11):** 17-agent workflow → 10 confirmed findings (no critical/security) → all fixed with regression tests. Measured plan-4.14 perf: symbol search ~9.8ms (<50ms), reindex ~3.1ms (<100ms), repomap 10k-file generate ~133ms (<2s).
